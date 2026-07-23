@@ -1,0 +1,60 @@
+#pragma kernel CSClear
+#pragma kernel CSCompactClusters
+#pragma kernel CSFinalizeArgs
+
+// 按可见 cluster expand 三角形 ID。
+// _DrawArgs 使用 GraphicsBuffer(IndirectArguments|Structured)，可被 compute UAV 写入并直接给 DrawProceduralIndirect。
+
+StructuredBuffer<uint> _ClusterVisible;
+StructuredBuffer<uint> _ClusterFirstTri;
+StructuredBuffer<uint> _ClusterTriCount;
+
+RWStructuredBuffer<uint> _CompactedTriIds;
+RWStructuredBuffer<uint> _CompactCounter;
+RWStructuredBuffer<uint> _DrawArgs; // [vertexCount, instanceCount, startVertex, startInstance]
+
+uint _ClusterCount;
+
+[numthreads(1, 1, 1)]
+void CSClear(uint3 id : SV_DispatchThreadID)
+{
+    _CompactCounter[0] = 0u;
+    _DrawArgs[0] = 0u;
+    _DrawArgs[1] = 1u;
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void CSCompactClusters(uint3 id : SV_DispatchThreadID)
+{
+    uint cluster = id.x;
+    if (cluster >= _ClusterCount)
+        return;
+    if (_ClusterVisible[cluster] == 0u)
+        return;
+
+    uint first = _ClusterFirstTri[cluster];
+    uint count = _ClusterTriCount[cluster];
+    if (count == 0u)
+        return;
+
+    uint dst;
+    InterlockedAdd(_CompactCounter[0], count, dst);
+
+    for (uint i = 0u; i < count; i++)
+        _CompactedTriIds[dst + i] = first + i;
+}
+
+[numthreads(1, 1, 1)]
+void CSFinalizeArgs(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0)
+        return;
+
+    uint visibleTris = _CompactCounter[0];
+    _DrawArgs[0] = visibleTris * 3u;
+    _DrawArgs[1] = 1u;
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+}

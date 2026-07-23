@@ -1,0 +1,172 @@
+Shader "Nanite/VBufferShadowCaster"
+{
+    Properties
+    {
+        _Cutoff ("Alpha Cutoff", Range(0, 1)) = 0
+        [NoScaleOffset] _BaseMap ("Base Map", 2D) = "white" {}
+    }
+
+    SubShader
+    {
+        Tags { "RenderType"="Opaque" }
+
+        Pass
+        {
+            Name "NaniteShadowCaster"
+            Tags { "LightMode" = "ShadowCaster" }
+
+            Cull Back
+            ZWrite On
+            ZTest LEqual
+            ColorMask 0
+
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma vertex vert
+            #pragma fragment frag
+            #pragma multi_compile_vertex _ _CASTING_PUNCTUAL_LIGHT_SHADOW
+            #pragma shader_feature_local_fragment _ALPHATEST_ON
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl"
+            #include "NaniteCompactDraw.hlsl"
+
+            // 与 URP ShadowCasterPass 一致：法线偏移需要当前阴影光方向/位置。
+            float3 _LightDirection;
+            float3 _LightPosition;
+            float4x4 _NaniteShadowViewProj;
+
+            CBUFFER_START(UnityPerMaterial)
+            float4 _BaseMap_ST;
+            float4 _BaseColor;
+            float _Cutoff;
+            CBUFFER_END
+
+            StructuredBuffer<float> _VertexData;
+            StructuredBuffer<int> _Indices;
+            StructuredBuffer<int> _TriangleCluster;
+            StructuredBuffer<int> _TrianglePage;
+            StructuredBuffer<int> _TriangleInstance;
+            StructuredBuffer<float4x4> _InstanceLocalToWorld;
+            StructuredBuffer<uint> _ClusterVisible;
+            int _VertexStride;
+            int _InstanceId;
+            float4x4 _LocalToWorld;
+            int _UseSceneInstanceBuffer;
+
+            struct Attributes
+            {
+                uint vertexID : SV_VertexID;
+            };
+
+            struct Varyings
+            {
+                float4 positionCS : SV_POSITION;
+                #if defined(_ALPHATEST_ON)
+                float2 uv : TEXCOORD0;
+                #endif
+            };
+
+            float3 DecodePositionOS(int logicalVertex)
+            {
+                int baseOffset = logicalVertex * _VertexStride;
+                return float3(
+                    _VertexData[baseOffset + 0],
+                    _VertexData[baseOffset + 1],
+                    _VertexData[baseOffset + 2]);
+            }
+
+            float2 DecodeUv(int logicalVertex)
+            {
+                if (_VertexStride < 5)
+                    return 0.0.xx;
+                int baseOffset = logicalVertex * _VertexStride;
+                return float2(_VertexData[baseOffset + 3], _VertexData[baseOffset + 4]);
+            }
+
+            float3 DecodeNormalOS(int logicalVertex)
+            {
+                if (_VertexStride < 8)
+                    return float3(0.0, 1.0, 0.0);
+                int baseOffset = logicalVertex * _VertexStride;
+                float3 n = float3(
+                    _VertexData[baseOffset + 5],
+                    _VertexData[baseOffset + 6],
+                    _VertexData[baseOffset + 7]);
+                return dot(n, n) > 1e-8 ? normalize(n) : float3(0.0, 1.0, 0.0);
+            }
+
+            float4 GetShadowPositionHClip(float3 positionOS, float3 normalOS, float4x4 localToWorld)
+            {
+                float3 positionWS = mul(localToWorld, float4(positionOS, 1.0)).xyz;
+                float3x3 m = (float3x3)localToWorld;
+                float3 c0 = mul(m, float3(1.0, 0.0, 0.0));
+                float3 c1 = mul(m, float3(0.0, 1.0, 0.0));
+                float3 c2 = mul(m, float3(0.0, 0.0, 1.0));
+                float3 normalWS = normalize(
+                    normalOS.x * cross(c1, c2) +
+                    normalOS.y * cross(c2, c0) +
+                    normalOS.z * cross(c0, c1));
+
+#if _CASTING_PUNCTUAL_LIGHT_SHADOW
+                float3 lightDirectionWS = normalize(_LightPosition - positionWS);
+#else
+                float3 lightDirectionWS = _LightDirection;
+#endif
+
+                float3 biasedPositionWS = ApplyShadowBias(positionWS, normalWS, lightDirectionWS);
+                float4 positionCS = mul(_NaniteShadowViewProj, float4(biasedPositionWS, 1.0));
+                positionCS = ApplyShadowClamping(positionCS);
+                return positionCS;
+            }
+
+            Varyings vert(Attributes input)
+            {
+                Varyings o;
+                int triId = NaniteResolveTriangleId(input.vertexID);
+
+                if (_UseCompactedTriIds < 0.5)
+                {
+                    int cluster = _TriangleCluster[triId];
+                    if (cluster < 0 || _ClusterVisible[cluster] == 0)
+                    {
+                        float nan = asfloat(0x7FC00000u);
+                        o.positionCS = float4(nan, nan, nan, nan);
+                        #if defined(_ALPHATEST_ON)
+                        o.uv = 0.0.xx;
+                        #endif
+                        return o;
+                    }
+                }
+
+                float4x4 localToWorld = _LocalToWorld;
+                if (_UseSceneInstanceBuffer != 0)
+                {
+                    int instanceId = _TriangleInstance[triId];
+                    localToWorld = _InstanceLocalToWorld[instanceId];
+                }
+
+                int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                float3 posOS = DecodePositionOS(logicalIndex);
+                float3 normalOS = DecodeNormalOS(logicalIndex);
+                o.positionCS = GetShadowPositionHClip(posOS, normalOS, localToWorld);
+
+                #if defined(_ALPHATEST_ON)
+                o.uv = TRANSFORM_TEX(DecodeUv(logicalIndex), _BaseMap);
+                #endif
+
+                return o;
+            }
+
+            half4 frag(Varyings input) : SV_Target
+            {
+                #if defined(_ALPHATEST_ON)
+                Alpha(SampleAlbedoAlpha(input.uv, TEXTURE2D_ARGS(_BaseMap, sampler_BaseMap)).a, _BaseColor, _Cutoff);
+                #endif
+                return 0;
+            }
+            ENDHLSL
+        }
+    }
+}

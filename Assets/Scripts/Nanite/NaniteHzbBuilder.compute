@@ -1,0 +1,74 @@
+#pragma kernel CSCopyDepth
+#pragma kernel CSCopyDepthHalf
+#pragma kernel CSDownsample
+
+Texture2D<float> _SourceDepth;
+Texture2D<float> _SourceMip;
+RWTexture2D<float> _DestMip;
+
+int2 _SourceSize;
+
+float ReduceDepth(float a, float b, float c, float d)
+{
+#if defined(UNITY_REVERSED_Z)
+    return max(max(a, b), max(c, d));
+#else
+    return min(min(a, b), min(c, d));
+#endif
+}
+
+[numthreads(8, 8, 1)]
+void CSCopyDepth(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (p.x >= _SourceSize.x || p.y >= _SourceSize.y)
+        return;
+
+    float d = _SourceDepth.Load(int3(p, 0));
+    _DestMip[p] = d;
+}
+
+// 半分辨率 HZB mip0：对全分辨率深度做 2x2 保守归约（_SourceSize = 目标 HZB 尺寸）。
+[numthreads(8, 8, 1)]
+void CSCopyDepthHalf(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (p.x >= _SourceSize.x || p.y >= _SourceSize.y)
+        return;
+
+    int2 src = p * 2;
+    int2 p00 = src + int2(0, 0);
+    int2 p10 = src + int2(1, 0);
+    int2 p01 = src + int2(0, 1);
+    int2 p11 = src + int2(1, 1);
+
+    float d00 = _SourceDepth.Load(int3(p00, 0));
+    float d10 = _SourceDepth.Load(int3(p10, 0));
+    float d01 = _SourceDepth.Load(int3(p01, 0));
+    float d11 = _SourceDepth.Load(int3(p11, 0));
+    _DestMip[p] = ReduceDepth(d00, d10, d01, d11);
+}
+
+[numthreads(8, 8, 1)]
+void CSDownsample(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    int2 dstSize = int2(max(1, _SourceSize.x >> 1), max(1, _SourceSize.y >> 1));
+    if (p.x >= dstSize.x || p.y >= dstSize.y)
+        return;
+
+    int2 src = p * 2;
+    int2 maxCoord = _SourceSize - 1;
+
+    int2 p00 = clamp(src + int2(0, 0), int2(0, 0), maxCoord);
+    int2 p10 = clamp(src + int2(1, 0), int2(0, 0), maxCoord);
+    int2 p01 = clamp(src + int2(0, 1), int2(0, 0), maxCoord);
+    int2 p11 = clamp(src + int2(1, 1), int2(0, 0), maxCoord);
+
+    float d00 = _SourceMip.Load(int3(p00, 0));
+    float d10 = _SourceMip.Load(int3(p10, 0));
+    float d01 = _SourceMip.Load(int3(p01, 0));
+    float d11 = _SourceMip.Load(int3(p11, 0));
+
+    _DestMip[p] = ReduceDepth(d00, d10, d01, d11);
+}

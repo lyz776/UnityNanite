@@ -1,0 +1,33 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1bcb789f38310f9439a4499718dd0b93, type: 3}
+  m_Name: dragon_871k_mesh
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteMesh
+  boundingSphere: {x: 0.16192496, y: 0.69532, z: 0.27752972, w: 6.5133753}
+  subMeshCount: 1
+  maxMipLevel: 13
+  pageArray:
+  - {fileID: 11400000, guid: 27539a93e0e028f42859a2bf692085c6, type: 2}
+  - {fileID: 11400000, guid: aeafdefe9979e53409e06c53d0188214, type: 2}
+  - {fileID: 11400000, guid: 2f15e5701b7d7354abe863d7773a3cb3, type: 2}
+  - {fileID: 11400000, guid: a4d120665bb7d7740885a1051fe6b440, type: 2}
+  - {fileID: 11400000, guid: 039eba5ff49b52f42a91b3b2437bd015, type: 2}
+  - {fileID: 11400000, guid: 157e24684a59d644ab03fbf1712a1c55, type: 2}
+  - {fileID: 11400000, guid: 521bfd8a9580ef642894f15ec87a769a, type: 2}
+  - {fileID: 11400000, guid: f17766f9c8429cd4884a7cc045904cdd, type: 2}
+  - {fileID: 11400000, guid: 17d4eb6bbe69de749841c4579a97d6b2, type: 2}
+  - {fileID: 11400000, guid: cf08d08332dc60c4a8baee0581df4fd4, type: 2}
+  - {fileID: 11400000, guid: 78667ed976ff42841b4b9296cb83e458, type: 2}
+  - {fileID: 11400000, guid: e5756387d546f144ca5d0eca06df1759, type: 2}
+  - {fileID: 11400000, guid: 7afdafbd56a224340843f034b25c43f0, type: 2}
+  - {fileID: 11400000, guid: dc9ac68067c9ed14c9ca14d3fe7de8d4, type: 2}
+  - {fileID: 11400000, guid: a036d045f5113ca41aca177427fff023, type: 2}

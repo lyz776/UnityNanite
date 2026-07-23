@@ -1,0 +1,356 @@
+#pragma kernel CSPartCull
+#pragma kernel CSClusterCull
+#pragma kernel CSClearClusterVisible
+#pragma kernel CSClearSecondPassCandidates
+#pragma kernel CSCopyUintBuffer
+#pragma kernel CSClearCullStats
+#pragma kernel CSOrMasksToVisible
+
+// CullPassMode:
+// 0 = legacy（全量 frustum+LOD，可选 HZB）
+// 1 = Bevy Pass1：仅 prevVisible（无 HZB）；其余进 secondPassCandidates
+// 2 = Bevy Pass2：仅 secondPassCandidates + HZB，追加写 visible
+#define CULL_MODE_LEGACY 0
+#define CULL_MODE_PASS1 1
+#define CULL_MODE_PASS2 2
+
+struct GpuPartData
+{
+    float4 selfSphere;
+    float4 parentSphere;
+    float maxParentError;
+    int clusterStart;
+    int clusterCount;
+    int instanceIndex;
+};
+
+struct GpuClusterData
+{
+    float4 selfSphere;
+    float4 parentSphere;
+    float selfError;
+    float parentError;
+    int partIndex;
+    int pageIndex;
+    int clusterIndex;
+    int instanceIndex;
+};
+
+StructuredBuffer<GpuPartData> _Parts;
+StructuredBuffer<GpuClusterData> _Clusters;
+RWStructuredBuffer<uint> _PartVisible;
+AppendStructuredBuffer<uint3> _VisibleClusters;
+RWStructuredBuffer<uint> _ClusterVisible;
+StructuredBuffer<uint> _ClusterSceneIndex;
+StructuredBuffer<uint> _PrevClusterVisible;
+RWStructuredBuffer<uint> _SecondPassCandidates;
+RWStructuredBuffer<uint> _Pass2Drawn;
+StructuredBuffer<uint> _UintCopySrc;
+RWStructuredBuffer<uint> _UintCopyDst;
+RWStructuredBuffer<uint> _CullStats; // [0]=pass1Drawn [1]=pass2Candidates [2]=pass2Drawn
+StructuredBuffer<uint> _Pass1Visible;
+StructuredBuffer<uint> _OrMaskB;
+Texture2D<float> _HizTexture;
+SamplerState sampler_HizTexture;
+StructuredBuffer<uint> _ClusterCandidates;
+
+int _PartCount;
+int _ClusterCount;
+int _ClusterCandidateCount;
+int _HizMipCount;
+int _UseHzb;
+int _ReversedZ;
+int _UseClusterCandidates;
+int _EnableVisibleAppend;
+int _EnableClusterVisibleWrite;
+int _SceneClusterCount;
+int _CullPassMode;
+int _HasPrevVisible;
+int _EnableCullStats;
+
+float4 _FrustumPlanes[6];
+StructuredBuffer<float4x4> _InstanceLocalToWorld;
+StructuredBuffer<float> _InstanceMaxScale;
+StructuredBuffer<float> _InstanceLodErrorPixels;
+
+float4 _CameraPos;
+float _ProjectionScale;
+float _ZNear;
+float4x4 _WorldToClip;
+float4 _ScreenSize;
+int _InstanceCount;
+
+float4 TransformSphere(float4 localSphere, int instanceIndex)
+{
+    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
+    float4x4 localToWorld = _InstanceLocalToWorld[instanceIndex];
+    float maxScale = max(_InstanceMaxScale[instanceIndex], 1e-6);
+    float3 center = mul(localToWorld, float4(localSphere.xyz, 1.0)).xyz;
+    float radius = localSphere.w * maxScale;
+    return float4(center, radius);
+}
+
+float LodErrorPixels(int instanceIndex)
+{
+    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
+    return _InstanceLodErrorPixels[instanceIndex];
+}
+
+bool SphereVisible(float4 sphere)
+{
+    float3 center = sphere.xyz;
+    float radius = sphere.w;
+    [unroll]
+    for (int i = 0; i < 6; i++)
+    {
+        float4 p = _FrustumPlanes[i];
+        if (dot(p.xyz, center) + p.w < -radius)
+            return false;
+    }
+    return true;
+}
+
+float ProjectedError(float error, float4 sphere)
+{
+    if (error >= 1e29)
+        return 1e30;
+
+    // 屏幕空间投影「直径」像素（Bevy/Nanite 常用 diameter < ~1px 作为 imperceptible）。
+    // 此前按半径估会偏保守 → 远处残留过多 cluster。
+    float dist = max(length(sphere.xyz - _CameraPos.xyz) - sphere.w, _ZNear);
+    return (2.0 * error * _ProjectionScale) / dist;
+}
+
+// Bevy: lod_error_is_imperceptible — 误差球屏幕投影 ≤ threshold。
+bool LodErrorIsImperceptible(float error, float4 sphere, float thresholdPixels)
+{
+    return ProjectedError(error, sphere) <= thresholdPixels;
+}
+
+// 互斥 DAG 切割（禁止宽重叠带）：同一表面只能选一层。
+// 宽带（0.5×/1.5×）会在阈值附近同时选中父子 → 浮动碎块/叠画假破洞。
+bool ShouldSelectClusterLod(
+    float parentError,
+    float selfError,
+    float4 parentSphere,
+    float4 selfSphere,
+    float lodErrorPixels)
+{
+    return !LodErrorIsImperceptible(parentError, parentSphere, lodErrorPixels) &&
+           LodErrorIsImperceptible(selfError, selfSphere, lodErrorPixels);
+}
+
+float2 ProjectToUv(float3 worldPos, out float depth01)
+{
+    float4 clip = mul(_WorldToClip, float4(worldPos, 1.0));
+    float invW = 1.0 / max(abs(clip.w), 1e-6);
+    float2 ndc = clip.xy * invW;
+    float2 uv = ndc * 0.5 + 0.5;
+    depth01 = saturate(clip.z * invW);
+    return uv;
+}
+
+bool IsOccludedByHzb(float4 sphere)
+{
+    if (_UseHzb == 0 || _HizMipCount <= 0)
+        return false;
+
+    float3 toCenter = sphere.xyz - _CameraPos.xyz;
+    float centerDist = length(toCenter);
+    if (centerDist <= sphere.w * 1.25 + _ZNear)
+        return false;
+
+    float depth01;
+    float2 uv = ProjectToUv(sphere.xyz, depth01);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return false;
+
+    float dist = max(centerDist, _ZNear);
+    float radiusPixels = max(1.0, _ProjectionScale * sphere.w / dist);
+    if (radiusPixels > 64.0)
+        return false;
+
+    int mip = (int)clamp(floor(log2(radiusPixels)), 0.0, (float)min(_HizMipCount - 1, 3));
+
+    float hzbDepth = _HizTexture.SampleLevel(sampler_HizTexture, uv, mip);
+    float depthBias = saturate(sphere.w / max(dist, 1e-5)) * 1.5 + 0.02;
+    if (_ReversedZ != 0)
+    {
+        float closestDepth = saturate(depth01 + depthBias);
+        return closestDepth < hzbDepth - 1e-3;
+    }
+    else
+    {
+        float closestDepth = saturate(depth01 - depthBias);
+        return closestDepth > hzbDepth + 1e-3;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CSClearClusterVisible(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_SceneClusterCount)
+        return;
+    _ClusterVisible[i] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void CSClearSecondPassCandidates(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_SceneClusterCount)
+        return;
+    _SecondPassCandidates[i] = 0u;
+    _Pass2Drawn[i] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void CSCopyUintBuffer(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_SceneClusterCount)
+        return;
+    _UintCopyDst[i] = _UintCopySrc[i];
+}
+
+[numthreads(64, 1, 1)]
+void CSOrMasksToVisible(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_SceneClusterCount)
+        return;
+    _ClusterVisible[i] = (_Pass1Visible[i] | _OrMaskB[i]) != 0u ? 1u : 0u;
+}
+
+[numthreads(1, 1, 1)]
+void CSClearCullStats(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x == 0)
+    {
+        _CullStats[0] = 0u;
+        _CullStats[1] = 0u;
+        _CullStats[2] = 0u;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CSPartCull(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_PartCount)
+        return;
+
+    GpuPartData part = _Parts[i];
+    int instanceIndex = part.instanceIndex;
+    float lodError = LodErrorPixels(instanceIndex);
+    float4 selfSphere = TransformSphere(part.selfSphere, instanceIndex);
+    float4 lodSphere = TransformSphere(part.parentSphere.w > 0 ? part.parentSphere : part.selfSphere, instanceIndex);
+
+    // Part：父误差尚可感知则保留（与 Bevy part 粗筛一致）。
+    bool visible = SphereVisible(selfSphere) && !LodErrorIsImperceptible(part.maxParentError, lodSphere, lodError);
+
+    // Pass1 不做 HZB；Pass2/legacy 才测遮挡。
+    if (visible && _CullPassMode != CULL_MODE_PASS1 && IsOccludedByHzb(selfSphere))
+        visible = false;
+
+    _PartVisible[i] = visible ? 1u : 0u;
+}
+
+[numthreads(64, 1, 1)]
+void CSClusterCull(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint workCount = (_UseClusterCandidates != 0) ? (uint)_ClusterCandidateCount : (uint)_ClusterCount;
+    if (i >= workCount)
+        return;
+    uint clusterIdx = (_UseClusterCandidates != 0) ? _ClusterCandidates[i] : i;
+
+    GpuClusterData c = _Clusters[clusterIdx];
+    if (c.partIndex < 0 || c.partIndex >= _PartCount)
+        return;
+    if (_PartVisible[c.partIndex] == 0)
+        return;
+
+    int instanceIndex = c.instanceIndex;
+    float lodError = LodErrorPixels(instanceIndex);
+    float4 selfSphere = TransformSphere(c.selfSphere, instanceIndex);
+    if (!SphereVisible(selfSphere))
+        return;
+
+    // parent / self 必须用各自的误差球投影（Bevy/Nanite），不能共用一个球。
+    float4 parentSphere = TransformSphere(c.parentSphere.w > 0 ? c.parentSphere : c.selfSphere, instanceIndex);
+    if (!ShouldSelectClusterLod(c.parentError, c.selfError, parentSphere, selfSphere, lodError))
+        return;
+
+    // 整簇屏幕直径 < 1px：亚像素簇直接丢（与 lodError 脱钩，避免 T=8 时误挖 6px 洞）。
+    {
+        float dist = max(length(selfSphere.xyz - _CameraPos.xyz) - selfSphere.w, _ZNear);
+        float diameterPixels = (2.0 * selfSphere.w * _ProjectionScale) / dist;
+        if (diameterPixels < 1.0)
+            return;
+    }
+
+    uint gi = 0xFFFFFFFFu;
+    if (_EnableClusterVisibleWrite != 0 && clusterIdx < (uint)_ClusterCount)
+        gi = _ClusterSceneIndex[clusterIdx];
+
+    if (_CullPassMode == CULL_MODE_PASS1)
+    {
+        // Pass1：无 HZB。
+        // _HasPrevVisible==0 或未启用时间滤波：画全部 LOD 切割（安全，避免 LOD 切换破洞）。
+        // 启用 prev 时：prev 命中则画；未命中进 Pass2 候选（需 HZB Pass2 补洞）。
+        bool usePrevFilter = (_HasPrevVisible != 0);
+        bool inPrev = (gi < (uint)_SceneClusterCount && _PrevClusterVisible[gi] != 0u);
+        bool drawNow = !usePrevFilter || inPrev;
+        if (!drawNow)
+        {
+            if (gi < (uint)_SceneClusterCount)
+            {
+                _SecondPassCandidates[gi] = 1u;
+                if (_EnableCullStats != 0)
+                    InterlockedAdd(_CullStats[1], 1u);
+            }
+            return;
+        }
+
+        if (_EnableVisibleAppend != 0)
+            _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
+
+        if (gi < (uint)_SceneClusterCount)
+        {
+            _ClusterVisible[gi] = 1u;
+            if (_EnableCullStats != 0)
+                InterlockedAdd(_CullStats[0], 1u);
+        }
+        return;
+    }
+
+    if (_CullPassMode == CULL_MODE_PASS2)
+    {
+        // Pass2：补画 Pass1 未画的候选。无 HZB 时不做遮挡剔（只补洞）。
+        if (gi >= (uint)_SceneClusterCount || _SecondPassCandidates[gi] == 0u)
+            return;
+        if (IsOccludedByHzb(selfSphere))
+            return;
+
+        if (_EnableVisibleAppend != 0)
+            _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
+
+        _ClusterVisible[gi] = 1u;
+        _Pass2Drawn[gi] = 1u;
+        if (_EnableCullStats != 0)
+            InterlockedAdd(_CullStats[2], 1u);
+        return;
+    }
+
+    // Legacy
+    if (IsOccludedByHzb(selfSphere))
+        return;
+
+    if (_EnableVisibleAppend != 0)
+        _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
+
+    if (_EnableClusterVisibleWrite != 0 && gi < (uint)_SceneClusterCount)
+        _ClusterVisible[gi] = 1u;
+}

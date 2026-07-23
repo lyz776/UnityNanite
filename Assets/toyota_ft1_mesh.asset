@@ -1,0 +1,24 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1bcb789f38310f9439a4499718dd0b93, type: 3}
+  m_Name: toyota_ft1_mesh
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteMesh
+  boundingSphere: {x: 0, y: 0.72600454, z: -0.003437519, w: 2.8205516}
+  subMeshCount: 1
+  maxMipLevel: 8
+  pageArray:
+  - {fileID: 11400000, guid: 0ca5de90a8a3a644d974a1ef0aeafde2, type: 2}
+  - {fileID: 11400000, guid: 818c5fc8519f96d4383a283b2b487320, type: 2}
+  - {fileID: 11400000, guid: a0c5cc0b9dc34aa458826cf112a245a6, type: 2}
+  - {fileID: 11400000, guid: eb9620b0ff90a3f428cf9bc76b958957, type: 2}
+  - {fileID: 11400000, guid: a721fa5708e22de4c8374827ca4076ff, type: 2}
+  - {fileID: 11400000, guid: 375960d662ce771489728aa3a27e7478, type: 2}
