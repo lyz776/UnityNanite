@@ -56,6 +56,8 @@ Shader "Nanite/VBufferShadowCaster"
             int _InstanceId;
             float4x4 _LocalToWorld;
             int _UseSceneInstanceBuffer;
+            int _UseIndexedClusterRaster;
+            int _GeometryVertexCount;
 
             struct Attributes
             {
@@ -126,6 +128,23 @@ Shader "Nanite/VBufferShadowCaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (_UseIndexedClusterRaster != 0 && _GeometryVertexCount > 0)
+                {
+                    int instanceId = (int)(input.vertexID / (uint)_GeometryVertexCount);
+                    int logicalVertex = (int)(input.vertexID % (uint)_GeometryVertexCount);
+                    float4x4 indexedLocalToWorld = _InstanceLocalToWorld[instanceId];
+                    float3 indexedPositionOS = DecodePositionOS(logicalVertex);
+                    float3 indexedNormalOS = DecodeNormalOS(logicalVertex);
+                    float2 indexedUvOS = DecodeUv(logicalVertex);
+                    o.positionCS = GetShadowPositionHClip(
+                        indexedPositionOS,
+                        indexedNormalOS,
+                        indexedLocalToWorld);
+                    #if defined(_ALPHATEST_ON)
+                    o.uv = TRANSFORM_TEX(indexedUvOS, _BaseMap);
+                    #endif
+                    return o;
+                }
                 if (!NaniteCompactedTriangleValid(input.vertexID))
                 {
                     float nan = asfloat(0x7FC00000u);

@@ -62,6 +62,35 @@ int NaniteResolveInstanceId(uint vertexID, int fallbackInstanceId)
     return fallbackInstanceId;
 }
 
+uint NaniteCompactedClusterIndexFromPrimitive(uint primitiveID)
+{
+    return primitiveID / NaniteCompactedTriangleSlots();
+}
+
+uint NaniteCompactedTriangleInClusterFromPrimitive(uint primitiveID)
+{
+    return primitiveID % NaniteCompactedTriangleSlots();
+}
+
+int NaniteResolveTriangleIdFromPrimitive(uint primitiveID)
+{
+    uint cluster = NaniteCompactedClusterIndexFromPrimitive(primitiveID);
+    uint firstTriangle = _UseDirectVisibleDrawQueue > 0.5
+        ? _CompactedDrawClusters[cluster].x
+        : _CompactedTriIds[cluster];
+    return (int)(firstTriangle + NaniteCompactedTriangleInClusterFromPrimitive(primitiveID));
+}
+
+int NaniteResolveInstanceIdFromPrimitive(uint primitiveID, int fallbackInstanceId)
+{
+    if (_UseCompactedTriIds <= 0.5)
+        return fallbackInstanceId;
+    uint cluster = NaniteCompactedClusterIndexFromPrimitive(primitiveID);
+    return _UseDirectVisibleDrawQueue > 0.5
+        ? (int)_CompactedDrawClusters[cluster].z
+        : (int)_CompactedTriInstances[cluster];
+}
+
 int NaniteResolveCorner(uint vertexID)
 {
     return (int)(vertexID % 3u);

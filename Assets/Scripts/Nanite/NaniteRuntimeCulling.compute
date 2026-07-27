@@ -118,11 +118,14 @@ RWStructuredBuffer<uint> _InstanceVisible;
 
 float4 _CameraPos;
 float _ProjectionScale;
+float _OrthographicLodScale;
 float _ZNear;
 float4x4 _WorldToClip;
 float4 _ScreenSize;
+float4 _ShadowProjectionScales;
 int _InstanceCount;
 int _UseInstanceCull;
+int _UseOrthographicLod;
 
 float4 TransformSphere(float4 localSphere, int instanceIndex)
 {
@@ -155,21 +158,26 @@ bool SphereVisible(float4 sphere)
     return true;
 }
 
-float ProjectedError(float error, float4 sphere)
+float ProjectedError(float error, float4 sphere, int instanceIndex)
 {
     if (error >= 1e29)
         return 1e30;
 
+    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
+    float worldError = error * max(_Instances[instanceIndex].maxScale, 1e-6);
+    if (_UseOrthographicLod != 0)
+        return 2.0 * worldError * _OrthographicLodScale;
+
     // 屏幕空间投影「直径」像素（Bevy/Nanite 常用 diameter < ~1px 作为 imperceptible）。
     // 此前按半径估会偏保守 → 远处残留过多 cluster。
     float dist = max(length(sphere.xyz - _CameraPos.xyz) - sphere.w, _ZNear);
-    return (2.0 * error * _ProjectionScale) / dist;
+    return (2.0 * worldError * _ProjectionScale) / dist;
 }
 
 // Bevy: lod_error_is_imperceptible — 误差球屏幕投影 ≤ threshold。
-bool LodErrorIsImperceptible(float error, float4 sphere, float thresholdPixels)
+bool LodErrorIsImperceptible(float error, float4 sphere, float thresholdPixels, int instanceIndex)
 {
-    return ProjectedError(error, sphere) <= thresholdPixels;
+    return ProjectedError(error, sphere, instanceIndex) <= thresholdPixels;
 }
 
 // 互斥 DAG 切割（禁止宽重叠带）：同一表面只能选一层。
@@ -179,10 +187,19 @@ bool ShouldSelectClusterLod(
     float selfError,
     float4 parentSphere,
     float4 selfSphere,
-    float lodErrorPixels)
+    float lodErrorPixels,
+    int instanceIndex)
 {
-    return !LodErrorIsImperceptible(parentError, parentSphere, lodErrorPixels) &&
-           LodErrorIsImperceptible(selfError, selfSphere, lodErrorPixels);
+    return !LodErrorIsImperceptible(parentError, parentSphere, lodErrorPixels, instanceIndex) &&
+           LodErrorIsImperceptible(selfError, selfSphere, lodErrorPixels, instanceIndex);
+}
+
+float ProjectedDiameterPixels(float4 sphere)
+{
+    if (_UseOrthographicLod != 0)
+        return 2.0 * sphere.w * _OrthographicLodScale;
+    float dist = max(length(sphere.xyz - _CameraPos.xyz) - sphere.w, _ZNear);
+    return (2.0 * sphere.w * _ProjectionScale) / dist;
 }
 
 float2 ProjectToUv(float3 worldPos, out float depth01)
@@ -352,7 +369,8 @@ void CullPart(uint i)
     float4 lodSphere = TransformSphere(part.parentSphere.w > 0 ? part.parentSphere : part.selfSphere, instanceIndex);
 
     // Part：父误差尚可感知则保留（与 Bevy part 粗筛一致）。
-    bool visible = SphereVisible(selfSphere) && !LodErrorIsImperceptible(part.maxParentError, lodSphere, lodError);
+    bool visible = SphereVisible(selfSphere) &&
+                   !LodErrorIsImperceptible(part.maxParentError, lodSphere, lodError, instanceIndex);
 
     // Pass1 不做 HZB；Pass2/legacy 才测遮挡。
     if (visible && _CullPassMode != CULL_MODE_PASS1 && IsOccludedByHzb(selfSphere))
@@ -446,14 +464,18 @@ void CullCluster(uint clusterIdx)
 
     // parent / self 必须用各自的误差球投影（Bevy/Nanite），不能共用一个球。
     float4 parentSphere = TransformSphere(c.parentSphere.w > 0 ? c.parentSphere : c.selfSphere, instanceIndex);
-    if (!ShouldSelectClusterLod(c.parentError, c.selfError, parentSphere, selfSphere, lodError))
+    if (!ShouldSelectClusterLod(
+            c.parentError,
+            c.selfError,
+            parentSphere,
+            selfSphere,
+            lodError,
+            instanceIndex))
         return;
 
     // 整簇屏幕直径 < 1px：亚像素簇直接丢（与 lodError 脱钩，避免 T=8 时误挖 6px 洞）。
     {
-        float dist = max(length(selfSphere.xyz - _CameraPos.xyz) - selfSphere.w, _ZNear);
-        float diameterPixels = (2.0 * selfSphere.w * _ProjectionScale) / dist;
-        if (diameterPixels < 1.0)
+        if (ProjectedDiameterPixels(selfSphere) < 1.0)
             return;
     }
 
@@ -604,6 +626,54 @@ bool ShadowSphereVisible(float4 sphere, int cascadeIndex)
     return true;
 }
 
+float ShadowProjectionScale(int cascadeIndex)
+{
+    if (cascadeIndex == 0)
+        return _ShadowProjectionScales.x;
+    if (cascadeIndex == 1)
+        return _ShadowProjectionScales.y;
+    if (cascadeIndex == 2)
+        return _ShadowProjectionScales.z;
+    return _ShadowProjectionScales.w;
+}
+
+float ShadowProjectedError(float error, int instanceIndex, int cascadeIndex)
+{
+    if (error >= 1e29)
+        return 1e30;
+    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
+    float worldError = error * max(_Instances[instanceIndex].maxScale, 1e-6);
+    return 2.0 * worldError * ShadowProjectionScale(cascadeIndex);
+}
+
+bool ShadowLodErrorIsImperceptible(
+    float error,
+    float thresholdPixels,
+    int instanceIndex,
+    int cascadeIndex)
+{
+    return ShadowProjectedError(error, instanceIndex, cascadeIndex) <= thresholdPixels;
+}
+
+bool ShouldSelectShadowClusterLod(
+    float parentError,
+    float selfError,
+    float thresholdPixels,
+    int instanceIndex,
+    int cascadeIndex)
+{
+    return !ShadowLodErrorIsImperceptible(
+               parentError,
+               thresholdPixels,
+               instanceIndex,
+               cascadeIndex) &&
+           ShadowLodErrorIsImperceptible(
+               selfError,
+               thresholdPixels,
+               instanceIndex,
+               cascadeIndex);
+}
+
 void AppendShadowVisibleDrawCluster(int cascadeIndex, uint sceneClusterIndex, uint instanceIndex)
 {
     if (sceneClusterIndex >= (uint)_SceneClusterCount)
@@ -640,17 +710,17 @@ void CSShadowCullMultiCascadeByPart(uint3 id : SV_DispatchThreadID)
     GpuPartData part = LoadPartData(partIndex, instanceIndex, clusterStart, partClusterCount);
     float lodError = LodErrorPixels(instanceIndex);
     float4 partSphere = TransformSphere(part.selfSphere, instanceIndex);
-    float4 partLodSphere = TransformSphere(
-        part.parentSphere.w > 0 ? part.parentSphere : part.selfSphere,
-        instanceIndex);
-    if (LodErrorIsImperceptible(part.maxParentError, partLodSphere, lodError))
-        return;
 
     int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
     uint partCascadeMask = 0u;
     for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
     {
-        if (ShadowSphereVisible(partSphere, cascadeIndex))
+        if (ShadowSphereVisible(partSphere, cascadeIndex) &&
+            !ShadowLodErrorIsImperceptible(
+                part.maxParentError,
+                lodError,
+                instanceIndex,
+                cascadeIndex))
             partCascadeMask |= 1u << cascadeIndex;
     }
     if (partCascadeMask == 0u)
@@ -667,37 +737,35 @@ void CSShadowCullMultiCascadeByPart(uint3 id : SV_DispatchThreadID)
             clusterInstanceIndex,
             unusedPartIndex,
             globalPageIndex);
-        RequestPageIfNeeded(globalPageIndex);
 
         float4 clusterSphere = TransformSphere(cluster.selfSphere, clusterInstanceIndex);
-        float4 parentSphere = TransformSphere(
-            cluster.parentSphere.w > 0 ? cluster.parentSphere : cluster.selfSphere,
-            clusterInstanceIndex);
-        if (!ShouldSelectClusterLod(
-                cluster.parentError,
-                cluster.selfError,
-                parentSphere,
-                clusterSphere,
-                lodError))
-            continue;
-
-        float dist = max(length(clusterSphere.xyz - _CameraPos.xyz) - clusterSphere.w, _ZNear);
-        float diameterPixels = (2.0 * clusterSphere.w * _ProjectionScale) / dist;
-        if (diameterPixels < 1.0)
-            continue;
-
         uint sceneClusterIndex = _ClusterSceneIndex[clusterIndex];
+        bool requestedPage = false;
         for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
         {
             uint cascadeBit = 1u << cascadeIndex;
-            if ((partCascadeMask & cascadeBit) != 0u &&
-                ShadowSphereVisible(clusterSphere, cascadeIndex))
+            if ((partCascadeMask & cascadeBit) == 0u ||
+                !ShadowSphereVisible(clusterSphere, cascadeIndex))
+                continue;
+            if (!ShouldSelectShadowClusterLod(
+                    cluster.parentError,
+                    cluster.selfError,
+                    lodError,
+                    clusterInstanceIndex,
+                    cascadeIndex))
+                continue;
+            if (2.0 * clusterSphere.w * ShadowProjectionScale(cascadeIndex) < 1.0)
+                continue;
+
+            if (!requestedPage)
             {
-                AppendShadowVisibleDrawCluster(
-                    cascadeIndex,
-                    sceneClusterIndex,
-                    (uint)clusterInstanceIndex);
+                RequestPageIfNeeded(globalPageIndex);
+                requestedPage = true;
             }
+            AppendShadowVisibleDrawCluster(
+                cascadeIndex,
+                sceneClusterIndex,
+                (uint)clusterInstanceIndex);
         }
     }
 }

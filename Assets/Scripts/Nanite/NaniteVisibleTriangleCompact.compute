@@ -3,6 +3,8 @@
 #pragma kernel CSFinalizeArgs
 #pragma kernel CSFinalizeVisibleDrawQueueArgs
 #pragma kernel CSFinalizeVisibleDrawQueueArgs4
+#pragma kernel CSPrepareIndexedDrawQueue
+#pragma kernel CSBuildIndexedDrawQueue
 
 // 把可见 cluster 压实为 (firstTriangle, triangleCount, instance)；VS 再按固定槽位展开。
 // _DrawArgs 使用 GraphicsBuffer(IndirectArguments|Structured)，可被 compute UAV 写入并直接给 DrawProceduralIndirect。
@@ -26,6 +28,19 @@ RWStructuredBuffer<uint> _DrawArgs0;
 RWStructuredBuffer<uint> _DrawArgs1;
 RWStructuredBuffer<uint> _DrawArgs2;
 RWStructuredBuffer<uint> _DrawArgs3;
+
+// Indexed cluster raster keeps the current visible-cluster ABI, but expands the
+// selected clusters into a transient hardware index buffer.  The encoded index
+// is instance * geometryVertexCount + geometryVertex, so the VS can recover both
+// values while the fixed-function post-transform cache reuses shared vertices.
+StructuredBuffer<int> _Indices;
+StructuredBuffer<uint3> _CompactedDrawClusters;
+RWByteAddressBuffer _IndexedDrawIndices;
+RWStructuredBuffer<uint> _IndexedDrawArgs;          // 5 uint indexed arguments
+RWStructuredBuffer<uint> _IndexedFallbackDrawArgs;  // 4 uint procedural arguments
+uint _GeometryVertexCount;
+uint _IndexedDrawBaseIndex;
+uint _IndexedDrawCapacityClusters;
 
 uint _ClusterCount;
 uint _CompactedClusterTriangleSlots;
@@ -111,4 +126,79 @@ void CSFinalizeVisibleDrawQueueArgs4(uint3 id : SV_DispatchThreadID)
     _DrawArgs3[1] = 1u;
     _DrawArgs3[2] = 0u;
     _DrawArgs3[3] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void CSPrepareIndexedDrawQueue(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0u)
+        return;
+
+    uint visibleClusters = _VisibleDrawCountArgs[0];
+    uint slots = max(1u, _CompactedClusterTriangleSlots);
+    bool fits = visibleClusters <= _IndexedDrawCapacityClusters && _GeometryVertexCount > 0u;
+    uint indexCount = visibleClusters * slots * 3u;
+
+    _IndexedDrawArgs[0] = fits ? indexCount : 0u;
+    _IndexedDrawArgs[1] = 1u;
+    _IndexedDrawArgs[2] = _IndexedDrawBaseIndex;
+    _IndexedDrawArgs[3] = 0u;
+    _IndexedDrawArgs[4] = 0u;
+
+    // Exactly one of the indexed/procedural draws is non-empty.  This keeps
+    // correctness when a large view exceeds the transient index budget without
+    // any CPU count readback or frame-late capacity decision.
+    _IndexedFallbackDrawArgs[0] = fits ? 0u : indexCount;
+    _IndexedFallbackDrawArgs[1] = 1u;
+    _IndexedFallbackDrawArgs[2] = 0u;
+    _IndexedFallbackDrawArgs[3] = 0u;
+}
+
+[numthreads(128, 1, 1)]
+void CSBuildIndexedDrawQueue(
+    uint3 groupId : SV_GroupID,
+    uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint visibleClusters = _VisibleDrawCountArgs[0];
+    if (visibleClusters > _IndexedDrawCapacityClusters || _GeometryVertexCount == 0u)
+        return;
+
+    uint clusterIndex = groupId.x;
+    if (clusterIndex >= visibleClusters)
+        return;
+
+    uint slots = max(1u, _CompactedClusterTriangleSlots);
+    uint triangleInCluster = groupThreadId.x;
+    if (triangleInCluster >= slots)
+        return;
+
+    uint3 draw = _CompactedDrawClusters[clusterIndex];
+    uint firstTriangle = draw.x;
+    uint triangleCount = draw.y;
+    uint instanceId = draw.z;
+    uint outputIndex = _IndexedDrawBaseIndex +
+        (clusterIndex * slots + triangleInCluster) * 3u;
+
+    if (triangleInCluster < triangleCount)
+    {
+        uint triangleId = firstTriangle + triangleInCluster;
+        uint sourceIndex = triangleId * 3u;
+        uint instanceBase = instanceId * _GeometryVertexCount;
+        uint i0 = instanceBase + (uint)max(0, _Indices[sourceIndex + 0u]);
+        uint i1 = instanceBase + (uint)max(0, _Indices[sourceIndex + 1u]);
+        uint i2 = instanceBase + (uint)max(0, _Indices[sourceIndex + 2u]);
+        _IndexedDrawIndices.Store((outputIndex + 0u) * 4u, i0);
+        _IndexedDrawIndices.Store((outputIndex + 1u) * 4u, i1);
+        _IndexedDrawIndices.Store((outputIndex + 2u) * 4u, i2);
+    }
+    else
+    {
+        // Preserve the fixed cluster-slot ABI used by SV_PrimitiveID. Padding is
+        // a degenerate triangle and normally costs at most one cached VS result.
+        uint instanceBase = instanceId * _GeometryVertexCount;
+        uint repeated = instanceBase + (uint)max(0, _Indices[firstTriangle * 3u]);
+        _IndexedDrawIndices.Store((outputIndex + 0u) * 4u, repeated);
+        _IndexedDrawIndices.Store((outputIndex + 1u) * 4u, repeated);
+        _IndexedDrawIndices.Store((outputIndex + 2u) * 4u, repeated);
+    }
 }

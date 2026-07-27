@@ -172,6 +172,8 @@ Shader "Nanite/VBufferPacketRaster"
             float _TriangleCount;
             float _InstanceCount;
             float _MaxSubMeshCount;
+            int _UseIndexedClusterRaster;
+            int _GeometryVertexCount;
             CBUFFER_END
 
             int VertexStrideInt() { return max(3, (int)_VertexStride); }
@@ -207,6 +209,19 @@ Shader "Nanite/VBufferPacketRaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (_UseIndexedClusterRaster > 0.5 && _GeometryVertexCount > 0.5)
+                {
+                    uint geometryVertexCount = (uint)_GeometryVertexCount;
+                    int instance = (int)(input.vertexID / geometryVertexCount);
+                    int logicalVertex = (int)(input.vertexID % geometryVertexCount);
+                    float3 posOS = DecodePositionOS(logicalVertex);
+                    float3 posWS = mul(_InstanceLocalToWorld[instance], float4(posOS, 1.0)).xyz;
+                    o.positionCS = TransformWorldToHClip(posWS);
+                    o.packedInstance = (float)instance;
+                    // Indexed raster resolves the exact triangle from SV_PrimitiveID.
+                    o.triId = 0u;
+                    return o;
+                }
                 if (!NaniteCompactedTriangleValid(input.vertexID))
                 {
                     float nan = asfloat(0x7FC00000u);
@@ -258,12 +273,14 @@ Shader "Nanite/VBufferPacketRaster"
             }
 
             #if defined(NANITE_COMPACT_VBUFFER)
-            uint2 frag(Varyings i) : SV_Target
+            uint2 frag(Varyings i, uint primitiveId : SV_PrimitiveID) : SV_Target
             #else
-            float4 frag(Varyings i) : SV_Target
+            float4 frag(Varyings i, uint primitiveId : SV_PrimitiveID) : SV_Target
             #endif
             {
-                int triId = (int)i.triId;
+                int triId = _UseIndexedClusterRaster > 0.5
+                    ? NaniteResolveTriangleIdFromPrimitive(primitiveId)
+                    : (int)i.triId;
                 int subMeshId = 0;
                 if (HasTriangleSubMeshInt() != 0)
                     subMeshId = max(0, _TriangleSubMesh[triId]);

@@ -153,6 +153,7 @@ namespace Nanite
         readonly Plane[] frustumPlaneObjects = new Plane[6];
         readonly Vector4[] frustumPlanes = new Vector4[6];
         readonly Vector4[] shadowBatchFrustumPlanes = new Vector4[kMaxShadowCascades * 6];
+        Vector4 shadowBatchProjectionScales;
         readonly Dictionary<int, List<NaniteVisibleClusterRef>> visibleScratch = new Dictionary<int, List<NaniteVisibleClusterRef>>();
 
         NaniteGpuCullingBackend.GpuPartData[] partDataCpu;
@@ -1305,9 +1306,9 @@ namespace Nanite
                     plane.distance);
             }
 
-            Matrix4x4 cameraGpuProjection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
-            float projectionScale = Mathf.Abs(cameraGpuProjection.m11) * 0.5f *
-                                    Mathf.Max(1, camera.pixelHeight);
+            float shadowProjectionScale = ComputeShadowProjectionScale(
+                shadowProjectionMatrix,
+                shadowResolution);
             Matrix4x4 shadowGpuProjection = GL.GetGPUProjectionMatrix(shadowProjectionMatrix, true);
             Matrix4x4 shadowWorldToClip = shadowGpuProjection * shadowViewMatrix;
             Vector3 cameraPosition = camera.transform.position;
@@ -1320,7 +1321,7 @@ namespace Nanite
             SetShadowCullParams(
                 cmd,
                 cameraPosition,
-                projectionScale,
+                shadowProjectionScale,
                 Mathf.Max(1e-3f, camera.nearClipPlane),
                 shadowWorldToClip,
                 Mathf.Max(1, shadowResolution),
@@ -1431,6 +1432,7 @@ namespace Nanite
                 cmd.SetBufferCounterValue(queue, 0u);
             }
 
+            shadowBatchProjectionScales = Vector4.zero;
             for (int cascadeIndex = 0; cascadeIndex < activeCascadeCount; cascadeIndex++)
             {
                 GeometryUtility.CalculateFrustumPlanes(
@@ -1446,6 +1448,18 @@ namespace Nanite
                         plane.normal.z,
                         plane.distance);
                 }
+
+                float scale = ComputeShadowProjectionScale(
+                    shadowProjectionMatrices[cascadeIndex],
+                    shadowResolutions[cascadeIndex]);
+                if (cascadeIndex == 0)
+                    shadowBatchProjectionScales.x = scale;
+                else if (cascadeIndex == 1)
+                    shadowBatchProjectionScales.y = scale;
+                else if (cascadeIndex == 2)
+                    shadowBatchProjectionScales.z = scale;
+                else
+                    shadowBatchProjectionScales.w = scale;
             }
 
             Matrix4x4 cameraGpuProjection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
@@ -1462,6 +1476,7 @@ namespace Nanite
             cmd.SetComputeFloatParam(shader, "_ZNear", Mathf.Max(1e-3f, camera.nearClipPlane));
             cmd.SetComputeIntParam(shader, "_ShadowCascadeCount", activeCascadeCount);
             cmd.SetComputeVectorArrayParam(shader, "_ShadowFrustumPlanes", shadowBatchFrustumPlanes);
+            cmd.SetComputeVectorParam(shader, "_ShadowProjectionScales", shadowBatchProjectionScales);
             cmd.SetComputeIntParam(shader, "_InstanceCount", instanceCount);
             cmd.SetComputeIntParam(shader, "_PartCount", partCount);
             cmd.SetComputeIntParam(shader, "_ClusterCount", clusterCount);
@@ -1594,6 +1609,8 @@ namespace Nanite
                 cameraPosition.z,
                 0f));
             cmd.SetComputeFloatParam(shader, "_ProjectionScale", projectionScale);
+            cmd.SetComputeFloatParam(shader, "_OrthographicLodScale", projectionScale);
+            cmd.SetComputeIntParam(shader, "_UseOrthographicLod", 1);
             cmd.SetComputeFloatParam(shader, "_ZNear", zNear);
             cmd.SetComputeMatrixParam(shader, "_WorldToClip", shadowWorldToClip);
             cmd.SetComputeVectorParam(shader, "_ScreenSize", new Vector4(
@@ -1948,12 +1965,24 @@ namespace Nanite
         {
             shader.SetVector("_CameraPos", new Vector4(cameraPos.x, cameraPos.y, cameraPos.z, 0f));
             shader.SetFloat("_ProjectionScale", projectionScale);
+            shader.SetFloat("_OrthographicLodScale", 0f);
+            shader.SetInt("_UseOrthographicLod", 0);
             shader.SetFloat("_ZNear", zNear);
             shader.SetMatrix("_WorldToClip", worldToClip);
             shader.SetVector("_ScreenSize", new Vector4(Mathf.Max(1, screenWidth), Mathf.Max(1, screenHeight), 1f / Mathf.Max(1, screenWidth), 1f / Mathf.Max(1, screenHeight)));
             shader.SetInt("_UseHzb", useHzb ? 1 : 0);
             shader.SetInt("_ReversedZ", SystemInfo.usesReversedZBuffer ? 1 : 0);
             shader.SetVectorArray("_FrustumPlanes", frustumPlanes);
+        }
+
+        static float ComputeShadowProjectionScale(Matrix4x4 projectionMatrix, int resolution)
+        {
+            // Directional cascades are orthographic. m00/m11 convert world-space radius to
+            // NDC radius; half the tile resolution converts NDC to shadow texels.
+            float ndcPerWorld = Mathf.Max(
+                Mathf.Abs(projectionMatrix.m00),
+                Mathf.Abs(projectionMatrix.m11));
+            return 0.5f * Mathf.Max(1, resolution) * ndcPerWorld;
         }
 
         void BindHzbTexture(int kernel, Texture hzbTexture)

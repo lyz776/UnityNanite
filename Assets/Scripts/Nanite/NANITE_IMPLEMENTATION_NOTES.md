@@ -296,3 +296,9 @@ Bake 安全修正：terminal ClusterGroup 现在由 `maxParentLodError == float.
 - Unity 已重新编译 `Nanite.dll` 与 `Nanite.Editor.dll`，无新增 C# 错误；仍只有项目原有 3 条 warning。
 
 恢复开发时应先做 Development Player 的 CPU/GPU Timeline 与逐 pass GPU timing，确认 VBuffer raster、material resolve、四级 shadow、Editor/driver wait 各自成本。只有证据表明受限显存流式是当前目标，才继续接入 root-to-leaf GPU traversal、resident ancestor fallback 和请求优先级；不要把继续增加基础设施本身当作性能优化。
+
+### 暂停前 capture 归因
+
+对 `ProfilerCaptures/NN_2026-07-27_17-06-11.data` 的 2,000 帧做 RawFrameData 离线汇总：CPU frame p50 5.620 ms、p95 12.083 ms、平均 6.291 ms。Main Thread 的 `GfxDeviceD3D12.WaitForLastPresentation.WaitForGPU` 平均 1.446 ms；Render Thread 的 `GfxDeviceD3D12.WaitForGPU` 平均 3.958 ms。Nanite CPU 热标记很小：`GpuCullDispatch` inclusive 0.071 ms、`FirstCull` 0.082 ms、`ResolveSubmit` 0.043 ms、`ShadowSubmit` 0.021 ms，`ScenePrepare` 约 0.001 ms。
+
+因此截图里“CPU latency 高”主要是 CPU/Render Thread 等待 GPU 或 Present，不是 GPU Scene 的 CPU 遍历、同步 readback 或 Page 通信。该 capture 的 GPU frame counter 全为 0，未包含可用的逐 pass GPU timestamp；Render Thread 上的 `Nanite/FormalVisibility` 等数字仅是命令提交成本，不能当作 GPU 执行时间。下一次唯一有判别力的验收是开启 GPU Profiler 的 Development Player A/B capture；在此之前不根据 Wait marker 继续修改 CPU 管线。

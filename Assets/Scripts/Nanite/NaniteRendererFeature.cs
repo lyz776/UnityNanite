@@ -164,6 +164,10 @@ namespace Nanite
             [Tooltip("GPU 压实可见三角形后再 DrawIndirect，避免全量三角进 VS。")]
             public bool enableVisibleTriangleCompact = true;
             public ComputeShader visibleTriangleCompactShader;
+            [Tooltip("把 visible-cluster queue 展开为临时硬件索引缓冲，利用 post-transform vertex cache。超出预算的视图在 GPU 上自动回退 procedural。")]
+            public bool enableIndexedClusterRaster = true;
+            [Tooltip("主视图复用全部预算；四级阴影各使用四分之一预算。默认 128 MiB 可覆盖当前 12 车基准。")]
+            [Range(16, 512)] public int indexedClusterBufferMaxMiB = 128;
             public Material vbufferPreviewMaterial;
             public Material vbufferDecodeMaterial;
             public Material vbufferLitResolveMaterial;
@@ -338,6 +342,8 @@ namespace Nanite
             public static readonly int LightDirection = Shader.PropertyToID("_LightDirection");
             public static readonly int LightPosition = Shader.PropertyToID("_LightPosition");
             public static readonly int NaniteShadowViewProj = Shader.PropertyToID("_NaniteShadowViewProj");
+            public static readonly int UseIndexedClusterRaster = Shader.PropertyToID("_UseIndexedClusterRaster");
+            public static readonly int GeometryVertexCount = Shader.PropertyToID("_GeometryVertexCount");
         }
 
         public Settings settings = new Settings();
@@ -364,6 +370,8 @@ namespace Nanite
         int kernelCompactFinalize = -1;
         int kernelCompactFinalizeVisibleQueue = -1;
         int kernelCompactFinalizeShadowQueues = -1;
+        int kernelPrepareIndexedDrawQueue = -1;
+        int kernelBuildIndexedDrawQueue = -1;
 
         const int kCompactSelectionFirst = 1;
         const int kCompactSelectionMerged = 2;
@@ -373,6 +381,9 @@ namespace Nanite
         int lastCompactGeometryGeneration = -1;
         bool lastCompactSucceeded;
         bool lastCompactUsedDirectQueue;
+        int lastIndexedDrawFrame = -1;
+        int lastIndexedDrawSelectionKey;
+        int lastIndexedDrawGeometryGeneration = -1;
         bool loggedCompactStatsOnce;
         bool loggedExecutionOnce;
         bool loggedVBufferOnce;
@@ -539,6 +550,8 @@ namespace Nanite
             kernelCompactFinalize = -1;
             kernelCompactFinalizeVisibleQueue = -1;
             kernelCompactFinalizeShadowQueues = -1;
+            kernelPrepareIndexedDrawQueue = -1;
+            kernelBuildIndexedDrawQueue = -1;
             if (settings.visibleTriangleCompactShader == null)
                 return;
             try
@@ -562,6 +575,16 @@ namespace Nanite
                 {
                     kernelCompactFinalizeShadowQueues = -1;
                 }
+                try
+                {
+                    kernelPrepareIndexedDrawQueue = settings.visibleTriangleCompactShader.FindKernel("CSPrepareIndexedDrawQueue");
+                    kernelBuildIndexedDrawQueue = settings.visibleTriangleCompactShader.FindKernel("CSBuildIndexedDrawQueue");
+                }
+                catch
+                {
+                    kernelPrepareIndexedDrawQueue = -1;
+                    kernelBuildIndexedDrawQueue = -1;
+                }
             }
             catch
             {
@@ -570,6 +593,8 @@ namespace Nanite
                 kernelCompactFinalize = -1;
                 kernelCompactFinalizeVisibleQueue = -1;
                 kernelCompactFinalizeShadowQueues = -1;
+                kernelPrepareIndexedDrawQueue = -1;
+                kernelBuildIndexedDrawQueue = -1;
             }
         }
 
@@ -805,6 +830,31 @@ namespace Nanite
             }
         }
 
+        void RecordIndexedDrawBuildPass(
+            RenderGraph renderGraph,
+            Camera camera,
+            int selectionKey,
+            ProfilingSampler profilingSampler)
+        {
+            if (!settings.enableIndexedClusterRaster || camera == null)
+                return;
+
+            using (var builder = renderGraph.AddUnsafePass<CompactRgPassData>(
+                       "Nanite/BuildIndexedClusterQueue",
+                       out var passData,
+                       profilingSampler))
+            {
+                passData.camera = camera;
+                passData.selectionKey = selectionKey;
+                builder.AllowPassCulling(false);
+                builder.AllowGlobalStateModification(true);
+                builder.SetRenderFunc((CompactRgPassData data, UnsafeGraphContext context) =>
+                {
+                    TryBuildCameraIndexedDraw(context.cmd, data.camera, data.selectionKey);
+                });
+            }
+        }
+
         void LogFormalAssetReadiness()
         {
             if (!IsFormalVisibilityEnabled())
@@ -938,6 +988,45 @@ namespace Nanite
             if (settings.skipWriteDepthWhenNoHzb && !IsHzbActiveForScene())
                 return false;
             return true;
+        }
+
+        bool TryBuildCameraIndexedDraw(
+            UnsafeCommandBuffer cmd,
+            Camera camera,
+            int selectionKey)
+        {
+            if (!settings.enableIndexedClusterRaster || cmd == null || camera == null ||
+                sceneVisibilityBackend == null || !sceneVisibilityBackend.IndexedDrawAvailable ||
+                batchedCulling == null || !lastCompactUsedDirectQueue ||
+                !HasValidCompactForSelection(selectionKey) ||
+                !batchedCulling.IsVisibleDrawQueueReady(camera) ||
+                kernelPrepareIndexedDrawQueue < 0 || kernelBuildIndexedDrawQueue < 0)
+                return false;
+
+            bool built = sceneVisibilityBackend.DispatchIndexedDrawQueue(
+                cmd,
+                settings.visibleTriangleCompactShader,
+                kernelPrepareIndexedDrawQueue,
+                kernelBuildIndexedDrawQueue,
+                batchedCulling.VisibleDrawClusterBuffer,
+                batchedCulling.VisibleDrawCountArgsBuffer);
+            if (built)
+            {
+                lastIndexedDrawFrame = Time.frameCount;
+                lastIndexedDrawSelectionKey = selectionKey;
+                lastIndexedDrawGeometryGeneration = sceneVisibilityBackend.GeometryGeneration;
+            }
+            return built;
+        }
+
+        bool HasValidIndexedDraw(int selectionKey)
+        {
+            return settings.enableIndexedClusterRaster &&
+                   sceneVisibilityBackend != null &&
+                   sceneVisibilityBackend.IndexedDrawAvailable &&
+                   lastIndexedDrawFrame == Time.frameCount &&
+                   lastIndexedDrawSelectionKey == selectionKey &&
+                   lastIndexedDrawGeometryGeneration == sceneVisibilityBackend.GeometryGeneration;
         }
 
         bool ShouldEnqueueSecondCull()
@@ -1163,6 +1252,24 @@ namespace Nanite
                             kernelCompactFinalizeVisibleQueue,
                             batchedCulling.GetShadowDrawCountArgsBuffer(cascadeIndex),
                             batchedCulling.GetShadowDrawArgsBuffer(cascadeIndex));
+                    }
+                }
+
+                if (settings.enableIndexedClusterRaster &&
+                    sceneVisibilityBackend.IndexedDrawAvailable &&
+                    kernelPrepareIndexedDrawQueue >= 0 &&
+                    kernelBuildIndexedDrawQueue >= 0)
+                {
+                    for (int cascadeIndex = 0; cascadeIndex < activeCascadeCount; cascadeIndex++)
+                    {
+                        sceneVisibilityBackend.DispatchIndexedDrawQueue(
+                            context.commandBuffer,
+                            settings.visibleTriangleCompactShader,
+                            kernelPrepareIndexedDrawQueue,
+                            kernelBuildIndexedDrawQueue,
+                            batchedCulling.GetShadowDrawClusterBuffer(cascadeIndex),
+                            batchedCulling.GetShadowDrawCountArgsBuffer(cascadeIndex),
+                            cascadeIndex);
                     }
                 }
             }
@@ -1497,6 +1604,15 @@ namespace Nanite
                 UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
                 if (!resourceData.activeDepthTexture.IsValid())
                     return;
+
+                // Rebuild immediately before raster. The same transient index allocation
+                // is also used by the earlier shadow atlas, so recording this in FirstCull
+                // would allow an intervening queue to overwrite it.
+                RecordIndexedDrawBuildPass(
+                    renderGraph,
+                    cameraData.camera,
+                    kCompactSelectionFirst,
+                    profilingSampler);
 
                 using (var builder = renderGraph.AddRasterRenderPass<DepthWriteRgPassData>("Nanite/WriteDepth", out var passData, profilingSampler))
                 {
@@ -2181,6 +2297,7 @@ namespace Nanite
             bool clearColorHint)
         {
             _ = clearColorHint;
+            RecordIndexedDrawBuildPass(renderGraph, camera, compactSelectionKey, profilingSampler);
             using (var builder = renderGraph.AddRasterRenderPass<FormalRasterRgPassData>(passName, out var passData, profilingSampler))
             {
                 passData.material = rasterMaterial;
@@ -2314,7 +2431,25 @@ namespace Nanite
             bool useCompactVBuffer = CanUseCompactFormalVBuffer();
             CoreUtils.SetKeyword(material, kCompactVBufferKeyword, useCompactVBuffer);
             const int kFormalRasterPass = 1;
-            cmd.DrawProceduralIndirect(Matrix4x4.identity, material, kFormalRasterPass, MeshTopology.Triangles, drawArgsBuffer, 0);
+            var indexedMpb = GetOrCreateVBufferPropertyBlock();
+            indexedMpb.Clear();
+            if (!TryDrawIndexedCameraQueue(
+                    cmd,
+                    material,
+                    kFormalRasterPass,
+                    compactSelectionKey,
+                    indexedMpb))
+            {
+                indexedMpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+                cmd.DrawProceduralIndirect(
+                    Matrix4x4.identity,
+                    material,
+                    kFormalRasterPass,
+                    MeshTopology.Triangles,
+                    drawArgsBuffer,
+                    0,
+                    indexedMpb);
+            }
 
             if (!loggedFormalRasterStats)
             {
@@ -2325,10 +2460,12 @@ namespace Nanite
                 Debug.Log(
                     $"[Nanite][RF] Formal VBuffer raster: geometryTriangles={sceneVisibilityBackend.TriangleCount}, " +
                     $"sceneInstances={sceneVisibilityBackend.InstanceCount}, " +
-                    $"submit={(lastCompactUsedDirectQueue ? "cullQueueIndirect" : "compactIndirect")}, selection={sel}, " +
+                    $"submit={(HasValidIndexedDraw(compactSelectionKey) ? "indexedClusterIndirect" : (lastCompactUsedDirectQueue ? "cullQueueIndirect" : "compactIndirect"))}, selection={sel}, " +
                     $"format={(useCompactVBuffer ? "RG32UI" : "RGBA32F")}, " +
                     $"geometrySource={(sceneVisibilityBackend.UsePackedPageRaster ? "residentCache" : "compatDecoded")}, " +
                     $"residentAddress={(sceneVisibilityBackend.UsePackedPageRaster ? "directAbsoluteIndex" : "n/a")}, " +
+                    $"indexedCapacity=camera:{sceneVisibilityBackend.IndexedDrawClusterCapacity},shadow:{sceneVisibilityBackend.IndexedShadowClusterCapacity}," +
+                    $"bufferMiB:{sceneVisibilityBackend.IndexedDrawBufferBytes / (1024f * 1024f):F1}, " +
                     $"bevyDual={settings.enableBevyFormalDualRaster}, pass=VBufferFormal");
             }
         }
@@ -2624,6 +2761,8 @@ namespace Nanite
             sceneVisibilityBackend ??= new NaniteSceneVisibilityBufferBackend();
             sceneVisibilityBackend.LightProbeRefreshInterval = settings.lightProbeRefreshInterval;
             sceneVisibilityBackend.PagePoolMaxMiB = settings.pagePoolMaxMiB;
+            sceneVisibilityBackend.IndexedDrawRequested = settings.enableIndexedClusterRaster;
+            sceneVisibilityBackend.IndexedDrawBufferMaxMiB = settings.indexedClusterBufferMaxMiB;
             sceneVisibilityBackend.PackedPageRasterRequested = settings.enablePackedPageRaster;
             sceneVisibilityBackend.PageTranscodeShader = settings.pageTranscodeShader;
             sceneVisibilityBackend.PageStreamingRequestsEnabled = settings.enablePageStreamingUploads;
@@ -3289,6 +3428,83 @@ namespace Nanite
             cmd.SetGlobalVector(ShaderIds.LightPosition, new Vector4(lightPosition.x, lightPosition.y, lightPosition.z, 1.0f));
         }
 
+        bool TryDrawIndexedCameraQueue(
+            RasterCommandBuffer cmd,
+            Material material,
+            int shaderPass,
+            int selectionKey,
+            MaterialPropertyBlock mpb)
+        {
+            if (cmd == null || material == null || mpb == null || !HasValidIndexedDraw(selectionKey))
+                return false;
+            GraphicsBuffer indices = sceneVisibilityBackend.IndexedDrawIndexBuffer;
+            GraphicsBuffer indexedArgs = sceneVisibilityBackend.IndexedDrawArgsBuffer;
+            GraphicsBuffer fallbackArgs = sceneVisibilityBackend.IndexedFallbackDrawArgsBuffer;
+            if (indices == null || indexedArgs == null || fallbackArgs == null)
+                return false;
+
+            mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 1);
+            mpb.SetInt(ShaderIds.GeometryVertexCount, sceneVisibilityBackend.GeometryVertexCount);
+            cmd.DrawProceduralIndirect(
+                indices,
+                Matrix4x4.identity,
+                material,
+                shaderPass,
+                MeshTopology.Triangles,
+                indexedArgs,
+                0,
+                mpb);
+            mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+            cmd.DrawProceduralIndirect(
+                Matrix4x4.identity,
+                material,
+                shaderPass,
+                MeshTopology.Triangles,
+                fallbackArgs,
+                0,
+                mpb);
+            return true;
+        }
+
+        bool TryDrawIndexedShadowQueue(
+            RasterCommandBuffer cmd,
+            Material material,
+            int shaderPass,
+            int cascadeIndex,
+            MaterialPropertyBlock mpb)
+        {
+            if (!settings.enableIndexedClusterRaster || cmd == null || material == null || mpb == null ||
+                sceneVisibilityBackend == null || !sceneVisibilityBackend.IndexedDrawAvailable)
+                return false;
+            GraphicsBuffer indices = sceneVisibilityBackend.IndexedDrawIndexBuffer;
+            GraphicsBuffer indexedArgs = sceneVisibilityBackend.GetIndexedShadowDrawArgsBuffer(cascadeIndex);
+            GraphicsBuffer fallbackArgs = sceneVisibilityBackend.GetIndexedShadowFallbackDrawArgsBuffer(cascadeIndex);
+            if (indices == null || indexedArgs == null || fallbackArgs == null)
+                return false;
+
+            mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 1);
+            mpb.SetInt(ShaderIds.GeometryVertexCount, sceneVisibilityBackend.GeometryVertexCount);
+            cmd.DrawProceduralIndirect(
+                indices,
+                Matrix4x4.identity,
+                material,
+                shaderPass,
+                MeshTopology.Triangles,
+                indexedArgs,
+                0,
+                mpb);
+            mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+            cmd.DrawProceduralIndirect(
+                Matrix4x4.identity,
+                material,
+                shaderPass,
+                MeshTopology.Triangles,
+                fallbackArgs,
+                0,
+                mpb);
+            return true;
+        }
+
         void DrawNaniteShadowGeometry(
             RasterCommandBuffer cmd,
             Material material,
@@ -3357,14 +3573,18 @@ namespace Nanite
                 BindCompactDrawState(mpb, kCompactSelectionFirst);
             }
 
-            cmd.DrawProceduralIndirect(
-                Matrix4x4.identity,
-                material,
-                0,
-                MeshTopology.Triangles,
-                activeDrawArgs,
-                0,
-                mpb);
+            if (!(useShadowQueue && TryDrawIndexedShadowQueue(cmd, material, 0, cascadeIndex, mpb)))
+            {
+                mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+                cmd.DrawProceduralIndirect(
+                    Matrix4x4.identity,
+                    material,
+                    0,
+                    MeshTopology.Triangles,
+                    activeDrawArgs,
+                    0,
+                    mpb);
+            }
         }
 
         int DrawDepthFromFirstSelection(CommandBuffer cmd, Material material, Camera camera)
@@ -3606,7 +3826,18 @@ namespace Nanite
             mpb.SetInt(ShaderIds.InstanceId, 0);
             mpb.SetMatrix(ShaderIds.LocalToWorld, Matrix4x4.identity);
             BindCompactDrawState(mpb, kCompactSelectionFirst);
-            cmd.DrawProceduralIndirect(Matrix4x4.identity, material, 0, MeshTopology.Triangles, drawArgsBuffer, 0, mpb);
+            if (!TryDrawIndexedCameraQueue(cmd, material, 0, kCompactSelectionFirst, mpb))
+            {
+                mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+                cmd.DrawProceduralIndirect(
+                    Matrix4x4.identity,
+                    material,
+                    0,
+                    MeshTopology.Triangles,
+                    drawArgsBuffer,
+                    0,
+                    mpb);
+            }
             return 1;
         }
 

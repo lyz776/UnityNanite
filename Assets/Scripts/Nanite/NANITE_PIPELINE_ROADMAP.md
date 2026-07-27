@@ -152,3 +152,5 @@ direct resident index 已完成运行验收，新 capture 为 `ProfilerCaptures/
 跨 Page hierarchy ABI 与 Bake 完整性审计已落地，但尚未接入 GPU traversal。当前全驻留正式路径继续扫描 Instance/Part/Cluster 并使用 resident absolute index；新增层级元数据不会进入每帧热路径，所以本阶段没有 FPS 提升是预期结果。
 
 在继续软件光栅、Mesh Shader、RT 或动态 Page fallback 前，先停止扩展功能并完成一次可归因性能审计：Development Player、固定相机/分辨率/阴影，Nanite 与普通 Mesh 各一份 capture，分别记录 CPU Main/Render、GPU VBuffer、Resolve、Shadow 和 cull pass。找到占主导的 pass 后，再决定优化现有热路径、降低 shadow 工作量、建立小模型 indirect fast path，还是继续动态 Page traversal。
+
+现有 2,000 帧 capture 已排除 Nanite CPU 准备/通信为主瓶颈：Render Thread `WaitForGPU` 平均 3.958 ms、Main Thread presentation wait 平均 1.446 ms，而 Nanite 各 CPU marker 均低于 0.1 ms。capture 没有有效 GPU timestamp，故尚不能在 VBuffer、Resolve、Shadow 之间归因；下一步仍需 GPU Profiler Development Player A/B，而不是继续堆 CPU/GPU Scene 基础设施。

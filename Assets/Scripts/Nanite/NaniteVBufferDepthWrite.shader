@@ -31,6 +31,8 @@ Shader "Nanite/VBufferDepthWrite"
             int _InstanceId;
             float4x4 _LocalToWorld;
             int _UseSceneInstanceBuffer;
+            int _UseIndexedClusterRaster;
+            int _GeometryVertexCount;
 
             struct Attributes
             {
@@ -54,6 +56,16 @@ Shader "Nanite/VBufferDepthWrite"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (_UseIndexedClusterRaster != 0 && _GeometryVertexCount > 0)
+                {
+                    int instanceId = (int)(input.vertexID / (uint)_GeometryVertexCount);
+                    int logicalVertex = (int)(input.vertexID % (uint)_GeometryVertexCount);
+                    float4x4 indexedLocalToWorld = _InstanceLocalToWorld[instanceId];
+                    float3 indexedPositionOS = DecodePositionOS(logicalVertex);
+                    float3 indexedPositionWS = mul(indexedLocalToWorld, float4(indexedPositionOS, 1.0)).xyz;
+                    o.positionCS = TransformWorldToHClip(indexedPositionWS);
+                    return o;
+                }
                 if (!NaniteCompactedTriangleValid(input.vertexID))
                 {
                     float nan = asfloat(0x7FC00000u);
