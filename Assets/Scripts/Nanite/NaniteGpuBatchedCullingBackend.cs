@@ -747,7 +747,7 @@ namespace Nanite
                 shader.SetInt("_EnableVisiblePartQueue", useVisiblePartQueue ? 1 : 0);
                 shader.SetInt("_UseInstanceCull", useVisibleInstanceQueue ? 0 : 1);
                 shader.SetBuffer(activePartKernel, "_Parts", partsBuffer);
-                shader.SetBuffer(activePartKernel, "_PartVisible", partVisibleBuffer);
+                shader.SetBuffer(activePartKernel, "_PartVisibleWrite", partVisibleBuffer);
                 shader.SetBuffer(activePartKernel, "_VisiblePartsOut", visiblePartAppendBuffer);
                 if (useVisibleInstanceQueue)
                 {
@@ -777,7 +777,7 @@ namespace Nanite
                     ComputeBuffer.CopyCount(visiblePartAppendBuffer, visiblePartDispatchArgsBuffer, 0);
                     shader.SetBuffer(
                         kernelFinalizeVisiblePartDispatch,
-                        "_VisiblePartDispatchArgs",
+                        "_VisiblePartDispatchArgsWrite",
                         visiblePartDispatchArgsBuffer);
                     shader.Dispatch(kernelFinalizeVisiblePartDispatch, 1, 1, 1);
                 }
@@ -789,7 +789,11 @@ namespace Nanite
                                           sceneClusterTriCountBuffer != null;
             if (enableVisibleDrawQueue && clearMask)
                 visibleDrawClusterAppendBuffer.SetCounterValue(0);
-            int activeClusterKernel = useVisiblePartQueue
+            // CSClusterCullVisibleParts is the lean direct draw-queue kernel. If
+            // a caller needs the legacy visibility mask instead, keep the normal
+            // part-driven kernel so mask consumers retain their previous ABI.
+            bool useVisiblePartClusterQueue = useVisiblePartQueue && enableVisibleDrawQueue;
+            int activeClusterKernel = useVisiblePartClusterQueue
                 ? kernelClusterCullVisibleParts
                 : (usePartDriven ? kernelClusterCullByPart : kernelClusterCull);
             shader.SetInt("_PartCount", partCount);
@@ -819,7 +823,7 @@ namespace Nanite
                 activeClusterKernel,
                 "_SceneClusterTriCount",
                 sceneClusterTriCountBuffer != null ? sceneClusterTriCountBuffer : fallbackSceneClusterData);
-            if (useVisiblePartQueue)
+            if (useVisiblePartClusterQueue)
             {
                 shader.SetBuffer(activeClusterKernel, "_VisiblePartsIn", visiblePartAppendBuffer);
                 shader.SetBuffer(activeClusterKernel, "_VisiblePartDispatchArgs", visiblePartDispatchArgsBuffer);
@@ -833,7 +837,7 @@ namespace Nanite
             int clusterWorkCount = usePartDriven
                 ? partCount
                 : (hasCpuCandidates ? clusterCandidateCount : clusterCount);
-            if (useVisiblePartQueue)
+            if (useVisiblePartClusterQueue)
             {
                 shader.DispatchIndirect(activeClusterKernel, visiblePartDispatchArgsBuffer, 0);
             }
@@ -904,7 +908,6 @@ namespace Nanite
             shader.SetBuffer(kernel, "_Pass2Drawn", pass2Drawn);
             shader.SetBuffer(kernel, "_VisibleClusters", visibleClusterAppendBuffer);
             shader.SetBuffer(kernel, "_ClusterCandidates", clusterCandidateBuffer);
-            shader.SetBuffer(kernel, "_PartVisible", partVisibleBuffer);
             if (cullStatsBuffer != null)
                 shader.SetBuffer(kernel, "_CullStats", cullStatsBuffer);
             if (partsBuffer != null)
@@ -1368,7 +1371,7 @@ namespace Nanite
                 cmd.SetComputeBufferParam(
                     shader,
                     kernelFinalizeVisiblePartDispatch,
-                    "_VisiblePartDispatchArgs",
+                    "_VisiblePartDispatchArgsWrite",
                     visiblePartDispatchArgsBuffer);
                 cmd.DispatchCompute(shader, kernelFinalizeVisiblePartDispatch, 1, 1, 1);
             }
@@ -1667,7 +1670,7 @@ namespace Nanite
         {
             cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
-            cmd.SetComputeBufferParam(shader, kernel, "_PartVisible", partVisibleBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_PartVisibleWrite", partVisibleBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_InstanceVisible", instanceVisibleBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VisiblePartsOut", visiblePartAppendBuffer);

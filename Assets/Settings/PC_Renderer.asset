@@ -71,7 +71,7 @@ MonoBehaviour:
   m_Active: 1
   settings:
     enable: 1
-    useHzbCulling: 1
+    useHzbCulling: 0
     adaptiveHzbCulling: 1
     hzbMinClusterCount: 50000
     usePreviousHzbOnFirstCull: 0
@@ -102,6 +102,7 @@ MonoBehaviour:
     materialTileMinMaterialCount: 3
     lightProbeRefreshInterval: 30
     enablePackedPageRaster: 1
+    enablePackedDirectDiagnostic: 0
     pageTranscodeShader: {fileID: 7200000, guid: e938f09d1f514e858d563e6c617dd30c, type: 3}
     enablePageStreamingUploads: 0
     pagePoolMaxMiB: 128
@@ -122,6 +123,8 @@ MonoBehaviour:
     maxNaniteShadowCascades: 4
     enableVisibleTriangleCompact: 1
     visibleTriangleCompactShader: {fileID: 7200000, guid: 5ab35da1511a6a34daa40279355a093b, type: 3}
+    enableIndexedClusterRaster: 1
+    indexedClusterBufferMaxMiB: 128
     vbufferPreviewMaterial: {fileID: 0}
     vbufferDecodeMaterial: {fileID: 0}
     vbufferLitResolveMaterial: {fileID: 0}

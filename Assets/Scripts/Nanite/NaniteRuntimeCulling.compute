@@ -48,10 +48,17 @@ StructuredBuffer<GpuClusterData> _Clusters;
 // Each virtual reference is only uint4(instance, geometryIndex, relation/range).
 StructuredBuffer<uint4> _VirtualParts;
 StructuredBuffer<uint4> _VirtualClusters;
-RWStructuredBuffer<uint> _PartVisible;
+// Part cull writes this mask while cluster cull only reads it. Splitting the
+// declarations removes one otherwise unnecessary UAV from cluster kernels.
+StructuredBuffer<uint> _PartVisible;
+RWStructuredBuffer<uint> _PartVisibleWrite;
 AppendStructuredBuffer<uint> _VisiblePartsOut;
 StructuredBuffer<uint> _VisiblePartsIn;
-RWStructuredBuffer<uint> _VisiblePartDispatchArgs;
+// The finalize kernel writes these args, while indirect cluster cull only reads
+// them. Keeping both views separate prevents the read-only cluster kernel from
+// consuming an unnecessary UAV slot on D3D12 (Windows Player supports eight).
+StructuredBuffer<uint> _VisiblePartDispatchArgs;
+RWStructuredBuffer<uint> _VisiblePartDispatchArgsWrite;
 AppendStructuredBuffer<uint> _VisibleInstancesOut;
 StructuredBuffer<uint> _VisibleInstancesIn;
 StructuredBuffer<uint> _VisibleInstancePartDispatchArgs;
@@ -361,7 +368,7 @@ void CullPart(uint i)
     GpuPartData part = LoadPartData(i, instanceIndex, unusedClusterStart, unusedClusterCount);
     if (_UseInstanceCull != 0 && _InstanceVisible[instanceIndex] == 0u)
     {
-        _PartVisible[i] = 0u;
+        _PartVisibleWrite[i] = 0u;
         return;
     }
     float lodError = LodErrorPixels(instanceIndex);
@@ -376,7 +383,7 @@ void CullPart(uint i)
     if (visible && _CullPassMode != CULL_MODE_PASS1 && IsOccludedByHzb(selfSphere))
         visible = false;
 
-    _PartVisible[i] = visible ? 1u : 0u;
+    _PartVisibleWrite[i] = visible ? 1u : 0u;
     if (visible && _EnableVisiblePartQueue != 0)
         _VisiblePartsOut.Append(i);
 }
@@ -584,11 +591,57 @@ void CSFinalizeVisiblePartDispatch(uint3 id : SV_DispatchThreadID)
 {
     if (id.x != 0u)
         return;
-    uint visiblePartCount = _VisiblePartDispatchArgs[0];
-    _VisiblePartDispatchArgs[0] = (visiblePartCount + 63u) / 64u;
-    _VisiblePartDispatchArgs[1] = 1u;
-    _VisiblePartDispatchArgs[2] = 1u;
-    _VisiblePartDispatchArgs[3] = visiblePartCount;
+    uint visiblePartCount = _VisiblePartDispatchArgsWrite[0];
+    _VisiblePartDispatchArgsWrite[0] = (visiblePartCount + 63u) / 64u;
+    _VisiblePartDispatchArgsWrite[1] = 1u;
+    _VisiblePartDispatchArgsWrite[2] = 1u;
+    _VisiblePartDispatchArgsWrite[3] = visiblePartCount;
+}
+
+// The visible-part path feeds the direct raster queue and does not consume the
+// legacy mask/Bevy bookkeeping outputs. Keeping it in a dedicated function is
+// important on Windows: the old generic CullCluster path reflected nine UAVs,
+// while D3D11-class Player dispatches accept at most eight.
+void CullVisiblePartClusterToDrawQueue(uint clusterIdx)
+{
+    int instanceIndex;
+    int virtualPartIndex;
+    uint globalPageIndex;
+    GpuClusterData cluster = LoadClusterData(
+        clusterIdx,
+        instanceIndex,
+        virtualPartIndex,
+        globalPageIndex);
+    if (virtualPartIndex < 0 || virtualPartIndex >= _PartCount ||
+        _PartVisible[virtualPartIndex] == 0u)
+        return;
+
+    // Compatibility/resident rendering still draws the geometry while streaming
+    // is introduced, so this can request a missing page without rejecting it.
+    RequestPageIfNeeded(globalPageIndex);
+
+    float lodError = LodErrorPixels(instanceIndex);
+    float4 selfSphere = TransformSphere(cluster.selfSphere, instanceIndex);
+    if (!SphereVisible(selfSphere))
+        return;
+    float4 parentSphere = TransformSphere(
+        cluster.parentSphere.w > 0 ? cluster.parentSphere : cluster.selfSphere,
+        instanceIndex);
+    if (!ShouldSelectClusterLod(
+            cluster.parentError,
+            cluster.selfError,
+            parentSphere,
+            selfSphere,
+            lodError,
+            instanceIndex) ||
+        ProjectedDiameterPixels(selfSphere) < 1.0 ||
+        IsOccludedByHzb(selfSphere))
+        return;
+
+    if (clusterIdx >= (uint)_ClusterCount)
+        return;
+    uint sceneClusterIndex = _ClusterSceneIndex[clusterIdx];
+    AppendVisibleDrawCluster(sceneClusterIndex, (uint)instanceIndex);
 }
 
 // Indirect cluster stage: only revisit parts that survived Instance/Part culling.
@@ -604,13 +657,13 @@ void CSClusterCullVisibleParts(uint3 id : SV_DispatchThreadID)
     if (partIndex >= (uint)_PartCount)
         return;
 
-    int instanceIndex;
+    int unusedInstanceIndex;
     uint clusterStart;
     uint clusterCount;
-    LoadPartData(partIndex, instanceIndex, clusterStart, clusterCount);
+    LoadPartData(partIndex, unusedInstanceIndex, clusterStart, clusterCount);
     uint end = min((uint)_ClusterCount, clusterStart + clusterCount);
     for (uint clusterIndex = clusterStart; clusterIndex < end; clusterIndex++)
-        CullCluster(clusterIndex);
+        CullVisiblePartClusterToDrawQueue(clusterIndex);
 }
 
 bool ShadowSphereVisible(float4 sphere, int cascadeIndex)

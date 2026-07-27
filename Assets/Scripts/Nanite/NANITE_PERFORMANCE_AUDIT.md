@@ -96,3 +96,64 @@
 曾尝试让 Formal `pass1` 直接复用 Depth 生成的 camera index slice，以省去约 310 万个索引的第二次写入。实机结果从约 309 FPS 降至约 215 FPS；即便关闭 indexed 路径仍更低，且 capture 中出现 GPU 9～12 ms 与更长的 RenderLoop 峰值。该变更已立即撤销。
 
 结论：当前 Unity 6 / D3D12 RenderGraph 下，跨 Depth 与 Formal raster pass 延长动态 index/indirect buffer 生命周期会造成比重建更重的资源状态/队列依赖。正式路径保持“消费前就地重建”，不再凭静态重复工作量推断性能。
+
+## Windows Player GPU Profiler（2026-07-28）
+
+有效 capture：`ProfilerCaptures/UnityNanite_2026-07-28_00-55-41.data`，Player 连接为 `lyz-pc - UnityNanite`，目标 4K、12 车、四级主光阴影。配套文件包括 `.png` 和 `.highlights`。
+
+本次 Player 日志确认 Windows 回归已解除：无 `CSClusterCullVisibleParts` 9-UAV 报错，无 runtime shader `MISSING`；`Formal VBuffer raster` 与 `Formal Resolve` 均入图，`submit=indexedClusterIndirect`、`geometrySource=residentCache`、`cascades=4/4`。
+
+Profiler 截图中的代表帧约为 CPU 6.56 ms、GPU 2.38 ms；选区 median frame time 约 2.62 ms，max 13.13 ms。GPU Hierarchy 代表帧显示主要 Nanite/URP pass：
+
+| Marker | GPU ms |
+|---|---:|
+| `Nanite/FormalVisibility` | 0.808 |
+| `Graphics.DrawProcedural` under FormalVisibility | 0.702 |
+| `Draw Main Light Shadowmap` | 0.485 |
+| `Nanite/WriteDepth` | 0.465 |
+| `Nanite Main Light Shadow Cull` | 0.191 |
+| `Bloom` | 0.071 |
+| `RG_UberPost` | 0.053 |
+| `Draw GBuffer` | 0.044 |
+| `Render Deferred Lighting` | 0.038 |
+| `Nanite/BuildHzb` | 0.034 |
+| `CopyDepth` | 0.022 |
+
+初步结论：该 Player capture 首次提供了有效 GPU timestamp。当前热区集中在 Formal VBuffer raster、WriteDepth 和主光阴影，cull/HZB 很小；CPU Timeline 的长条主要仍是 `DXGI.WaitOnSwapChain` / render-thread 等待，不应作为 Nanite C# 热点处理。下一步需要同一视角普通 Mesh A/B capture，判断 indexed Nanite 相对 Unity Mesh renderer 的真实 GPU 成本差距；若继续优化 Nanite，优先看如何合并或减少 Depth/Formal 的重复 raster，以及 shadow/depth 的 indexed draw 成本，而不是扩展 Page traversal 或 CPU 管线。
+
+### Ordinary Mesh A/B（2026-07-28）
+
+普通 Mesh 对照 capture：`ProfilerCaptures/UnityNanite_2026-07-28_01-04-22.data`，同为 4K、12 车、四级主光阴影。Player 日志显示 `externalNanite=False`，说明该 capture 没有 Nanite 外部 shadow caster 与 Formal VBuffer pass 介入。
+
+普通 Mesh Editor/Game Stats 约为 521 FPS（1.9 ms），CPU main 1.9 ms、render thread 1.1 ms，64 batches、27 SetPass，Triangles 12.8M、Vertices 9.6M。Profiler 选区 median frame time 约 1.470 ms、max 6.492 ms、min 1.182 ms；代表帧 CPU 1.34 ms、GPU 1.32 ms。GPU Hierarchy 代表帧：
+
+| Marker | GPU ms |
+|---|---:|
+| `Draw Main Light Shadowmap` | 0.676 |
+| `Draw GBuffer` | 0.432 |
+| `Bloom` | 0.069 |
+| `Render Deferred Lighting` | 0.037 |
+| `CopyDepth` | 0.020 |
+| `DrawSkybox` | 0.014 |
+| `CopyColor` | 0.007 |
+| `Blit Color LUT` | 0.003 |
+
+A/B 结论：
+
+| Capture | Median frame | Representative GPU | Camera geometry | Shadow |
+|---|---:|---:|---:|---:|
+| Nanite indexed | 2.621 ms | 2.38 ms | `FormalVisibility` 0.808 ms + `WriteDepth` 0.465 ms | 0.485 ms + Nanite shadow cull 0.191 ms |
+| Ordinary Mesh | 1.470 ms | 1.32 ms | `Draw GBuffer` 0.432 ms | 0.676 ms |
+
+普通 Mesh 尽管提交的统计三角形更多，但 SRP Batcher + 常规 indexed mesh 的 camera path 只需一次 GBuffer raster；Nanite 当前要执行 depth prepass、Formal VBuffer raster 与 resolve/后续 GBuffer 合成，单 camera 几何成本已经接近或超过普通 Mesh 全帧 GPU。主光阴影方面，Nanite 的纯 shadow raster 比普通 Mesh 低，但加上 Nanite shadow cull 后差距变小，整体瓶颈仍主要是 camera path 的重复 raster/resolve，而不是 shadow 或 cull。
+
+下一步优化优先级：
+
+1. 优先减少 camera path 的重复几何工作：评估是否能让 Formal VBuffer 同时产出可用于后续深度测试的 depth，或在 URP Deferred 下跳过独立 `Nanite/WriteDepth`，避免 Depth + Formal 双 raster。
+2. 评估 Formal Resolve/GBuffer merge 成本是否能并入更少的 full-screen pass；普通 Mesh 的优势来自直接写 GBuffer，而 Nanite 现在多了一次 VBuffer 解码/材质恢复。
+3. Shadow 只作为第二优先级：当前 ordinary mesh shadow 0.676 ms，Nanite shadow raster 0.485 ms、cull 0.191 ms，收益空间小于 camera path。
+4. 暂停 Page traversal、RT、软件光栅与 CPU 侧管线扩展；这些不解决本次 A/B 暴露的主要 1.0 ms 级差距。
+
+已切换下一轮验证配置：`Assets/Settings/PC_Renderer.asset` 将 `useHzbCulling` 设为 `0`。现有准入逻辑会因此跳过 `Nanite/WriteDepth`、`Nanite/BuildHzb` 与 `Nanite/SecondCull`，Formal raster 仍写入 VBuffer/Depth，作为“Formal-only camera path”A/B。下一次 Nanite Player capture 需确认日志不再出现 `hzbActive=True` 或 `Nanite/WriteDepth`，并比较 GPU 是否从约 2.38 ms 接近普通 Mesh 的 1.32 ms。
+
+Game View 快速回归（非最终 Profiler 数据）：关 HZB 后同 4K / 12 车视角约 364.1 FPS（2.7 ms），CPU main 2.7 ms、render thread 1.7 ms、40 batches / 40 SetPass，Stats 面板 GPU 延迟落入 1.x ms 区间。相对 HZB 开启时约 309 FPS 小幅提升，说明无 HZB 的 Formal-only camera path 方向成立；仍需 Player GPU Profiler capture 确认 `Nanite/WriteDepth`、`Nanite/BuildHzb`、`Nanite/SecondCull` 已消失，并记录 Formal raster/resolve 的真实 GPU ms。

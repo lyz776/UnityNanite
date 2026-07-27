@@ -302,3 +302,21 @@ Bake 安全修正：terminal ClusterGroup 现在由 `maxParentLodError == float.
 对 `ProfilerCaptures/NN_2026-07-27_17-06-11.data` 的 2,000 帧做 RawFrameData 离线汇总：CPU frame p50 5.620 ms、p95 12.083 ms、平均 6.291 ms。Main Thread 的 `GfxDeviceD3D12.WaitForLastPresentation.WaitForGPU` 平均 1.446 ms；Render Thread 的 `GfxDeviceD3D12.WaitForGPU` 平均 3.958 ms。Nanite CPU 热标记很小：`GpuCullDispatch` inclusive 0.071 ms、`FirstCull` 0.082 ms、`ResolveSubmit` 0.043 ms、`ShadowSubmit` 0.021 ms，`ScenePrepare` 约 0.001 ms。
 
 因此截图里“CPU latency 高”主要是 CPU/Render Thread 等待 GPU 或 Present，不是 GPU Scene 的 CPU 遍历、同步 readback 或 Page 通信。该 capture 的 GPU frame counter 全为 0，未包含可用的逐 pass GPU timestamp；Render Thread 上的 `Nanite/FormalVisibility` 等数字仅是命令提交成本，不能当作 GPU 执行时间。下一次唯一有判别力的验收是开启 GPU Profiler 的 Development Player A/B capture；在此之前不根据 Wait marker 继续修改 CPU 管线。
+
+## 3.14 Indexed Cluster Raster 已验收（2026-07-27）
+
+- 保持 GPU visible-cluster queue 和 VBuffer `(instanceId, triangleId)` ABI 不变；新 compute 把当前视图的可见 cluster 展开为临时 32-bit index buffer，索引编码为 `instance * geometryVertexCount + geometryVertex`。
+- Formal VBuffer、WriteDepth 与四级 shadow 均使用带 `GraphicsBuffer indexBuffer` 的 `DrawProceduralIndirect`。VS 从 `SV_VertexID` 恢复实例与唯一几何顶点，PS 从 `SV_PrimitiveID` 恢复原 triangle ID，因此 Resolve、材质映射和 Page ABI 无需迁移。
+- 128 MiB 为默认临时 index 预算；阴影四个 cascade 使用互不重叠的四分之一区间，shadow 完成后 camera 复用整块。若任何 view 超出容量，GPU 将 indexed draw 参数置零并仅执行原 procedural fallback，不发生 CPU readback，也不会漏绘几何。
+- 同一 12 车、4K、四级主光阴影的实机 A/B：从相近视角约 236.7 FPS（Main 4.2 ms、Render 3.8 ms）提升至 309.2 FPS（Main 3.2 ms、Render 2.1 ms）。日志确认 `submit=indexedClusterIndirect`、`geometrySource=residentCache`、`cascades=4/4`，且无 warning/error。说明此前主要瓶颈确为 procedural vertex amplification，indexed cluster raster 保留为 D3D12/Unity 6 正式路径。
+- 尝试跨 Depth 与 Formal pass 复用 camera index slice 反而将性能降至约 215 FPS，已撤销；正式路径在每个消费点就地重建 index/args，避免拉长动态 buffer 的 RenderGraph 资源生命周期。
+
+接下来的唯一性能决策门槛是 Development Player 的 GPU Profiler A/B：固定同一相机、4K、阴影和场景，分别采集 Nanite 与普通 Mesh，记录 GPU VBuffer raster、material resolve、四级 shadow、cull/HZB 以及 CPU Main/Render。取得这些 timestamp 前，不继续扩展 Page traversal、软件光栅、Mesh Shader 或 RT。
+
+为保证该验收可复现，`Nanite/Performance/Build GPU Profiler Development Player` 菜单会基于当前启用的 Build Settings scene 构建 Windows Development Player（自动连接 Profiler、StrictMode），但不修改项目的默认分辨率。使用 `-screen-width 3840 -screen-height 2160 -screen-fullscreen 0` 启动 Player 后，在 Profiler 启用 GPU Usage，再分别采集 Nanite 与普通 Mesh 的固定相机窗口。
+
+### Windows Player 回归修复（2026-07-28）
+
+- 首个 Development Player 暴露 `CSClusterCullVisibleParts` 使用 9 个 UAV、而 Windows Player 仅支持 8 个的兼容问题。该 kernel 现只负责 visible Part 到 direct draw queue 的展开；legacy mask、two-pass 候选和统计输出不再被其资源反射带入。`PartVisible` 与 indirect dispatch args 均拆为 PartCull 的 RW writer 和 ClusterCull 的只读 SRV，保证该路径处于 UAV 上限内。
+- Player 中 `Shader.Find("Nanite/VBufferPacketRaster")`、`VBufferLitResolve` 等运行时创建材质所需 shader 曾被 build stripping 移除，导致 Formal VBuffer pass 被跳过。2026-07-28 的 `UnityNanite` Player 日志确认 9-UAV 报错已消失，但仍因 `PacketRaster=MISSING, LitResolve=MISSING` 跳过 Formal pass；根因是 `GraphicsSettings` 尚未真正保存 Nanite shader 引用。五个运行时 Nanite shader 现显式写入 Always Included Shaders，GPU profiler 构建菜单也会在 Build 前自动补齐并保存这些引用，后续 Player 不依赖 Editor 的已导入 shader 状态。
+- 项目 Player Settings 的旧 Product Name 为 `NN`，这只影响窗口标题和 Profiler connection 名称，不代表构建来自其他项目；现已统一为 `UnityNanite`。

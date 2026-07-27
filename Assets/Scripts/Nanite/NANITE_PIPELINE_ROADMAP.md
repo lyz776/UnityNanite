@@ -143,7 +143,7 @@ Nyx 的可复用思想是模块边界和数据流，而不是直接照搬 DX12 M
 3. 已实现 Page 驻留时批量 GPU transcode：NPG1/NZC1 与 Page Pool ABI 不变，48-byte full vertex 与绝对 `uint` resident index 仅生成一次；生产绘制通过每三角形 direct resident index 起点访问顶点，不再读取 Decode/Resident Page Table。`compressed-direct` 仅保留为默认关闭的诊断变体。
 4. 受限池的 resident vertex/index range allocator、失效表先发布和帧末 `GraphicsFence` retirement 已完成；全驻留 12 车路径保持固定地址且不注册额外 fence pass。下一流式硬门槛是 residency-aware parent/root fallback 与 request priority，之后才能解除“全部 Page 必须驻留”的生产准入限制。
 5. terminal/root Group 标记、root Page 前缀、root/non-root 硬边界与 Page locality root 审计已补完。运行成本验收后重 Bake Toyota，继续 chunk IO、page-aware adjacency/METIS、micro software raster、Mesh Shader/native plugin，以及复用 SceneDB/Page residency 的 BLAS/TLAS/RTX reflection/RTGI。
-6. 当前等待同一 12 车 4K 视角验收 direct resident index 热路径：画面、材质、Depth、四级 shadow、稳定 FPS/Main/Render。目录内仍只有旧的 2000 帧 capture；若要分析截图中 3837 帧长尾，需要另存该 capture 后再做逐 marker 归因。
+6. direct resident index 热路径和 indexed cluster raster 已完成 12 车 4K 验收：四级阴影、材质和 VBuffer 正确，indexed A/B 从约 236.7 FPS 提升至 309.2 FPS。正式路径保留消费点就地构建的 index buffer；跨 Depth/Formal pass 复用会延长 RenderGraph buffer 生命周期并实测回退，已撤销。
 
 ## 暂停点与下一次决策门槛（2026-07-27）
 
