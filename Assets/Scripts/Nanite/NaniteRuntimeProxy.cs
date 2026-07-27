@@ -41,6 +41,14 @@ namespace Nanite
         [Tooltip("仅 Proxy 自驱路径生效。Feature 驱动时用 Feature.useBvhCandidates，本开关无效。")]
         public bool useBvh = true;
 
+        [Header("Pipeline Admission")]
+        [Tooltip("始终进入虚拟几何管线；用于低面模型对比或强制 Nanite。")]
+        public bool forceNaniteRendering = false;
+        [Tooltip("始终交给普通 MeshRenderer/SRP 路径。与 forceNaniteRendering 同时开启时 Nanite 优先。")]
+        public bool forceRasterRendering = false;
+        [Tooltip("低复杂度回退使用的原始 Mesh。留空时优先使用 NaniteMesh.sourceMesh，其次捕获当前 MeshFilter。")]
+        public Mesh rasterFallbackMesh;
+
         [Header("Resolve Materials")]
         [Tooltip("可选：覆盖 VBuffer→GBuffer Resolve 使用的材质。留空则从 Renderer.sharedMaterials 读取；仍无则使用 URP Lit 回退。")]
         public Material[] resolveMaterials;
@@ -89,6 +97,10 @@ namespace Nanite
         Mesh debugMesh;
         MeshFilter debugMeshFilter;
         MeshRenderer debugMeshRenderer;
+        Mesh capturedRasterFallbackMesh;
+        Mesh admissionCountMesh;
+        int admissionTriangleCount;
+        bool rasterFallbackActive;
         NaniteGpuCullingBackend gpuBackend;
         NaniteMesh gpuBackendMesh;
         ComputeShader gpuBackendShader;
@@ -141,16 +153,59 @@ namespace Nanite
         public ComputeBuffer VisiblePageRangeBuffer => selectionPageRangeBuffer;
         public int VisiblePacketCount => runtimeSelection.packets.Count;
         public int VisiblePageRangeCount => runtimeSelection.pageRanges.Count;
+        public bool NaniteRenderingActive => !rasterFallbackActive;
+        public bool RasterFallbackActive => rasterFallbackActive;
+
+        public int RasterFallbackTriangleCount
+        {
+            get
+            {
+                Mesh mesh = ResolveRasterFallbackMesh();
+                if (mesh == null)
+                    return naniteMesh != null ? Mathf.Max(0, naniteMesh.sourceTriangleCount) : 0;
+                if (admissionCountMesh == mesh)
+                    return admissionTriangleCount;
+
+                long indexCount = 0;
+                for (int subMesh = 0; subMesh < mesh.subMeshCount; subMesh++)
+                    indexCount += (long)mesh.GetIndexCount(subMesh);
+                admissionCountMesh = mesh;
+                admissionTriangleCount = (int)Math.Min(int.MaxValue, indexCount / 3L);
+                return admissionTriangleCount;
+            }
+        }
+
+        public bool CanUseRasterFallback =>
+            ResolveRasterFallbackMesh() != null &&
+            GetComponent<MeshFilter>() != null &&
+            GetComponent<MeshRenderer>() != null;
+
+        public bool NativeRendererRequested
+        {
+            get
+            {
+                if (forceNaniteRendering)
+                    return false;
+                if (forceRasterRendering)
+                    return true;
+                if (renderVisibleMesh)
+                    return false;
+                MeshRenderer renderer = GetComponent<MeshRenderer>();
+                return renderer != null && renderer.enabled;
+            }
+        }
 
         void Awake()
         {
             TryAutoLoadNaniteMesh();
+            CaptureRasterFallbackMesh();
             EnsureDebugRenderer();
         }
 
         void OnEnable()
         {
             TryAutoLoadNaniteMesh();
+            CaptureRasterFallbackMesh();
             EnsureDebugRenderer();
             NaniteRuntimeRegistry.Register(this);
         }
@@ -158,6 +213,19 @@ namespace Nanite
         void LateUpdate()
         {
             TryAutoLoadNaniteMesh();
+
+            if (rasterFallbackActive)
+            {
+                visible.Clear();
+                runtimeSelection.Clear();
+                visibleClusterCount = 0;
+                visiblePageCount = 0;
+                testedNodeCount = 0;
+                testedPartCount = 0;
+                testedClusterCount = 0;
+                testedInstanceCount = 0;
+                return;
+            }
 
             // Feature 驱动时必须最先返回：禁止 UploadSelectionBuffers / 重复剔除。
             // Proxy 上 Use Bvh / Use Gpu Culling 此时不参与（由 RendererFeature 全局路径决定）。
@@ -369,8 +437,49 @@ namespace Nanite
         void OnValidate()
         {
             TryAutoLoadNaniteMesh();
+            CaptureRasterFallbackMesh();
             if (!useGpuCulling || gpuCullingShader == null)
                 DisposeGpuBackend();
+            NaniteRuntimeRegistry.NotifyRenderDataChanged(this);
+        }
+
+        public bool SetRasterFallbackActive(bool enabled)
+        {
+            CaptureRasterFallbackMesh();
+            Mesh source = ResolveRasterFallbackMesh();
+            bool next = enabled && !forceNaniteRendering && source != null &&
+                        debugMeshFilter != null && debugMeshRenderer != null;
+            if (rasterFallbackActive == next)
+            {
+                if (next)
+                {
+                    debugMeshFilter.sharedMesh = source;
+                    debugMeshRenderer.enabled = true;
+                }
+                return next;
+            }
+
+            rasterFallbackActive = next;
+            if (next)
+            {
+                ClearDebugMesh();
+                debugMeshFilter.sharedMesh = source;
+                debugMeshRenderer.enabled = true;
+                debugMeshRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On;
+            }
+            else if (debugMeshRenderer != null && !renderVisibleMesh)
+            {
+                debugMeshRenderer.enabled = false;
+            }
+
+            NaniteRuntimeRegistry.NotifyRenderDataChanged(this);
+            return rasterFallbackActive;
+        }
+
+        /// <summary>Call after changing naniteMesh or resolveMaterials from script.</summary>
+        public void MarkRenderDataDirty()
+        {
+            NaniteRuntimeRegistry.NotifyRenderDataChanged(this);
         }
 
         void OnDisable()
@@ -694,7 +803,7 @@ namespace Nanite
                 if (debugMaterial != null)
                     debugMeshRenderer.sharedMaterial = debugMaterial;
             }
-            else if (debugMeshFilter != null)
+            else if (debugMeshFilter != null && debugMeshFilter.sharedMesh == debugMesh)
             {
                 debugMeshFilter.sharedMesh = null;
             }
@@ -703,10 +812,30 @@ namespace Nanite
         void ClearDebugMesh()
         {
             // 已清空时不要每帧 Mesh.Clear()，否则 Profiler 会出现持续 UpdateBufferData_Request。
-            if (debugMeshFilter != null && debugMeshFilter.sharedMesh != null)
+            if (debugMeshFilter != null && debugMeshFilter.sharedMesh == debugMesh)
                 debugMeshFilter.sharedMesh = null;
             if (debugMesh != null && debugMesh.vertexCount > 0)
                 debugMesh.Clear();
+        }
+
+        void CaptureRasterFallbackMesh()
+        {
+            if (debugMeshFilter == null)
+                debugMeshFilter = GetComponent<MeshFilter>();
+            if (debugMeshRenderer == null)
+                debugMeshRenderer = GetComponent<MeshRenderer>();
+            if (capturedRasterFallbackMesh == null && debugMeshFilter != null &&
+                debugMeshFilter.sharedMesh != null && debugMeshFilter.sharedMesh != debugMesh)
+                capturedRasterFallbackMesh = debugMeshFilter.sharedMesh;
+        }
+
+        Mesh ResolveRasterFallbackMesh()
+        {
+            if (rasterFallbackMesh != null)
+                return rasterFallbackMesh;
+            if (naniteMesh != null && naniteMesh.sourceMesh != null)
+                return naniteMesh.sourceMesh;
+            return capturedRasterFallbackMesh;
         }
 
         Vector4 TransformSphere(in Vector4 localSphere, float maxScale)

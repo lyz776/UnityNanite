@@ -72,14 +72,23 @@ MonoBehaviour:
   settings:
     enable: 1
     useHzbCulling: 1
+    adaptiveHzbCulling: 1
+    hzbMinClusterCount: 50000
     usePreviousHzbOnFirstCull: 0
     useBvhCandidates: 1
+    cpuBvhMaxInstances: 0
+    gpuPartQueueMinVirtualParts: 4096
+    gpuInstanceQueueMinInstances: 8
+    shadowPartQueueMinVirtualParts: 32768
+    shadowInstanceQueueMinInstances: 64
+    enableSmallMeshRasterFallback: 1
+    smallMeshTriangleThreshold: 2048
     enableBevyTwoPhaseOcclusion: 1
     enablePrevVisiblePass1Filter: 1
-    enableBevyFormalDualRaster: 1
+    enableBevyFormalDualRaster: 0
     skipWriteDepthWhenNoHzb: 1
     overrideLodErrorPixels: 2
-    logStats: 1
+    logStats: 0
     enableVBufferPreview: 0
     vbufferPreviewMaxPackets: 1
     enableDebugVisualization: 0
@@ -87,8 +96,18 @@ MonoBehaviour:
     debugVisualizationEvent: 300
     enableFormalVisibilityBuffer: 1
     enableFormalVisibilityBufferExperimentalGate: 1
+    enableCompactFormalVBuffer: 1
     enableMaterialTileCulling: 1
-    materialTileSize: 13
+    adaptiveMaterialTileCulling: 1
+    materialTileMinMaterialCount: 3
+    lightProbeRefreshInterval: 30
+    enablePackedPageRaster: 1
+    pageTranscodeShader: {fileID: 7200000, guid: e938f09d1f514e858d563e6c617dd30c, type: 3}
+    enablePageStreamingUploads: 0
+    pagePoolMaxMiB: 128
+    pageRequestReadbackInterval: 3
+    pageUploadsPerPoll: 8
+    materialTileSize: 16
     hzbHalfResolution: 1
     hzbMinMipSize: 8
     formalVBufferHalfResolution: 0
@@ -100,6 +119,7 @@ MonoBehaviour:
     enableIndirectPreviewDraw: 0
     enableSceneIndirectDepthWrite: 1
     enableShadowCasting: 1
+    maxNaniteShadowCascades: 4
     enableVisibleTriangleCompact: 1
     visibleTriangleCompactShader: {fileID: 7200000, guid: 5ab35da1511a6a34daa40279355a093b, type: 3}
     vbufferPreviewMaterial: {fileID: 0}

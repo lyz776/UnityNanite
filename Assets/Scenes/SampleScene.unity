@@ -119,6 +119,141 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
+--- !u!1 &159561527
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 159561531}
+  - component: {fileID: 159561530}
+  - component: {fileID: 159561529}
+  - component: {fileID: 159561528}
+  m_Layer: 0
+  m_Name: GameObject (13)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &159561528
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 159561527}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &159561529
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 159561527}
+  m_Mesh: {fileID: 0}
+--- !u!114 &159561530
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 159561527}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &159561531
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 159561527}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -41.47, y: 0, z: 13.95}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &330585543
 GameObject:
   m_ObjectHideFlags: 0
@@ -205,8 +340,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
-  m_LocalRotation: {x: -0.11339371, y: 0.8821543, z: -0.27289614, w: -0.3667061}
-  m_LocalPosition: {x: -43.62185, y: 3.33393, z: 22.925465}
+  m_LocalRotation: {x: -0.094193414, y: 0.89955443, z: -0.24056366, w: -0.35221967}
+  m_LocalPosition: {x: -38.824432, y: 5.044585, z: 27.980064}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -256,6 +391,276 @@ MonoBehaviour:
     m_VarianceClampScale: 0.9
     m_ContrastAdaptiveSharpening: 0
   m_Version: 2
+--- !u!1 &356191684
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 356191688}
+  - component: {fileID: 356191687}
+  - component: {fileID: 356191686}
+  - component: {fileID: 356191685}
+  m_Layer: 0
+  m_Name: GameObject (4)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &356191685
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356191684}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &356191686
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356191684}
+  m_Mesh: {fileID: 0}
+--- !u!114 &356191687
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356191684}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &356191688
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356191684}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -43.82, y: 0, z: 19.32}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &356747291
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 356747295}
+  - component: {fileID: 356747294}
+  - component: {fileID: 356747293}
+  - component: {fileID: 356747292}
+  m_Layer: 0
+  m_Name: GameObject (8)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &356747292
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356747291}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &356747293
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356747291}
+  m_Mesh: {fileID: 0}
+--- !u!114 &356747294
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356747291}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &356747295
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 356747291}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -46.15, y: 0, z: 24.07}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0
@@ -347,13 +752,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 410087039}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.40821788, y: -0.23456968, z: 0.10938163, w: 0.8754261}
+  m_LocalRotation: {x: 0.12833469, y: -0.2565245, z: 0.03438717, w: 0.95736253}
   m_LocalPosition: {x: 0, y: 3, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 50, y: -30, z: 0}
+  m_LocalEulerAnglesHint: {x: 15.27, y: -30, z: 0}
 --- !u!114 &410087042
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -412,6 +817,141 @@ Material:
     - _Tint: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1
+--- !u!1 &481381657
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 481381661}
+  - component: {fileID: 481381660}
+  - component: {fileID: 481381659}
+  - component: {fileID: 481381658}
+  m_Layer: 0
+  m_Name: GameObject (5)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &481381658
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 481381657}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &481381659
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 481381657}
+  m_Mesh: {fileID: 0}
+--- !u!114 &481381660
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 481381657}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &481381661
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 481381657}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -41.46, y: 0, z: 19.29}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &536820285
 GameObject:
   m_ObjectHideFlags: 0
@@ -510,6 +1050,9 @@ MonoBehaviour:
   targetCamera: {fileID: 330585545}
   lodErrorPixels: 1
   useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
   resolveMaterials:
   - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
   renderVisibleMesh: 0
@@ -522,8 +1065,8 @@ MonoBehaviour:
   drawClusterBounds: 0
   drawOnlyVisibleClusterBounds: 1
   boundsSphereScale: 1
-  visibleClusterCount: 5231
-  lastGpuVisibleApprox: 5231
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
   visiblePageCount: 0
   testedInstanceCount: 0
   testedNodeCount: 0
@@ -539,6 +1082,276 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: -46.119, y: 0, z: 19.335}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &655979748
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 655979752}
+  - component: {fileID: 655979751}
+  - component: {fileID: 655979750}
+  - component: {fileID: 655979749}
+  m_Layer: 0
+  m_Name: GameObject (14)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &655979749
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 655979748}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &655979750
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 655979748}
+  m_Mesh: {fileID: 0}
+--- !u!114 &655979751
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 655979748}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &655979752
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 655979748}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -34.65, y: 0, z: 28.52}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &691413371
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 691413375}
+  - component: {fileID: 691413374}
+  - component: {fileID: 691413373}
+  - component: {fileID: 691413372}
+  m_Layer: 0
+  m_Name: GameObject (6)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &691413372
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 691413371}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &691413373
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 691413371}
+  m_Mesh: {fileID: 0}
+--- !u!114 &691413374
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 691413371}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &691413375
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 691413371}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -41.46, y: 0, z: 24.07}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 1
   m_Children: []
@@ -632,6 +1445,10 @@ PrefabInstance:
     - target: {fileID: 919132149155446097, guid: cf5a632ff3708aa46a0952d32d1baa33, type: 3}
       propertyPath: m_Name
       value: toyota_ft1
+      objectReference: {fileID: 0}
+    - target: {fileID: 919132149155446097, guid: cf5a632ff3708aa46a0952d32d1baa33, type: 3}
+      propertyPath: m_IsActive
+      value: 1
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
@@ -752,6 +1569,276 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &961438296
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 961438300}
+  - component: {fileID: 961438299}
+  - component: {fileID: 961438298}
+  - component: {fileID: 961438297}
+  m_Layer: 0
+  m_Name: GameObject (7)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &961438297
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 961438296}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &961438298
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 961438296}
+  m_Mesh: {fileID: 0}
+--- !u!114 &961438299
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 961438296}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &961438300
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 961438296}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -43.83, y: 0, z: 24.07}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1076802447
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1076802451}
+  - component: {fileID: 1076802450}
+  - component: {fileID: 1076802449}
+  - component: {fileID: 1076802448}
+  m_Layer: 0
+  m_Name: GameObject (9)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &1076802448
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1076802447}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &1076802449
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1076802447}
+  m_Mesh: {fileID: 0}
+--- !u!114 &1076802450
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1076802447}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &1076802451
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1076802447}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -49.27, y: 0, z: 24.07}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1205259129
 GameObject:
   m_ObjectHideFlags: 0
@@ -850,6 +1937,9 @@ MonoBehaviour:
   targetCamera: {fileID: 330585545}
   lodErrorPixels: 1
   useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
   resolveMaterials:
   - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
   renderVisibleMesh: 0
@@ -879,6 +1969,141 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: 19.07, y: 0, z: 17.35}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1465932570
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1465932574}
+  - component: {fileID: 1465932573}
+  - component: {fileID: 1465932572}
+  - component: {fileID: 1465932571}
+  m_Layer: 0
+  m_Name: GameObject (12)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &1465932571
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1465932570}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &1465932572
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1465932570}
+  m_Mesh: {fileID: 0}
+--- !u!114 &1465932573
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1465932570}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &1465932574
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1465932570}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -43.83, y: 0, z: 13.95}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 1
   m_Children: []
@@ -947,6 +2172,141 @@ PrefabInstance:
     m_AddedGameObjects: []
     m_AddedComponents: []
   m_SourcePrefab: {fileID: 100100000, guid: 3d5fc8adc0275f3459f41833eec48e80, type: 3}
+--- !u!1 &1544129590
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1544129594}
+  - component: {fileID: 1544129593}
+  - component: {fileID: 1544129592}
+  - component: {fileID: 1544129591}
+  m_Layer: 0
+  m_Name: GameObject (10)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &1544129591
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1544129590}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &1544129592
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1544129590}
+  m_Mesh: {fileID: 0}
+--- !u!114 &1544129593
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1544129590}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &1544129594
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1544129590}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -49.27, y: 0, z: 13.95}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1001 &1590175924
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -1012,6 +2372,141 @@ PrefabInstance:
     m_AddedGameObjects: []
     m_AddedComponents: []
   m_SourcePrefab: {fileID: 100100000, guid: 0c455d348b24ad44aa33b5f1c644d042, type: 3}
+--- !u!1 &1852328242
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1852328246}
+  - component: {fileID: 1852328245}
+  - component: {fileID: 1852328244}
+  - component: {fileID: 1852328243}
+  m_Layer: 0
+  m_Name: GameObject (11)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!23 &1852328243
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1852328242}
+  m_Enabled: 0
+  m_CastShadows: 0
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 691938275}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!33 &1852328244
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1852328242}
+  m_Mesh: {fileID: 0}
+--- !u!114 &1852328245
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1852328242}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 1
+  resourcesPath: Assets/toyota_ft1_mesh.asset
+  useGpuCulling: 1
+  gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: 21b46fb05260c3744ae3717902933d6c, type: 2}
+  targetCamera: {fileID: 330585545}
+  lodErrorPixels: 1
+  useBvh: 1
+  forceNaniteRendering: 0
+  forceRasterRendering: 0
+  rasterFallbackMesh: {fileID: 0}
+  resolveMaterials:
+  - {fileID: 2100000, guid: f4ca4345e138ad144bfef50bcd1f47f2, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 691938275}
+  debugColorMode: 1
+  debugColorSaturation: 0.277
+  debugColorValue: 0.316
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 64308
+  lastGpuVisibleApprox: 64308
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0
+--- !u!4 &1852328246
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1852328242}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -46.25, y: 0, z: 13.95}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 1
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1859469836
 GameObject:
   m_ObjectHideFlags: 0
@@ -1194,4 +2689,15 @@ SceneRoots:
   - {fileID: 1590175924}
   - {fileID: 1205259133}
   - {fileID: 536820289}
+  - {fileID: 356191688}
+  - {fileID: 481381661}
+  - {fileID: 691413375}
+  - {fileID: 961438300}
+  - {fileID: 356747295}
+  - {fileID: 1076802451}
+  - {fileID: 1544129594}
+  - {fileID: 1852328246}
+  - {fileID: 1465932574}
+  - {fileID: 159561531}
+  - {fileID: 655979752}
   - {fileID: 738759217}

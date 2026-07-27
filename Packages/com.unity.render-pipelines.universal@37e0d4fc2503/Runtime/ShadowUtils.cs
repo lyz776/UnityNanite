@@ -629,7 +629,7 @@ namespace UnityEngine.Rendering.Universal
             return false;
         }
 
-        static Matrix4x4 GetShadowTransform(Matrix4x4 proj, Matrix4x4 view)
+        internal static Matrix4x4 GetShadowTransform(Matrix4x4 proj, Matrix4x4 view)
         {
             // Currently CullResults ComputeDirectionalShadowMatricesAndCullingPrimitives doesn't
             // apply z reversal to projection matrix. We need to do it manually here.

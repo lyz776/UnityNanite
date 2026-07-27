@@ -36,6 +36,17 @@ namespace Nanite
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        public struct GpuInstanceData
+        {
+            public Matrix4x4 localToWorld;
+            public Vector4 bounds;
+            public float maxScale;
+            public float lodErrorPixels;
+            public uint partOffset;
+            public uint partCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         struct GpuVisibleRef
         {
             public uint instanceIndex;
@@ -55,11 +66,13 @@ namespace Nanite
         ComputeBuffer visibleClusterAppendBuffer;
         ComputeBuffer visibleCountBuffer;
         ComputeBuffer clusterCandidateBuffer;
-        ComputeBuffer instanceLocalToWorldBuffer;
-        ComputeBuffer instanceMaxScaleBuffer;
-        ComputeBuffer instanceLodErrorBuffer;
+        ComputeBuffer instanceDataBuffer;
+        ComputeBuffer instanceVisibleBuffer;
         ComputeBuffer fallbackUintBuffer;
         ComputeBuffer fallbackCullStatsBuffer;
+        ComputeBuffer fallbackVirtualRefBuffer;
+        ComputeBuffer fallbackVisiblePartAppendBuffer;
+        ComputeBuffer fallbackVisibleDrawAppendBuffer;
         RenderTexture fallbackHzbTexture;
 
         int partCount;
@@ -75,6 +88,7 @@ namespace Nanite
 
         readonly Vector4[] frustumPlanes = new Vector4[6];
         uint[] visibleCountCpu = new uint[1];
+        readonly GpuInstanceData[] singleInstanceData = new GpuInstanceData[1];
 
         public bool IsReady =>
             shader != null &&
@@ -86,9 +100,10 @@ namespace Nanite
             visibleClusterAppendBuffer != null &&
             visibleCountBuffer != null &&
             clusterCandidateBuffer != null &&
-            instanceLocalToWorldBuffer != null &&
-            instanceMaxScaleBuffer != null &&
-            instanceLodErrorBuffer != null;
+            instanceDataBuffer != null &&
+            instanceVisibleBuffer != null &&
+            fallbackVisiblePartAppendBuffer != null &&
+            fallbackVisibleDrawAppendBuffer != null;
 
         public void Dispose()
         {
@@ -137,13 +152,17 @@ namespace Nanite
             visibleClusterAppendBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<GpuVisibleRef>(), ComputeBufferType.Append);
             visibleCountBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Raw);
             clusterCandidateBuffer = new ComputeBuffer(clusterCount, sizeof(uint));
-            instanceLocalToWorldBuffer = new ComputeBuffer(1, sizeof(float) * 16);
-            instanceMaxScaleBuffer = new ComputeBuffer(1, sizeof(float));
-            instanceLodErrorBuffer = new ComputeBuffer(1, sizeof(float));
+            instanceDataBuffer = new ComputeBuffer(1, Marshal.SizeOf<GpuInstanceData>());
+            instanceVisibleBuffer = new ComputeBuffer(1, sizeof(uint));
+            fallbackVisiblePartAppendBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Append);
+            fallbackVisibleDrawAppendBuffer = new ComputeBuffer(1, sizeof(uint) * 3, ComputeBufferType.Append);
 
             partsBuffer.SetData(parts);
             clustersBuffer.SetData(clusters);
             visibleClusterAppendBuffer.SetCounterValue(0);
+            fallbackVisiblePartAppendBuffer.SetCounterValue(0);
+            fallbackVisibleDrawAppendBuffer.SetCounterValue(0);
+            instanceVisibleBuffer.SetData(new uint[] { 1u });
             partDataCpu = parts.ToArray();
             partVisibleCpu = new uint[partCount];
             clusterCandidatesCpu = new uint[clusterCount];
@@ -188,6 +207,11 @@ namespace Nanite
             if (!IsReady || camera == null)
                 return false;
 
+            shader.SetInt("_UseGpuSceneRefs", 0);
+            shader.SetInt("_UseInstanceCull", 0);
+            shader.SetInt("_EnableVisibleInstanceQueue", 0);
+            shader.SetInt("_EnableVisibleDrawAppend", 0);
+
             var planes = GeometryUtility.CalculateFrustumPlanes(camera);
             for (int i = 0; i < 6; i++)
             {
@@ -227,8 +251,11 @@ namespace Nanite
                 shader.SetInt("_PartCount", partCount);
                 shader.SetInt("_CullPassMode", 0);
                 shader.SetInt("_HasPrevVisible", 0);
+                shader.SetInt("_EnableVisiblePartQueue", 0);
                 shader.SetBuffer(kernelPartCull, "_Parts", partsBuffer);
                 shader.SetBuffer(kernelPartCull, "_PartVisible", partVisibleBuffer);
+                shader.SetBuffer(kernelPartCull, "_VisiblePartsOut", fallbackVisiblePartAppendBuffer);
+                BindLegacyVirtualRefs(kernelPartCull);
                 BindInstanceBuffers(kernelPartCull);
                 BindBevyCompatBuffers(kernelPartCull);
                 BindHzb(kernelPartCull, hzbTexture, hzbMipCount, enableHzb);
@@ -254,6 +281,7 @@ namespace Nanite
             shader.SetBuffer(kernelClusterCull, "_PartVisible", partVisibleBuffer);
             shader.SetBuffer(kernelClusterCull, "_VisibleClusters", visibleClusterAppendBuffer);
             shader.SetBuffer(kernelClusterCull, "_ClusterCandidates", clusterCandidateBuffer);
+            BindLegacyVirtualRefs(kernelClusterCull);
             BindInstanceBuffers(kernelClusterCull);
             BindBevyCompatBuffers(kernelClusterCull);
             BindHzb(kernelClusterCull, hzbTexture, hzbMipCount, enableHzb);
@@ -293,17 +321,31 @@ namespace Nanite
 
         void UploadSingleInstance(Matrix4x4 localToWorld, float maxScale, float lodErrorPixels)
         {
-            instanceLocalToWorldBuffer.SetData(new[] { localToWorld });
-            instanceMaxScaleBuffer.SetData(new[] { maxScale });
-            instanceLodErrorBuffer.SetData(new[] { lodErrorPixels });
+            singleInstanceData[0] = new GpuInstanceData
+            {
+                localToWorld = localToWorld,
+                bounds = sourceMesh != null ? sourceMesh.boundingSphere : Vector4.zero,
+                maxScale = maxScale,
+                lodErrorPixels = lodErrorPixels,
+                partOffset = 0u,
+                partCount = (uint)Mathf.Max(0, partCount)
+            };
+            instanceDataBuffer.SetData(singleInstanceData);
         }
 
         void BindInstanceBuffers(int kernel)
         {
             shader.SetInt("_InstanceCount", 1);
-            shader.SetBuffer(kernel, "_InstanceLocalToWorld", instanceLocalToWorldBuffer);
-            shader.SetBuffer(kernel, "_InstanceMaxScale", instanceMaxScaleBuffer);
-            shader.SetBuffer(kernel, "_InstanceLodErrorPixels", instanceLodErrorBuffer);
+            shader.SetBuffer(kernel, "_Instances", instanceDataBuffer);
+            shader.SetBuffer(kernel, "_InstanceVisible", instanceVisibleBuffer);
+        }
+
+        void BindLegacyVirtualRefs(int kernel)
+        {
+            if (fallbackVirtualRefBuffer == null)
+                fallbackVirtualRefBuffer = new ComputeBuffer(1, sizeof(uint) * 4, ComputeBufferType.Structured);
+            shader.SetBuffer(kernel, "_VirtualParts", fallbackVirtualRefBuffer);
+            shader.SetBuffer(kernel, "_VirtualClusters", fallbackVirtualRefBuffer);
         }
 
         void SetSharedParams(
@@ -602,11 +644,13 @@ namespace Nanite
             visibleClusterAppendBuffer?.Release();
             visibleCountBuffer?.Release();
             clusterCandidateBuffer?.Release();
-            instanceLocalToWorldBuffer?.Release();
-            instanceMaxScaleBuffer?.Release();
-            instanceLodErrorBuffer?.Release();
+            instanceDataBuffer?.Release();
+            instanceVisibleBuffer?.Release();
             fallbackUintBuffer?.Release();
             fallbackCullStatsBuffer?.Release();
+            fallbackVirtualRefBuffer?.Release();
+            fallbackVisiblePartAppendBuffer?.Release();
+            fallbackVisibleDrawAppendBuffer?.Release();
 
             partsBuffer = null;
             clustersBuffer = null;
@@ -614,11 +658,13 @@ namespace Nanite
             visibleClusterAppendBuffer = null;
             visibleCountBuffer = null;
             clusterCandidateBuffer = null;
-            instanceLocalToWorldBuffer = null;
-            instanceMaxScaleBuffer = null;
-            instanceLodErrorBuffer = null;
+            instanceDataBuffer = null;
+            instanceVisibleBuffer = null;
             fallbackUintBuffer = null;
             fallbackCullStatsBuffer = null;
+            fallbackVirtualRefBuffer = null;
+            fallbackVisiblePartAppendBuffer = null;
+            fallbackVisibleDrawAppendBuffer = null;
         }
 
         public static void BuildGpuData(
@@ -700,12 +746,24 @@ namespace Nanite
         void BindBevyCompatBuffers(int kernel)
         {
             EnsureFallbackUintBuffers();
+            // The shared runtime culling shader declares Page streaming resources for its
+            // cluster kernels. This legacy per-proxy path intentionally has no global Page
+            // table, but Unity still requires every referenced UAV/SRV to be bound even when
+            // _EnablePageRequests is zero.
+            shader.SetInt("_PageCount", 0);
+            shader.SetInt("_EnablePageRequests", 0);
+            shader.SetInt("_TrackPageUsage", 0);
+            shader.SetBuffer(kernel, "_PageResidency", fallbackUintBuffer);
+            shader.SetBuffer(kernel, "_PageRequests", fallbackUintBuffer);
             shader.SetBuffer(kernel, "_ClusterVisible", fallbackUintBuffer);
             shader.SetBuffer(kernel, "_ClusterSceneIndex", fallbackUintBuffer);
             shader.SetBuffer(kernel, "_PrevClusterVisible", fallbackUintBuffer);
             shader.SetBuffer(kernel, "_SecondPassCandidates", fallbackUintBuffer);
             shader.SetBuffer(kernel, "_Pass2Drawn", fallbackUintBuffer);
             shader.SetBuffer(kernel, "_CullStats", fallbackCullStatsBuffer);
+            shader.SetBuffer(kernel, "_VisibleDrawClusters", fallbackVisibleDrawAppendBuffer);
+            shader.SetBuffer(kernel, "_SceneClusterFirstTri", fallbackUintBuffer);
+            shader.SetBuffer(kernel, "_SceneClusterTriCount", fallbackUintBuffer);
         }
 
         void EnsureFallbackUintBuffers()

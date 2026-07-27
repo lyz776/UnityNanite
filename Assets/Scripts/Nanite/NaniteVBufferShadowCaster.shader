@@ -22,6 +22,7 @@ Shader "Nanite/VBufferShadowCaster"
 
             HLSLPROGRAM
             #pragma target 4.5
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
             #pragma vertex vert
             #pragma fragment frag
             #pragma multi_compile_vertex _ _CASTING_PUNCTUAL_LIGHT_SHADOW
@@ -50,6 +51,7 @@ Shader "Nanite/VBufferShadowCaster"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            #include "NanitePackedPage.hlsl"
             int _VertexStride;
             int _InstanceId;
             float4x4 _LocalToWorld;
@@ -124,6 +126,15 @@ Shader "Nanite/VBufferShadowCaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (!NaniteCompactedTriangleValid(input.vertexID))
+                {
+                    float nan = asfloat(0x7FC00000u);
+                    o.positionCS = float4(nan, nan, nan, nan);
+                    #if defined(_ALPHATEST_ON)
+                    o.uv = 0.0.xx;
+                    #endif
+                    return o;
+                }
                 int triId = NaniteResolveTriangleId(input.vertexID);
 
                 if (_UseCompactedTriIds < 0.5)
@@ -143,17 +154,40 @@ Shader "Nanite/VBufferShadowCaster"
                 float4x4 localToWorld = _LocalToWorld;
                 if (_UseSceneInstanceBuffer != 0)
                 {
-                    int instanceId = _TriangleInstance[triId];
+                    int instanceId = _UseCompactedTriIds > 0.5
+                        ? NaniteResolveInstanceId(input.vertexID, 0)
+                        : _TriangleInstance[triId];
                     localToWorld = _InstanceLocalToWorld[instanceId];
                 }
 
-                int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
-                float3 posOS = DecodePositionOS(logicalIndex);
-                float3 normalOS = DecodeNormalOS(logicalIndex);
+                float3 posOS;
+                float3 normalOS;
+                float2 uvOS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    NanitePackedVertex packedVertex;
+                    if (!NanitePackedLoadVertex(
+                            (uint)triId,
+                            (uint)NaniteResolveCorner(input.vertexID),
+                            packedVertex))
+                    {
+                        packedVertex.positionOS = asfloat(0x7FC00000u).xxx;
+                    }
+                    posOS = packedVertex.positionOS;
+                    normalOS = packedVertex.normalOS;
+                    uvOS = packedVertex.uv;
+                }
+                else
+                {
+                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    posOS = DecodePositionOS(logicalIndex);
+                    normalOS = DecodeNormalOS(logicalIndex);
+                    uvOS = DecodeUv(logicalIndex);
+                }
                 o.positionCS = GetShadowPositionHClip(posOS, normalOS, localToWorld);
 
                 #if defined(_ALPHATEST_ON)
-                o.uv = TRANSFORM_TEX(DecodeUv(logicalIndex), _BaseMap);
+                o.uv = TRANSFORM_TEX(uvOS, _BaseMap);
                 #endif
 
                 return o;

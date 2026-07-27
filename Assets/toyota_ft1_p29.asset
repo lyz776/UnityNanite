@@ -1,0 +1,1034 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1d45e96a1b9390e438601d786f395193, type: 3}
+  m_Name: toyota_ft1_p29
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteMeshPage
+  binaryPayload: {fileID: 4900000, guid: 0b4e52afd99c2ce4791aa6bbd03665c8, type: 3}
+  binaryStats:
+    formatVersion: 1
+    flags: 31
+    blobBytes: 257156
+    legacyRawBytes: 583780
+    vertexBytes: 192020
+    indexBytes: 57930
+    hierarchyBytes: 7068
+    storageBytes: 195553
+    storageCodec: 1
+    rawSizeRatio: 0.44050157
+    storageSizeRatio: 0.760445
+    maxPositionError: 0.00003709258
+    maxUvError: 0.000540217
+    maxNormalAngleError: 0.01978234
+    maxTangentAngleError: 0.01978234
+  parts:
+  - clusterStart: 0
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    maxParentLodError: 0.050956085
+  - clusterStart: 8
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    parentSphere: {x: 0.47415644, y: 0.5950485, z: -1.2192024, w: 1.0346956}
+    maxParentLodError: 0.050956085
+  - clusterStart: 16
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    maxParentLodError: 0.040038254
+  - clusterStart: 24
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.79686093, y: 0.3631371, z: -1.4696556, w: 0.7110297}
+    parentSphere: {x: 0.5800776, y: 0.6564197, z: -1.4701989, w: 1.2866036}
+    maxParentLodError: 0.9768533
+  - clusterStart: 32
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.69776917, y: 0.5151082, z: -1.6498988, w: 0.4294398}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    maxParentLodError: 0.9768533
+  - clusterStart: 40
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.9129489, y: 0.83482486, z: -2.0341697, w: 0.591641}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    maxParentLodError: 0.9768533
+  - clusterStart: 48
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.8665029, y: 0.821102, z: -2.0105493, w: 0.6361705}
+    parentSphere: {x: 0.83190477, y: 0.727529, z: -1.9098508, w: 0.79144114}
+    maxParentLodError: 0.9768533
+  - clusterStart: 56
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    maxParentLodError: 0.15412173
+  - clusterStart: 64
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: 0.85683995, y: 0.5329062, z: -1.5409194, w: 0.6245854}
+    parentSphere: {x: 0.87270856, y: 0.68510485, z: -1.7727698, w: 0.9291022}
+    maxParentLodError: 0.15412173
+  - clusterStart: 72
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: -0.18349801, y: 0.45079723, z: 0.19333592, w: 2.265712}
+    parentSphere: {x: -0.48540914, y: 0.31542856, z: 0.0013415217, w: 2.640035}
+    maxParentLodError: 0.094870836
+  - clusterStart: 80
+    clusterCount: 8
+    mipLevel: 1
+    selfSphere: {x: -0.93530756, y: 0.23777352, z: 0.5489632, w: 1.6343274}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    maxParentLodError: 0.082889184
+  clusterArray:
+  - indiceIndex: 0
+    indiceCount: 267
+    selfError: 0.0092269555
+    parentError: 0.050956085
+    selfSphere: {x: 0.6874125, y: 0.5429671, z: -1.3064257, w: 0.4613478}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 267
+    indiceCount: 384
+    selfError: 0.009010226
+    parentError: 0.050956085
+    selfSphere: {x: 0.95993614, y: 0.2925336, z: -1.2664174, w: 0.45051128}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 651
+    indiceCount: 384
+    selfError: 0.009010226
+    parentError: 0.050956085
+    selfSphere: {x: 0.95993614, y: 0.2925336, z: -1.2664174, w: 0.45051128}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 1035
+    indiceCount: 369
+    selfError: 0.009010226
+    parentError: 0.050956085
+    selfSphere: {x: 0.95993614, y: 0.2925336, z: -1.2664174, w: 0.45051128}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 1404
+    indiceCount: 384
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 1788
+    indiceCount: 384
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 2172
+    indiceCount: 384
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 2556
+    indiceCount: 384
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 0
+    vertexOffset: 0
+  - indiceIndex: 2940
+    indiceCount: 384
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 3324
+    indiceCount: 384
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 3708
+    indiceCount: 360
+    selfError: 0.012699139
+    parentError: 0.050956085
+    selfSphere: {x: 0.9019118, y: 0.28083032, z: -1.30361, w: 0.3882887}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 4068
+    indiceCount: 384
+    selfError: 0.008456794
+    parentError: 0.050956085
+    selfSphere: {x: 0.88845444, y: 0.44008005, z: -1.4146136, w: 0.2873796}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 4452
+    indiceCount: 384
+    selfError: 0.008456794
+    parentError: 0.050956085
+    selfSphere: {x: 0.88845444, y: 0.44008005, z: -1.4146136, w: 0.2873796}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 4836
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.050956085
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 5220
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.050956085
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 5604
+    indiceCount: 384
+    selfError: 0.009781652
+    parentError: 0.040038254
+    selfSphere: {x: 0.02859594, y: 0.9056324, z: -1.1766082, w: 0.48908263}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 1
+    vertexOffset: 0
+  - indiceIndex: 5988
+    indiceCount: 384
+    selfError: 0.009781652
+    parentError: 0.040038254
+    selfSphere: {x: 0.02859594, y: 0.9056324, z: -1.1766082, w: 0.48908263}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 6372
+    indiceCount: 348
+    selfError: 0.009781652
+    parentError: 0.040038254
+    selfSphere: {x: 0.02859594, y: 0.9056324, z: -1.1766082, w: 0.48908263}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 6720
+    indiceCount: 384
+    selfError: 0.008456794
+    parentError: 0.040038254
+    selfSphere: {x: 0.88845444, y: 0.44008005, z: -1.4146136, w: 0.2873796}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 7104
+    indiceCount: 384
+    selfError: 0.008456794
+    parentError: 0.040038254
+    selfSphere: {x: 0.88845444, y: 0.44008005, z: -1.4146136, w: 0.2873796}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 7488
+    indiceCount: 237
+    selfError: 0.008456794
+    parentError: 0.040038254
+    selfSphere: {x: 0.88845444, y: 0.44008005, z: -1.4146136, w: 0.2873796}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 7725
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 8109
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 8493
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 2
+    vertexOffset: 0
+  - indiceIndex: 8877
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 9261
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 9645
+    indiceCount: 384
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 10029
+    indiceCount: 87
+    selfError: 0.0138575025
+    parentError: 0.040038254
+    selfSphere: {x: 0.83804464, y: 0.32376516, z: -1.2448702, w: 0.4791359}
+    parentSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 10116
+    indiceCount: 351
+    selfError: 0.21064937
+    parentError: 0.9768533
+    selfSphere: {x: 0.72712785, y: 0.42980245, z: -1.8502668, w: 0.31838235}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 10467
+    indiceCount: 384
+    selfError: 0.21064937
+    parentError: 0.9768533
+    selfSphere: {x: 0.72712785, y: 0.42980245, z: -1.8502668, w: 0.31838235}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 10851
+    indiceCount: 384
+    selfError: 0.21064937
+    parentError: 0.9768533
+    selfSphere: {x: 0.72712785, y: 0.42980245, z: -1.8502668, w: 0.31838235}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 11235
+    indiceCount: 384
+    selfError: 0.38787785
+    parentError: 0.9768533
+    selfSphere: {x: 0.69776917, y: 0.5151082, z: -1.6498988, w: 0.4294398}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 3
+    vertexOffset: 0
+  - indiceIndex: 11619
+    indiceCount: 384
+    selfError: 0.38787785
+    parentError: 0.9768533
+    selfSphere: {x: 0.69776917, y: 0.5151082, z: -1.6498988, w: 0.4294398}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 12003
+    indiceCount: 288
+    selfError: 0.38787785
+    parentError: 0.9768533
+    selfSphere: {x: 0.69776917, y: 0.5151082, z: -1.6498988, w: 0.4294398}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 12291
+    indiceCount: 153
+    selfError: 0.38787785
+    parentError: 0.9768533
+    selfSphere: {x: 0.69776917, y: 0.5151082, z: -1.6498988, w: 0.4294398}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 12444
+    indiceCount: 384
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 12828
+    indiceCount: 384
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 13212
+    indiceCount: 384
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 13596
+    indiceCount: 384
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 13980
+    indiceCount: 324
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 4
+    vertexOffset: 0
+  - indiceIndex: 14304
+    indiceCount: 315
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 14619
+    indiceCount: 384
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 15003
+    indiceCount: 174
+    selfError: 0.059138224
+    parentError: 0.9768533
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 15177
+    indiceCount: 384
+    selfError: 0.04034046
+    parentError: 0.9768533
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 15561
+    indiceCount: 384
+    selfError: 0.04034046
+    parentError: 0.9768533
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 15945
+    indiceCount: 384
+    selfError: 0.04034046
+    parentError: 0.9768533
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 16329
+    indiceCount: 255
+    selfError: 0.04034046
+    parentError: 0.9768533
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 16584
+    indiceCount: 318
+    selfError: 0.04034046
+    parentError: 0.9768533
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 5
+    vertexOffset: 0
+  - indiceIndex: 16902
+    indiceCount: 63
+    selfError: 0.04034046
+    parentError: 0.9768533
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 16965
+    indiceCount: 384
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 17349
+    indiceCount: 384
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 17733
+    indiceCount: 384
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 18117
+    indiceCount: 384
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 18501
+    indiceCount: 348
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 18849
+    indiceCount: 318
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 19167
+    indiceCount: 294
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 6
+    vertexOffset: 0
+  - indiceIndex: 19461
+    indiceCount: 243
+    selfError: 0.005204837
+    parentError: 0.15412173
+    selfSphere: {x: 0.6494611, y: 0.656727, z: -1.7513275, w: 0.26024184}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 19704
+    indiceCount: 57
+    selfError: 0.0052867136
+    parentError: 0.15412173
+    selfSphere: {x: 0.561431, y: 0.6853983, z: -1.7857838, w: 0.2643357}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 19761
+    indiceCount: 30
+    selfError: 0.059138224
+    parentError: 0.15412173
+    selfSphere: {x: 0.819403, y: 0.5918308, z: -1.6668459, w: 0.14139259}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 19791
+    indiceCount: 231
+    selfError: 0.04034046
+    parentError: 0.15412173
+    selfSphere: {x: 0.92460644, y: 0.86510634, z: -2.0799448, w: 0.5355318}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 20022
+    indiceCount: 345
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 20367
+    indiceCount: 366
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 20733
+    indiceCount: 384
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 21117
+    indiceCount: 276
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 7
+    vertexOffset: 0
+  - indiceIndex: 21393
+    indiceCount: 177
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 21570
+    indiceCount: 213
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 21783
+    indiceCount: 12
+    selfError: 0.028347252
+    parentError: 0.15412173
+    selfSphere: {x: 0.58009917, y: 0.7859658, z: -1.6628795, w: 0.19443268}
+    parentSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 21795
+    indiceCount: 267
+    selfError: 0.038065616
+    parentError: 0.094870836
+    selfSphere: {x: 0.91578394, y: 0.4513539, z: -1.5429747, w: 0.50301266}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 22062
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 22446
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 22830
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 23214
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 8
+    vertexOffset: 0
+  - indiceIndex: 23598
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 23982
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 24366
+    indiceCount: 384
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 24750
+    indiceCount: 303
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 25053
+    indiceCount: 48
+    selfError: 0.0075958306
+    parentError: 0.094870836
+    selfSphere: {x: 0.8911789, y: 0.762988, z: -1.2607126, w: 0.26039773}
+    parentSphere: {x: 0.9105681, y: 0.5174148, z: -1.4831401, w: 0.5922955}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 25101
+    indiceCount: 24
+    selfError: 0.024704646
+    parentError: 0.082889184
+    selfSphere: {x: -1.001435, y: 0.14275093, z: -0.3525347, w: 1.2352324}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 25125
+    indiceCount: 384
+    selfError: 0.013847582
+    parentError: 0.082889184
+    selfSphere: {x: -0.7535198, y: 0.30677694, z: 1.4706239, w: 0.6923791}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 25509
+    indiceCount: 384
+    selfError: 0.013847582
+    parentError: 0.082889184
+    selfSphere: {x: -0.7535198, y: 0.30677694, z: 1.4706239, w: 0.6923791}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 9
+    vertexOffset: 0
+  - indiceIndex: 25893
+    indiceCount: 384
+    selfError: 0.013847582
+    parentError: 0.082889184
+    selfSphere: {x: -0.7535198, y: 0.30677694, z: 1.4706239, w: 0.6923791}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 26277
+    indiceCount: 384
+    selfError: 0.01184143
+    parentError: 0.082889184
+    selfSphere: {x: -0.923952, y: 0.48851526, z: 1.3857738, w: 0.46376666}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 26661
+    indiceCount: 384
+    selfError: 0.01184143
+    parentError: 0.082889184
+    selfSphere: {x: -0.923952, y: 0.48851526, z: 1.3857738, w: 0.46376666}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 27045
+    indiceCount: 384
+    selfError: 0.012268942
+    parentError: 0.082889184
+    selfSphere: {x: -0.9261289, y: 0.37916312, z: 1.6470826, w: 0.3365838}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 27429
+    indiceCount: 384
+    selfError: 0.012268942
+    parentError: 0.082889184
+    selfSphere: {x: -0.9261289, y: 0.37916312, z: 1.6470826, w: 0.3365838}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 27813
+    indiceCount: 384
+    selfError: 0.03115724
+    parentError: 0.082889184
+    selfSphere: {x: -0.9500647, y: 0.23217197, z: 0.47414473, w: 1.557862}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 28197
+    indiceCount: 384
+    selfError: 0.03115724
+    parentError: 0.082889184
+    selfSphere: {x: -0.9500647, y: 0.23217197, z: 0.47414473, w: 1.557862}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  - indiceIndex: 28581
+    indiceCount: 384
+    selfError: 0.03115724
+    parentError: 0.082889184
+    selfSphere: {x: -0.9500647, y: 0.23217197, z: 0.47414473, w: 1.557862}
+    parentSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    subMeshId: 0
+    partIndex: 10
+    vertexOffset: 0
+  clusterMip: 01000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000
+  bvhNodes:
+  - sphere: {x: -0.93530756, y: 0.23777352, z: 0.5489632, w: 1.6343274}
+    lodSphere: {x: -0.8815554, y: 0.2581095, z: 0.42260325, w: 2.0589335}
+    maxParentLodError: 0.082889184
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 10
+  - sphere: {x: -0.18349801, y: 0.45079723, z: 0.19333592, w: 2.265712}
+    lodSphere: {x: -0.48540914, y: 0.31542856, z: 0.0013415217, w: 2.640035}
+    maxParentLodError: 0.094870836
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 9
+  - sphere: {x: 0.79686093, y: 0.3631371, z: -1.4696556, w: 0.7110297}
+    lodSphere: {x: 0.5800776, y: 0.6564197, z: -1.4701989, w: 1.2866036}
+    maxParentLodError: 0.9768533
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 3
+  - sphere: {x: 0.69776917, y: 0.5151082, z: -1.6498988, w: 0.4294398}
+    lodSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    maxParentLodError: 0.9768533
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 4
+  - sphere: {x: 0.85683995, y: 0.5329062, z: -1.5409194, w: 0.6245854}
+    lodSphere: {x: 0.87270856, y: 0.68510485, z: -1.7727698, w: 0.9291022}
+    maxParentLodError: 0.15412173
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 8
+  - sphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    lodSphere: {x: 0.8197079, y: 0.4213953, z: -1.2870039, w: 0.64206576}
+    maxParentLodError: 0.050956085
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 0
+  - sphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    lodSphere: {x: 0.47415644, y: 0.5950485, z: -1.2192024, w: 1.0346956}
+    maxParentLodError: 0.050956085
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 1
+  - sphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    lodSphere: {x: 0.4292915, y: 0.6175949, z: -1.2103994, w: 0.9837182}
+    maxParentLodError: 0.040038254
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 2
+  - sphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    lodSphere: {x: 0.84136856, y: 0.8239182, z: -2.0125246, w: 0.65029454}
+    maxParentLodError: 0.15412173
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 7
+  - sphere: {x: 0.8665029, y: 0.821102, z: -2.0105493, w: 0.6361705}
+    lodSphere: {x: 0.83190477, y: 0.727529, z: -1.9098508, w: 0.79144114}
+    maxParentLodError: 0.9768533
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 6
+  - sphere: {x: 0.9129489, y: 0.83482486, z: -2.0341697, w: 0.591641}
+    lodSphere: {x: 0.8312734, y: 0.72109824, z: -1.9030008, w: 0.7820244}
+    maxParentLodError: 0.9768533
+    child0: -1
+    child1: -1
+    child2: -1
+    child3: -1
+    childCount: 0
+    partIndex: 5
+  - sphere: {x: -0.18820873, y: 0.41739845, z: 0.09034142, w: 2.556808}
+    lodSphere: {x: -0.34272796, y: 0.36109126, z: -0.19571501, w: 2.8875713}
+    maxParentLodError: 0.9768533
+    child0: 0
+    child1: 1
+    child2: 2
+    child3: 3
+    childCount: 4
+    partIndex: -1
+  - sphere: {x: 0.54277635, y: 0.57754415, z: -1.2648376, w: 1.1158031}
+    lodSphere: {x: 0.67646873, y: 0.6088744, z: -1.4479941, w: 1.3404195}
+    maxParentLodError: 0.15412173
+    child0: 4
+    child1: 5
+    child2: 6
+    child3: 7
+    childCount: 4
+    partIndex: -1
+  - sphere: {x: 0.84987605, y: 0.8238072, z: -2.0130694, w: 0.6590561}
+    lodSphere: {x: 0.83190477, y: 0.727529, z: -1.9098508, w: 0.79144114}
+    maxParentLodError: 0.9768533
+    child0: 8
+    child1: 9
+    child2: 10
+    child3: -1
+    childCount: 3
+    partIndex: -1
+  - sphere: {x: -0.081130855, y: 0.4553133, z: -0.12262018, w: 2.798299}
+    lodSphere: {x: -0.3157867, y: 0.36764112, z: -0.22881755, w: 2.9307513}
+    maxParentLodError: 0.9768533
+    child0: 11
+    child1: 12
+    child2: 13
+    child3: -1
+    childCount: 3
+    partIndex: -1
+  bvhRoot: 14
+  mipBvhRoots: ffffffff0e000000
+  legacyIndices: 
+  legacyVertexData: []
+  vertexStride: 12
+  vertexCount: 9601

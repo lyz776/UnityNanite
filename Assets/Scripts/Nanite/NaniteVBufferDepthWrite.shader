@@ -13,6 +13,7 @@ Shader "Nanite/VBufferDepthWrite"
 
             HLSLPROGRAM
             #pragma target 4.5
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
             #pragma vertex vert
             #pragma fragment frag
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
@@ -25,6 +26,7 @@ Shader "Nanite/VBufferDepthWrite"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            #include "NanitePackedPage.hlsl"
             int _VertexStride;
             int _InstanceId;
             float4x4 _LocalToWorld;
@@ -52,6 +54,12 @@ Shader "Nanite/VBufferDepthWrite"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (!NaniteCompactedTriangleValid(input.vertexID))
+                {
+                    float nan = asfloat(0x7FC00000u);
+                    o.positionCS = float4(nan, nan, nan, nan);
+                    return o;
+                }
                 int triId = NaniteResolveTriangleId(input.vertexID);
 
                 // compact 开启时列表已过滤；未开启时仍做 VS 剔除兜底。
@@ -70,11 +78,22 @@ Shader "Nanite/VBufferDepthWrite"
                 float4x4 localToWorld = _LocalToWorld;
                 if (_UseSceneInstanceBuffer != 0)
                 {
-                    int instanceId = _TriangleInstance[triId];
+                    int instanceId = _UseCompactedTriIds > 0.5
+                        ? NaniteResolveInstanceId(input.vertexID, 0)
+                        : _TriangleInstance[triId];
                     localToWorld = _InstanceLocalToWorld[instanceId];
                 }
-                int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
-                float3 posOS = DecodePositionOS(logicalIndex);
+                float3 posOS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                        posOS = asfloat(0x7FC00000u).xxx;
+                }
+                else
+                {
+                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    posOS = DecodePositionOS(logicalIndex);
+                }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                 o.positionCS = TransformWorldToHClip(posWS);
                 return o;

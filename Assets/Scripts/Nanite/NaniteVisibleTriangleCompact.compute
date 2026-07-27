@@ -1,19 +1,34 @@
 #pragma kernel CSClear
 #pragma kernel CSCompactClusters
 #pragma kernel CSFinalizeArgs
+#pragma kernel CSFinalizeVisibleDrawQueueArgs
+#pragma kernel CSFinalizeVisibleDrawQueueArgs4
 
-// 按可见 cluster expand 三角形 ID。
+// 把可见 cluster 压实为 (firstTriangle, triangleCount, instance)；VS 再按固定槽位展开。
 // _DrawArgs 使用 GraphicsBuffer(IndirectArguments|Structured)，可被 compute UAV 写入并直接给 DrawProceduralIndirect。
 
 StructuredBuffer<uint> _ClusterVisible;
 StructuredBuffer<uint> _ClusterFirstTri;
 StructuredBuffer<uint> _ClusterTriCount;
+StructuredBuffer<uint> _ClusterInstance;
 
 RWStructuredBuffer<uint> _CompactedTriIds;
+RWStructuredBuffer<uint> _CompactedTriInstances;
+RWStructuredBuffer<uint> _CompactedTriCounts;
 RWStructuredBuffer<uint> _CompactCounter;
 RWStructuredBuffer<uint> _DrawArgs; // [vertexCount, instanceCount, startVertex, startInstance]
+StructuredBuffer<uint> _VisibleDrawCountArgs;
+StructuredBuffer<uint> _VisibleDrawCountArgs0;
+StructuredBuffer<uint> _VisibleDrawCountArgs1;
+StructuredBuffer<uint> _VisibleDrawCountArgs2;
+StructuredBuffer<uint> _VisibleDrawCountArgs3;
+RWStructuredBuffer<uint> _DrawArgs0;
+RWStructuredBuffer<uint> _DrawArgs1;
+RWStructuredBuffer<uint> _DrawArgs2;
+RWStructuredBuffer<uint> _DrawArgs3;
 
 uint _ClusterCount;
+uint _CompactedClusterTriangleSlots;
 
 [numthreads(1, 1, 1)]
 void CSClear(uint3 id : SV_DispatchThreadID)
@@ -36,14 +51,15 @@ void CSCompactClusters(uint3 id : SV_DispatchThreadID)
 
     uint first = _ClusterFirstTri[cluster];
     uint count = _ClusterTriCount[cluster];
+    uint instance = _ClusterInstance[cluster];
     if (count == 0u)
         return;
 
     uint dst;
-    InterlockedAdd(_CompactCounter[0], count, dst);
-
-    for (uint i = 0u; i < count; i++)
-        _CompactedTriIds[dst + i] = first + i;
+    InterlockedAdd(_CompactCounter[0], 1u, dst);
+    _CompactedTriIds[dst] = first;
+    _CompactedTriInstances[dst] = instance;
+    _CompactedTriCounts[dst] = count;
 }
 
 [numthreads(1, 1, 1)]
@@ -52,9 +68,47 @@ void CSFinalizeArgs(uint3 id : SV_DispatchThreadID)
     if (id.x != 0)
         return;
 
-    uint visibleTris = _CompactCounter[0];
-    _DrawArgs[0] = visibleTris * 3u;
+    uint visibleClusters = _CompactCounter[0];
+    _DrawArgs[0] = visibleClusters * max(1u, _CompactedClusterTriangleSlots) * 3u;
     _DrawArgs[1] = 1u;
     _DrawArgs[2] = 0u;
     _DrawArgs[3] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void CSFinalizeVisibleDrawQueueArgs(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0u)
+        return;
+
+    uint visibleClusters = _VisibleDrawCountArgs[0];
+    _DrawArgs[0] = visibleClusters * max(1u, _CompactedClusterTriangleSlots) * 3u;
+    _DrawArgs[1] = 1u;
+    _DrawArgs[2] = 0u;
+    _DrawArgs[3] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void CSFinalizeVisibleDrawQueueArgs4(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0u)
+        return;
+
+    uint multiplier = max(1u, _CompactedClusterTriangleSlots) * 3u;
+    _DrawArgs0[0] = _VisibleDrawCountArgs0[0] * multiplier;
+    _DrawArgs0[1] = 1u;
+    _DrawArgs0[2] = 0u;
+    _DrawArgs0[3] = 0u;
+    _DrawArgs1[0] = _VisibleDrawCountArgs1[0] * multiplier;
+    _DrawArgs1[1] = 1u;
+    _DrawArgs1[2] = 0u;
+    _DrawArgs1[3] = 0u;
+    _DrawArgs2[0] = _VisibleDrawCountArgs2[0] * multiplier;
+    _DrawArgs2[1] = 1u;
+    _DrawArgs2[2] = 0u;
+    _DrawArgs2[3] = 0u;
+    _DrawArgs3[0] = _VisibleDrawCountArgs3[0] * multiplier;
+    _DrawArgs3[1] = 1u;
+    _DrawArgs3[2] = 0u;
+    _DrawArgs3[3] = 0u;
 }

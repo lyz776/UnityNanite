@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using UnityEngine;
+using Unity.Profiling;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule.Util;
 
 namespace Nanite
 {
@@ -15,12 +18,43 @@ namespace Nanite
             public NaniteRuntimeProxy proxy;
             public int proxyId;
             public NaniteMesh mesh;
+            public int geometryIndex;
+            public int virtualPartOffset;
+            public int virtualClusterOffset;
+            public int partCount;
+            public int clusterCount;
+            public int[] pagePartBase;
+            public int[] pagePartCount;
+        }
+
+        sealed class GeometrySlot
+        {
+            public NaniteMesh mesh;
             public int partOffset;
             public int clusterOffset;
             public int partCount;
             public int clusterCount;
             public int[] pagePartBase;
             public int[] pagePartCount;
+            public Vector4 bounds;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GpuVirtualPartRef
+        {
+            public uint instanceIndex;
+            public uint partIndex;
+            public uint clusterStart;
+            public uint clusterCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GpuVirtualClusterRef
+        {
+            public uint instanceIndex;
+            public uint clusterIndex;
+            public uint partIndex;
+            public uint reserved;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -32,7 +66,24 @@ namespace Nanite
         }
 
         const int kThreadGroupSize = 64;
-        const int kGpuLayoutVersion = 2;
+        const int kMaxShadowCascades = 4;
+        const int kGpuLayoutVersion = 6;
+        static readonly int[] kShadowVisibleDrawCountArgsIds =
+        {
+            Shader.PropertyToID("_VisibleDrawCountArgs0"),
+            Shader.PropertyToID("_VisibleDrawCountArgs1"),
+            Shader.PropertyToID("_VisibleDrawCountArgs2"),
+            Shader.PropertyToID("_VisibleDrawCountArgs3")
+        };
+        static readonly int[] kShadowDrawArgsIds =
+        {
+            Shader.PropertyToID("_DrawArgs0"),
+            Shader.PropertyToID("_DrawArgs1"),
+            Shader.PropertyToID("_DrawArgs2"),
+            Shader.PropertyToID("_DrawArgs3")
+        };
+        static readonly ProfilerMarker kDispatchMarker = new ProfilerMarker("Nanite.CPU.GpuCullDispatch");
+        static readonly ProfilerMarker kCpuBvhMarker = new ProfilerMarker("Nanite.CPU.CpuBvhCandidates");
 
         public enum CullPassMode
         {
@@ -44,6 +95,12 @@ namespace Nanite
         ComputeShader shader;
         int kernelPartCull = -1;
         int kernelClusterCull = -1;
+        int kernelClusterCullByPart = -1;
+        int kernelFinalizeVisiblePartDispatch = -1;
+        int kernelClusterCullVisibleParts = -1;
+        int kernelInstanceCull = -1;
+        int kernelPartCullVisibleInstances = -1;
+        int kernelShadowCullMultiCascadeByPart = -1;
         int kernelClearClusterVisible = -1;
         int kernelClearSecondPassCandidates = -1;
         int kernelCopyUintBuffer = -1;
@@ -52,14 +109,30 @@ namespace Nanite
 
         ComputeBuffer partsBuffer;
         ComputeBuffer clustersBuffer;
+        ComputeBuffer virtualPartsBuffer;
+        ComputeBuffer virtualClustersBuffer;
+        ComputeBuffer visiblePartAppendBuffer;
+        ComputeBuffer visiblePartDispatchArgsBuffer;
+        ComputeBuffer visibleInstanceAppendBuffer;
+        ComputeBuffer visibleInstancePartDispatchArgsBuffer;
+        ComputeBuffer visibleDrawClusterAppendBuffer;
+        ComputeBuffer visibleDrawCountArgsBuffer;
+        readonly ComputeBuffer[] shadowDrawClusterAppendBuffers = new ComputeBuffer[kMaxShadowCascades];
+        readonly ComputeBuffer[] shadowDrawCountArgsBuffers = new ComputeBuffer[kMaxShadowCascades];
+        readonly GraphicsBuffer[] shadowDrawArgsBuffers = new GraphicsBuffer[kMaxShadowCascades];
         ComputeBuffer partVisibleBuffer;
         ComputeBuffer visibleClusterAppendBuffer;
         ComputeBuffer visibleCountBuffer;
         ComputeBuffer clusterCandidateBuffer;
         ComputeBuffer clusterSceneIndexBuffer;
-        ComputeBuffer instanceLocalToWorldBuffer;
-        ComputeBuffer instanceMaxScaleBuffer;
-        ComputeBuffer instanceLodErrorBuffer;
+        ComputeBuffer sceneClusterFirstTriBuffer;
+        ComputeBuffer sceneClusterTriCountBuffer;
+        ComputeBuffer scenePageResidencyBuffer;
+        ComputeBuffer scenePageRequestBuffer;
+        int scenePageCount;
+        bool sceneTrackPageUsage;
+        ComputeBuffer instanceDataBuffer;
+        ComputeBuffer instanceVisibleBuffer;
         ComputeBuffer fallbackClusterVisibleBuffer;
         ComputeBuffer fallbackPrevVisibleBuffer;
         ComputeBuffer fallbackSecondPassBuffer;
@@ -69,17 +142,23 @@ namespace Nanite
         readonly uint[] cullStatsCpu = new uint[3];
 
         readonly List<BatchSlot> slots = new List<BatchSlot>(32);
+        readonly List<GeometrySlot> geometrySlots = new List<GeometrySlot>(16);
+        readonly Dictionary<int, int> geometryIndexByMeshId = new Dictionary<int, int>(16);
         readonly List<NaniteGpuCullingBackend.GpuPartData> mergedParts = new List<NaniteGpuCullingBackend.GpuPartData>(8192);
         readonly List<NaniteGpuCullingBackend.GpuClusterData> mergedClusters = new List<NaniteGpuCullingBackend.GpuClusterData>(65536);
-        readonly List<Matrix4x4> instanceMatrices = new List<Matrix4x4>(32);
-        readonly List<float> instanceMaxScales = new List<float>(32);
-        readonly List<float> instanceLodErrors = new List<float>(32);
+        readonly List<GpuVirtualPartRef> virtualParts = new List<GpuVirtualPartRef>(8192);
+        readonly List<GpuVirtualClusterRef> virtualClusters = new List<GpuVirtualClusterRef>(65536);
+        readonly List<NaniteGpuCullingBackend.GpuInstanceData> instanceData = new List<NaniteGpuCullingBackend.GpuInstanceData>(32);
         readonly List<int> bvhStack = new List<int>(256);
+        readonly Plane[] frustumPlaneObjects = new Plane[6];
         readonly Vector4[] frustumPlanes = new Vector4[6];
+        readonly Vector4[] shadowBatchFrustumPlanes = new Vector4[kMaxShadowCascades * 6];
         readonly Dictionary<int, List<NaniteVisibleClusterRef>> visibleScratch = new Dictionary<int, List<NaniteVisibleClusterRef>>();
 
         NaniteGpuCullingBackend.GpuPartData[] partDataCpu;
         NaniteGpuCullingBackend.GpuClusterData[] clusterDataCpu;
+        GpuVirtualPartRef[] virtualPartRefsCpu;
+        GpuVirtualClusterRef[] virtualClusterRefsCpu;
         uint[] partVisibleCpu;
         uint[] clusterCandidatesCpu;
         uint[] clusterSceneIndexCpu;
@@ -88,11 +167,20 @@ namespace Nanite
         GpuVisibleRef[] visibleRefsScratch = Array.Empty<GpuVisibleRef>();
         int partCount;
         int clusterCount;
+        int geometryPartCount;
+        int geometryClusterCount;
         int clusterCandidateCount;
         int instanceCount;
         int rebuildSignature;
+        int registryRevision = -1;
         int sceneIndexSignature;
         int sceneClusterCountMapped;
+        int lastVisibleDrawQueueFrame = -1;
+        int lastVisibleDrawCameraId;
+        int lastShadowDrawQueueFrame = -1;
+        int lastShadowDrawCameraId;
+        int lastShadowDrawCascadeMask;
+        int lastTransformUpdateFrame = -1;
 
         public bool IsReady =>
             shader != null &&
@@ -100,13 +188,20 @@ namespace Nanite
             kernelClusterCull >= 0 &&
             partsBuffer != null &&
             clustersBuffer != null &&
+            virtualPartsBuffer != null &&
+            virtualClustersBuffer != null &&
+            visiblePartAppendBuffer != null &&
+            visiblePartDispatchArgsBuffer != null &&
+            visibleInstanceAppendBuffer != null &&
+            visibleInstancePartDispatchArgsBuffer != null &&
+            visibleDrawClusterAppendBuffer != null &&
+            visibleDrawCountArgsBuffer != null &&
             partVisibleBuffer != null &&
             visibleClusterAppendBuffer != null &&
             visibleCountBuffer != null &&
             clusterCandidateBuffer != null &&
-            instanceLocalToWorldBuffer != null &&
-            instanceMaxScaleBuffer != null &&
-            instanceLodErrorBuffer != null &&
+            instanceDataBuffer != null &&
+            instanceVisibleBuffer != null &&
             instanceCount > 0;
 
         public bool SupportsGpuVisibleMask =>
@@ -114,6 +209,8 @@ namespace Nanite
             kernelClearClusterVisible >= 0 &&
             clusterSceneIndexBuffer != null &&
             clusterSceneIndexCpu != null &&
+            sceneClusterFirstTriBuffer != null &&
+            sceneClusterTriCountBuffer != null &&
             sceneClusterCountMapped > 0;
 
         public void Dispose()
@@ -123,38 +220,81 @@ namespace Nanite
             shader = null;
             kernelPartCull = -1;
             kernelClusterCull = -1;
+            kernelClusterCullByPart = -1;
+            kernelFinalizeVisiblePartDispatch = -1;
+            kernelClusterCullVisibleParts = -1;
+            kernelInstanceCull = -1;
+            kernelPartCullVisibleInstances = -1;
+            kernelShadowCullMultiCascadeByPart = -1;
             slots.Clear();
+            geometrySlots.Clear();
+            geometryIndexByMeshId.Clear();
             mergedParts.Clear();
             mergedClusters.Clear();
-            instanceMatrices.Clear();
-            instanceMaxScales.Clear();
-            instanceLodErrors.Clear();
+            virtualParts.Clear();
+            virtualClusters.Clear();
+            instanceData.Clear();
             partDataCpu = null;
             clusterDataCpu = null;
+            virtualPartRefsCpu = null;
+            virtualClusterRefsCpu = null;
             partVisibleCpu = null;
             clusterCandidatesCpu = null;
             clusterSceneIndexCpu = null;
             visibleRefsScratch = Array.Empty<GpuVisibleRef>();
             partCount = 0;
             clusterCount = 0;
+            geometryPartCount = 0;
+            geometryClusterCount = 0;
             clusterCandidateCount = 0;
             instanceCount = 0;
+            lastTransformUpdateFrame = -1;
             rebuildSignature = 0;
+            registryRevision = -1;
             sceneIndexSignature = 0;
             sceneClusterCountMapped = 0;
+            lastVisibleDrawQueueFrame = -1;
+            lastVisibleDrawCameraId = 0;
+            lastShadowDrawQueueFrame = -1;
+            lastShadowDrawCameraId = 0;
+            lastShadowDrawCascadeMask = 0;
             LastClusterCandidateCount = 0;
             LastClusterCount = 0;
             LastCull1Drawn = 0;
             LastCull2Candidates = 0;
             LastCull2Drawn = 0;
+            LastUsedCpuCandidates = false;
+            LastUsedPartDrivenClusterCull = false;
+            LastUsedVisiblePartQueue = false;
+            LastUsedVisibleInstanceQueue = false;
+            LastShadowUsedFusedBatch = false;
         }
 
         public bool EnsureClusterSceneIndex(NaniteSceneVisibilityBufferBackend scene)
         {
-            if (!IsReady || scene == null || !scene.IsReady || clusterDataCpu == null || slots.Count == 0)
+            if (!IsReady || scene == null || !scene.IsReady || clusterDataCpu == null ||
+                virtualClusterRefsCpu == null || slots.Count == 0)
                 return false;
 
-            int sig = unchecked(scene.GeometryGeneration * 397 + clusterCount * 31 + slots.Count);
+            sceneClusterFirstTriBuffer = scene.ClusterFirstTriBuffer;
+            sceneClusterTriCountBuffer = scene.ClusterTriCountBuffer;
+            if (sceneClusterFirstTriBuffer == null || sceneClusterTriCountBuffer == null)
+                return false;
+
+            bool pageRequestsEnabled =
+                scene.PageStreamingRequestsEnabled &&
+                scene.IsPagePoolReady;
+            scenePageResidencyBuffer = pageRequestsEnabled ? scene.PageResidencyBitsetBuffer : null;
+            scenePageRequestBuffer = pageRequestsEnabled ? scene.PageRequestBitsetBuffer : null;
+            scenePageCount = pageRequestsEnabled ? scene.GlobalPageCount : 0;
+            sceneTrackPageUsage = pageRequestsEnabled && scene.PagePoolRequiresEviction;
+
+            int sig = unchecked(
+                scene.GeometryGeneration * 397 +
+                clusterCount * 31 +
+                geometryClusterCount * 17 +
+                slots.Count +
+                scenePageCount * 13);
             if (clusterSceneIndexBuffer != null &&
                 clusterSceneIndexCpu != null &&
                 clusterSceneIndexCpu.Length == clusterCount &&
@@ -166,17 +306,24 @@ namespace Nanite
             int mapped = 0;
             for (int i = 0; i < clusterCount; i++)
             {
-                var c = clusterDataCpu[i];
-                int inst = c.instanceIndex;
+                var virtualCluster = virtualClusterRefsCpu[i];
+                int inst = (int)virtualCluster.instanceIndex;
                 uint sceneIndex = 0xFFFFFFFFu;
-                if ((uint)inst < (uint)slots.Count)
+                if ((uint)inst < (uint)slots.Count && virtualCluster.clusterIndex < (uint)clusterDataCpu.Length)
                 {
+                    var c = clusterDataCpu[virtualCluster.clusterIndex];
                     int proxyId = slots[inst].proxyId;
                     if (scene.TryGetGlobalClusterIndex(proxyId, c.pageIndex, c.clusterIndex, out int gi) && gi >= 0)
                     {
                         sceneIndex = (uint)gi;
                         mapped++;
                     }
+                    virtualCluster.reserved =
+                        scene.TryGetGlobalPageId(proxyId, c.pageIndex, out int globalPageId) &&
+                        globalPageId >= 0
+                            ? (uint)globalPageId
+                            : uint.MaxValue;
+                    virtualClusterRefsCpu[i] = virtualCluster;
                 }
 
                 clusterSceneIndexCpu[i] = sceneIndex;
@@ -188,6 +335,7 @@ namespace Nanite
             clusterSceneIndexBuffer?.Release();
             clusterSceneIndexBuffer = new ComputeBuffer(clusterSceneIndexCpu.Length, sizeof(uint), ComputeBufferType.Structured);
             clusterSceneIndexBuffer.SetData(clusterSceneIndexCpu);
+            virtualClustersBuffer.SetData(virtualClusterRefsCpu);
             sceneIndexSignature = sig;
             sceneClusterCountMapped = scene.ClusterCount;
             return true;
@@ -197,6 +345,15 @@ namespace Nanite
         {
             if (cullingShader == null || proxies == null || proxies.Count == 0)
                 return false;
+
+            int currentRevision = NaniteRuntimeRegistry.Revision;
+            if (shader == cullingShader &&
+                registryRevision == currentRevision &&
+                IsReady)
+            {
+                UpdateInstanceTransforms(proxies);
+                return true;
+            }
 
             int signature = ComputeRebuildSignature(proxies);
             if (shader != cullingShader)
@@ -225,6 +382,7 @@ namespace Nanite
                 UpdateInstanceTransforms(proxies);
             }
 
+            registryRevision = currentRevision;
             return IsReady;
         }
 
@@ -299,7 +457,7 @@ namespace Nanite
                 return false;
 
             LastClusterCount = clusterCount;
-            LastClusterCandidateCount = PreferBvhCandidates ? clusterCandidateCount : clusterCount;
+            LastClusterCandidateCount = LastUsedCpuCandidates ? clusterCandidateCount : clusterCount;
             if (enableCullStats)
                 ReadbackCullStats();
             return true;
@@ -448,13 +606,14 @@ namespace Nanite
             out bool hasCpuCandidates,
             out int cpuTestedNodes)
         {
+            using var profilerScope = kDispatchMarker.Auto();
             hasCpuCandidates = false;
             cpuTestedNodes = 0;
 
-            var planes = GeometryUtility.CalculateFrustumPlanes(camera);
+            GeometryUtility.CalculateFrustumPlanes(camera.cullingMatrix, frustumPlaneObjects);
             for (int i = 0; i < 6; i++)
             {
-                var p = planes[i];
+                var p = frustumPlaneObjects[i];
                 frustumPlanes[i] = new Vector4(p.normal.x, p.normal.y, p.normal.z, p.distance);
             }
 
@@ -469,11 +628,22 @@ namespace Nanite
                              useHzb &&
                              hzbTexture != null &&
                              hzbMipCount > 0;
+            SetSharedParams(
+                cameraPos,
+                projectionScale,
+                zNear,
+                worldToClip,
+                camera.pixelWidth,
+                camera.pixelHeight,
+                enableHzb);
+            shader.SetInt("_UseGpuSceneRefs", 1);
+            shader.SetInt("_HizMipCount", enableHzb ? Mathf.Max(1, hzbMipCount) : 1);
+            Texture boundHzbTexture = enableHzb ? hzbTexture : GetFallbackHzbTexture();
 
             if (allowCpuCandidates)
             {
                 hasCpuCandidates = BuildCpuClusterCandidates(
-                    planes,
+                    frustumPlaneObjects,
                     cameraPos,
                     projectionScale,
                     zNear,
@@ -510,7 +680,7 @@ namespace Nanite
                 shader.SetInt("_EnableClusterVisibleWrite", 0);
                 BindCullSharedBuffers(kernelClearClusterVisible, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
                 BindInstanceBuffers(kernelClearClusterVisible);
-                BindHzb(kernelClearClusterVisible, hzbTexture, hzbMipCount, enableHzb);
+                BindHzbTexture(kernelClearClusterVisible, boundHzbTexture);
                 int clearGroups = (visibleCountParam + kThreadGroupSize - 1) / kThreadGroupSize;
                 shader.Dispatch(kernelClearClusterVisible, Mathf.Max(1, clearGroups), 1, 1);
             }
@@ -525,6 +695,17 @@ namespace Nanite
                 shader.Dispatch(kernelClearSecondPassCandidates, Mathf.Max(1, clearGroups), 1, 1);
             }
 
+            bool usePartDriven = !hasCpuCandidates &&
+                                 PreferPartDrivenClusterCull &&
+                                 kernelClusterCullByPart >= 0;
+            bool useVisiblePartQueue = usePartDriven &&
+                                       kernelClusterCullVisibleParts >= 0 &&
+                                       kernelFinalizeVisiblePartDispatch >= 0 &&
+                                       partCount >= Mathf.Max(1, PartQueueMinVirtualParts);
+            bool useVisibleInstanceQueue = useVisiblePartQueue &&
+                                           kernelPartCullVisibleInstances >= 0 &&
+                                           instanceCount >= Mathf.Max(1, InstanceQueueMinInstances);
+
             if (hasCpuCandidates)
             {
                 partVisibleBuffer.SetData(partVisibleCpu);
@@ -533,52 +714,178 @@ namespace Nanite
             }
             else
             {
-                SetSharedParams(kernelPartCull, cameraPos, projectionScale, zNear, worldToClip, camera.pixelWidth, camera.pixelHeight, enableHzb);
+                if (useVisiblePartQueue)
+                    visiblePartAppendBuffer.SetCounterValue(0);
+                if (useVisibleInstanceQueue)
+                    visibleInstanceAppendBuffer.SetCounterValue(0);
+
+                shader.SetInt("_CullPassMode", (int)cullPassMode);
+                shader.SetInt("_UseInstanceCull", 1);
+                shader.SetInt("_EnableVisibleInstanceQueue", useVisibleInstanceQueue ? 1 : 0);
+                shader.SetBuffer(kernelInstanceCull, "_VisibleInstancesOut", visibleInstanceAppendBuffer);
+                BindInstanceBuffers(kernelInstanceCull);
+                BindHzbTexture(kernelInstanceCull, boundHzbTexture);
+                int instanceGroups = (instanceCount + kThreadGroupSize - 1) / kThreadGroupSize;
+                shader.Dispatch(kernelInstanceCull, Mathf.Max(1, instanceGroups), 1, 1);
+
+                if (useVisibleInstanceQueue)
+                    ComputeBuffer.CopyCount(
+                        visibleInstanceAppendBuffer,
+                        visibleInstancePartDispatchArgsBuffer,
+                        0);
+
+                int activePartKernel = useVisibleInstanceQueue
+                    ? kernelPartCullVisibleInstances
+                    : kernelPartCull;
                 shader.SetInt("_PartCount", partCount);
                 shader.SetInt("_SceneClusterCount", visibleCountParam);
                 shader.SetInt("_CullPassMode", (int)cullPassMode);
                 shader.SetInt("_HasPrevVisible", hasPrevVisible ? 1 : 0);
                 shader.SetInt("_EnableVisibleAppend", 0);
                 shader.SetInt("_EnableClusterVisibleWrite", 0);
-                shader.SetBuffer(kernelPartCull, "_Parts", partsBuffer);
-                shader.SetBuffer(kernelPartCull, "_PartVisible", partVisibleBuffer);
-                BindCullSharedBuffers(kernelPartCull, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
-                BindInstanceBuffers(kernelPartCull);
-                BindHzb(kernelPartCull, hzbTexture, hzbMipCount, enableHzb);
+                shader.SetInt("_EnableVisiblePartQueue", useVisiblePartQueue ? 1 : 0);
+                shader.SetInt("_UseInstanceCull", useVisibleInstanceQueue ? 0 : 1);
+                shader.SetBuffer(activePartKernel, "_Parts", partsBuffer);
+                shader.SetBuffer(activePartKernel, "_PartVisible", partVisibleBuffer);
+                shader.SetBuffer(activePartKernel, "_VisiblePartsOut", visiblePartAppendBuffer);
+                if (useVisibleInstanceQueue)
+                {
+                    shader.SetBuffer(activePartKernel, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
+                    shader.SetBuffer(
+                        activePartKernel,
+                        "_VisibleInstancePartDispatchArgs",
+                        visibleInstancePartDispatchArgsBuffer);
+                }
+                BindGpuSceneRefs(activePartKernel);
+                BindCullSharedBuffers(activePartKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
+                BindInstanceBuffers(activePartKernel);
+                BindHzbTexture(activePartKernel, boundHzbTexture);
 
-                int partGroups = (partCount + kThreadGroupSize - 1) / kThreadGroupSize;
-                shader.Dispatch(kernelPartCull, partGroups, 1, 1);
+                if (useVisibleInstanceQueue)
+                {
+                    shader.DispatchIndirect(activePartKernel, visibleInstancePartDispatchArgsBuffer, 0);
+                }
+                else
+                {
+                    int partGroups = (partCount + kThreadGroupSize - 1) / kThreadGroupSize;
+                    shader.Dispatch(activePartKernel, partGroups, 1, 1);
+                }
+
+                if (useVisiblePartQueue)
+                {
+                    ComputeBuffer.CopyCount(visiblePartAppendBuffer, visiblePartDispatchArgsBuffer, 0);
+                    shader.SetBuffer(
+                        kernelFinalizeVisiblePartDispatch,
+                        "_VisiblePartDispatchArgs",
+                        visiblePartDispatchArgsBuffer);
+                    shader.Dispatch(kernelFinalizeVisiblePartDispatch, 1, 1, 1);
+                }
             }
 
             visibleClusterAppendBuffer.SetCounterValue(0);
-            SetSharedParams(kernelClusterCull, cameraPos, projectionScale, zNear, worldToClip, camera.pixelWidth, camera.pixelHeight, enableHzb);
+            bool enableVisibleDrawQueue = enableClusterVisibleWrite &&
+                                          sceneClusterFirstTriBuffer != null &&
+                                          sceneClusterTriCountBuffer != null;
+            if (enableVisibleDrawQueue && clearMask)
+                visibleDrawClusterAppendBuffer.SetCounterValue(0);
+            int activeClusterKernel = useVisiblePartQueue
+                ? kernelClusterCullVisibleParts
+                : (usePartDriven ? kernelClusterCullByPart : kernelClusterCull);
             shader.SetInt("_PartCount", partCount);
             shader.SetInt("_ClusterCount", clusterCount);
             shader.SetInt("_ClusterCandidateCount", hasCpuCandidates ? clusterCandidateCount : 0);
             shader.SetInt("_UseClusterCandidates", hasCpuCandidates ? 1 : 0);
+            shader.SetInt("_UseInstanceCull", hasCpuCandidates ? 0 : 1);
             shader.SetInt("_EnableVisibleAppend", enableVisibleAppend ? 1 : 0);
+            shader.SetInt("_EnableVisibleDrawAppend", enableVisibleDrawQueue ? 1 : 0);
             shader.SetInt("_EnableClusterVisibleWrite", enableClusterVisibleWrite ? 1 : 0);
             shader.SetInt("_SceneClusterCount", visibleCountParam);
             shader.SetInt("_CullPassMode", (int)cullPassMode);
             shader.SetInt("_HasPrevVisible", hasPrevVisible ? 1 : 0);
             shader.SetInt("_EnableCullStats", enableCullStats ? 1 : 0);
-            shader.SetBuffer(kernelClusterCull, "_Clusters", clustersBuffer);
-            shader.SetBuffer(kernelClusterCull, "_PartVisible", partVisibleBuffer);
-            shader.SetBuffer(kernelClusterCull, "_VisibleClusters", visibleClusterAppendBuffer);
-            shader.SetBuffer(kernelClusterCull, "_ClusterCandidates", clusterCandidateBuffer);
-            shader.SetBuffer(kernelClusterCull, "_CullStats", cullStatsBuffer);
-            BindCullSharedBuffers(kernelClusterCull, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
-            BindInstanceBuffers(kernelClusterCull);
-            BindHzb(kernelClusterCull, hzbTexture, hzbMipCount, enableHzb);
+            shader.SetBuffer(activeClusterKernel, "_Clusters", clustersBuffer);
+            shader.SetBuffer(activeClusterKernel, "_PartVisible", partVisibleBuffer);
+            shader.SetBuffer(activeClusterKernel, "_VisibleClusters", visibleClusterAppendBuffer);
+            shader.SetBuffer(activeClusterKernel, "_ClusterCandidates", clusterCandidateBuffer);
+            shader.SetBuffer(activeClusterKernel, "_CullStats", cullStatsBuffer);
+            shader.SetBuffer(activeClusterKernel, "_VisibleDrawClusters", visibleDrawClusterAppendBuffer);
+            ComputeBuffer fallbackSceneClusterData = GetFallbackClusterVisibleBuffer();
+            shader.SetBuffer(
+                activeClusterKernel,
+                "_SceneClusterFirstTri",
+                sceneClusterFirstTriBuffer != null ? sceneClusterFirstTriBuffer : fallbackSceneClusterData);
+            shader.SetBuffer(
+                activeClusterKernel,
+                "_SceneClusterTriCount",
+                sceneClusterTriCountBuffer != null ? sceneClusterTriCountBuffer : fallbackSceneClusterData);
+            if (useVisiblePartQueue)
+            {
+                shader.SetBuffer(activeClusterKernel, "_VisiblePartsIn", visiblePartAppendBuffer);
+                shader.SetBuffer(activeClusterKernel, "_VisiblePartDispatchArgs", visiblePartDispatchArgsBuffer);
+            }
+            BindGpuSceneRefs(activeClusterKernel);
+            BindPageStreamingBuffers(activeClusterKernel);
+            BindCullSharedBuffers(activeClusterKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
+            BindInstanceBuffers(activeClusterKernel);
+            BindHzbTexture(activeClusterKernel, boundHzbTexture);
 
-            int clusterWorkCount = hasCpuCandidates ? clusterCandidateCount : clusterCount;
-            if (clusterWorkCount > 0)
+            int clusterWorkCount = usePartDriven
+                ? partCount
+                : (hasCpuCandidates ? clusterCandidateCount : clusterCount);
+            if (useVisiblePartQueue)
+            {
+                shader.DispatchIndirect(activeClusterKernel, visiblePartDispatchArgsBuffer, 0);
+            }
+            else if (clusterWorkCount > 0)
             {
                 int clusterGroups = (clusterWorkCount + kThreadGroupSize - 1) / kThreadGroupSize;
-                shader.Dispatch(kernelClusterCull, clusterGroups, 1, 1);
+                shader.Dispatch(activeClusterKernel, clusterGroups, 1, 1);
             }
 
+            if (enableVisibleDrawQueue)
+            {
+                ComputeBuffer.CopyCount(visibleDrawClusterAppendBuffer, visibleDrawCountArgsBuffer, 0);
+                lastVisibleDrawQueueFrame = Time.frameCount;
+                lastVisibleDrawCameraId = camera.GetInstanceID();
+            }
+            else
+            {
+                lastVisibleDrawQueueFrame = -1;
+                lastVisibleDrawCameraId = 0;
+            }
+
+            LastUsedCpuCandidates = hasCpuCandidates;
+            LastUsedPartDrivenClusterCull = usePartDriven;
+            LastUsedVisiblePartQueue = useVisiblePartQueue;
+            LastUsedVisibleInstanceQueue = useVisibleInstanceQueue;
+
             return true;
+        }
+
+        void BindGpuSceneRefs(int kernel)
+        {
+            shader.SetBuffer(kernel, "_VirtualParts", virtualPartsBuffer);
+            shader.SetBuffer(kernel, "_VirtualClusters", virtualClustersBuffer);
+        }
+
+        void BindPageStreamingBuffers(int kernel)
+        {
+            ComputeBuffer fallback = GetFallbackClusterVisibleBuffer();
+            bool enabled =
+                scenePageCount > 0 &&
+                scenePageResidencyBuffer != null &&
+                scenePageRequestBuffer != null;
+            shader.SetInt("_PageCount", enabled ? scenePageCount : 0);
+            shader.SetInt("_EnablePageRequests", enabled ? 1 : 0);
+            shader.SetInt("_TrackPageUsage", enabled && sceneTrackPageUsage ? 1 : 0);
+            shader.SetBuffer(
+                kernel,
+                "_PageResidency",
+                enabled ? scenePageResidencyBuffer : fallback);
+            shader.SetBuffer(
+                kernel,
+                "_PageRequests",
+                enabled ? scenePageRequestBuffer : fallback);
         }
 
         void BindCullSharedBuffers(
@@ -672,12 +979,15 @@ namespace Nanite
         {
             if (slots.Count == 0)
                 return;
+            if (lastTransformUpdateFrame == Time.frameCount)
+                return;
+            lastTransformUpdateFrame = Time.frameCount;
 
             bool dirty = false;
             for (int s = 0; s < slots.Count; s++)
             {
                 var proxy = slots[s].proxy;
-                if (proxy == null || !proxy.isActiveAndEnabled)
+                if (proxy == null || !proxy.isActiveAndEnabled || !proxy.NaniteRenderingActive)
                     continue;
 
                 Matrix4x4 m = proxy.transform.localToWorldMatrix;
@@ -686,13 +996,15 @@ namespace Nanite
                     Mathf.Abs(proxy.transform.lossyScale.y),
                     Mathf.Abs(proxy.transform.lossyScale.z));
                 float lodErr = LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels;
-                if (instanceMatrices[s] != m ||
-                    !Mathf.Approximately(instanceMaxScales[s], maxScale) ||
-                    !Mathf.Approximately(instanceLodErrors[s], lodErr))
+                var current = instanceData[s];
+                if (current.localToWorld != m ||
+                    !Mathf.Approximately(current.maxScale, maxScale) ||
+                    !Mathf.Approximately(current.lodErrorPixels, lodErr))
                 {
-                    instanceMatrices[s] = m;
-                    instanceMaxScales[s] = maxScale;
-                    instanceLodErrors[s] = lodErr;
+                    current.localToWorld = m;
+                    current.maxScale = maxScale;
+                    current.lodErrorPixels = lodErr;
+                    instanceData[s] = current;
                     dirty = true;
                 }
             }
@@ -700,20 +1012,20 @@ namespace Nanite
             if (!dirty)
                 return;
 
-            instanceLocalToWorldBuffer.SetData(instanceMatrices, 0, 0, slots.Count);
-            instanceMaxScaleBuffer.SetData(instanceMaxScales, 0, 0, slots.Count);
-            instanceLodErrorBuffer.SetData(instanceLodErrors, 0, 0, slots.Count);
+            instanceDataBuffer.SetData(instanceData, 0, 0, slots.Count);
         }
 
         bool RebuildMergedData(IReadOnlyList<NaniteRuntimeProxy> proxies)
         {
             ReleaseBuffers();
             slots.Clear();
+            geometrySlots.Clear();
+            geometryIndexByMeshId.Clear();
             mergedParts.Clear();
             mergedClusters.Clear();
-            instanceMatrices.Clear();
-            instanceMaxScales.Clear();
-            instanceLodErrors.Clear();
+            virtualParts.Clear();
+            virtualClusters.Clear();
+            instanceData.Clear();
 
             for (int i = 0; i < proxies.Count; i++)
             {
@@ -721,75 +1033,222 @@ namespace Nanite
                 if (!IsBatchableProxy(proxy))
                     continue;
 
+                NaniteMesh mesh = proxy.naniteMesh;
+                int meshId = mesh.GetInstanceID();
+                if (!geometryIndexByMeshId.TryGetValue(meshId, out int geometryIndex))
+                {
+                    int geometryPartOffset = mergedParts.Count;
+                    int geometryClusterOffset = mergedClusters.Count;
+                    NaniteGpuCullingBackend.BuildGpuData(
+                        mesh,
+                        0,
+                        mergedParts,
+                        mergedClusters,
+                        out var geometryPagePartBase,
+                        out var geometryPagePartCount);
+
+                    int geometryParts = mergedParts.Count - geometryPartOffset;
+                    int geometryClusters = mergedClusters.Count - geometryClusterOffset;
+                    if (geometryParts <= 0 || geometryClusters <= 0)
+                    {
+                        if (geometryParts > 0)
+                            mergedParts.RemoveRange(geometryPartOffset, geometryParts);
+                        if (geometryClusters > 0)
+                            mergedClusters.RemoveRange(geometryClusterOffset, geometryClusters);
+                        continue;
+                    }
+
+                    var geometry = new GeometrySlot
+                    {
+                        mesh = mesh,
+                        partOffset = geometryPartOffset,
+                        clusterOffset = geometryClusterOffset,
+                        partCount = geometryParts,
+                        clusterCount = geometryClusters,
+                        pagePartBase = geometryPagePartBase,
+                        pagePartCount = geometryPagePartCount,
+                        bounds = ResolveMeshBounds(mesh, geometryPartOffset, geometryParts)
+                    };
+                    geometryIndex = geometrySlots.Count;
+                    geometrySlots.Add(geometry);
+                    geometryIndexByMeshId.Add(meshId, geometryIndex);
+                }
+
+                GeometrySlot geometrySlot = geometrySlots[geometryIndex];
                 int instanceIndex = slots.Count;
-                int partOffset = mergedParts.Count;
-                int clusterOffset = mergedClusters.Count;
+                int virtualPartOffset = virtualParts.Count;
+                int virtualClusterOffset = virtualClusters.Count;
 
-                NaniteGpuCullingBackend.BuildGpuData(
-                    proxy.naniteMesh,
-                    instanceIndex,
-                    mergedParts,
-                    mergedClusters,
-                    out var pagePartBase,
-                    out var pagePartCount);
+                for (int localCluster = 0; localCluster < geometrySlot.clusterCount; localCluster++)
+                {
+                    int geometryClusterIndex = geometrySlot.clusterOffset + localCluster;
+                    int geometryPartIndex = mergedClusters[geometryClusterIndex].partIndex;
+                    int localPart = geometryPartIndex - geometrySlot.partOffset;
+                    uint virtualPartIndex = (uint)localPart < (uint)geometrySlot.partCount
+                        ? (uint)(virtualPartOffset + localPart)
+                        : uint.MaxValue;
+                    virtualClusters.Add(new GpuVirtualClusterRef
+                    {
+                        instanceIndex = (uint)instanceIndex,
+                        clusterIndex = (uint)geometryClusterIndex,
+                        partIndex = virtualPartIndex,
+                        reserved = 0u
+                    });
+                }
 
-                int partCountInMesh = mergedParts.Count - partOffset;
-                int clusterCountInMesh = mergedClusters.Count - clusterOffset;
-                if (partCountInMesh <= 0 || clusterCountInMesh <= 0)
-                    continue;
+                for (int localPart = 0; localPart < geometrySlot.partCount; localPart++)
+                {
+                    int geometryPartIndex = geometrySlot.partOffset + localPart;
+                    var part = mergedParts[geometryPartIndex];
+                    int localClusterStart = part.clusterStart - geometrySlot.clusterOffset;
+                    int safeClusterStart = Mathf.Clamp(localClusterStart, 0, geometrySlot.clusterCount);
+                    int safeClusterCount = Mathf.Clamp(
+                        part.clusterCount,
+                        0,
+                        geometrySlot.clusterCount - safeClusterStart);
+                    virtualParts.Add(new GpuVirtualPartRef
+                    {
+                        instanceIndex = (uint)instanceIndex,
+                        partIndex = (uint)geometryPartIndex,
+                        clusterStart = (uint)(virtualClusterOffset + safeClusterStart),
+                        clusterCount = (uint)safeClusterCount
+                    });
+                }
+
+                int[] pagePartBase = new int[geometrySlot.pagePartBase.Length];
+                for (int page = 0; page < pagePartBase.Length; page++)
+                {
+                    int geometryPageBase = geometrySlot.pagePartBase[page];
+                    pagePartBase[page] = geometryPageBase >= geometrySlot.partOffset
+                        ? virtualPartOffset + (geometryPageBase - geometrySlot.partOffset)
+                        : -1;
+                }
 
                 slots.Add(new BatchSlot
                 {
                     proxy = proxy,
                     proxyId = proxy.GetInstanceID(),
-                    mesh = proxy.naniteMesh,
-                    partOffset = partOffset,
-                    clusterOffset = clusterOffset,
-                    partCount = partCountInMesh,
-                    clusterCount = clusterCountInMesh,
+                    mesh = mesh,
+                    geometryIndex = geometryIndex,
+                    virtualPartOffset = virtualPartOffset,
+                    virtualClusterOffset = virtualClusterOffset,
+                    partCount = geometrySlot.partCount,
+                    clusterCount = geometrySlot.clusterCount,
                     pagePartBase = pagePartBase,
-                    pagePartCount = pagePartCount
+                    pagePartCount = geometrySlot.pagePartCount
                 });
 
-                instanceMatrices.Add(proxy.transform.localToWorldMatrix);
-                instanceMaxScales.Add(Mathf.Max(
-                    Mathf.Abs(proxy.transform.lossyScale.x),
-                    Mathf.Abs(proxy.transform.lossyScale.y),
-                    Mathf.Abs(proxy.transform.lossyScale.z)));
-                instanceLodErrors.Add(LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels);
+                instanceData.Add(new NaniteGpuCullingBackend.GpuInstanceData
+                {
+                    localToWorld = proxy.transform.localToWorldMatrix,
+                    bounds = geometrySlot.bounds,
+                    maxScale = Mathf.Max(
+                        Mathf.Abs(proxy.transform.lossyScale.x),
+                        Mathf.Abs(proxy.transform.lossyScale.y),
+                        Mathf.Abs(proxy.transform.lossyScale.z)),
+                    lodErrorPixels = LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels,
+                    partOffset = (uint)virtualPartOffset,
+                    partCount = (uint)geometrySlot.partCount
+                });
             }
 
-            partCount = mergedParts.Count;
-            clusterCount = mergedClusters.Count;
+            geometryPartCount = mergedParts.Count;
+            geometryClusterCount = mergedClusters.Count;
+            partCount = virtualParts.Count;
+            clusterCount = virtualClusters.Count;
             instanceCount = slots.Count;
-            if (partCount == 0 || clusterCount == 0 || instanceCount == 0)
+            if (geometryPartCount == 0 || geometryClusterCount == 0 ||
+                partCount == 0 || clusterCount == 0 || instanceCount == 0)
                 return false;
 
             partDataCpu = mergedParts.ToArray();
             clusterDataCpu = mergedClusters.ToArray();
+            virtualPartRefsCpu = virtualParts.ToArray();
+            virtualClusterRefsCpu = virtualClusters.ToArray();
             partVisibleCpu = new uint[partCount];
             clusterCandidatesCpu = new uint[clusterCount];
             clusterSceneIndexCpu = null;
             sceneIndexSignature = 0;
             sceneClusterCountMapped = 0;
 
-            partsBuffer = new ComputeBuffer(partCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuPartData>());
-            clustersBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuClusterData>());
+            partsBuffer = new ComputeBuffer(geometryPartCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuPartData>());
+            clustersBuffer = new ComputeBuffer(geometryClusterCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuClusterData>());
+            virtualPartsBuffer = new ComputeBuffer(partCount, Marshal.SizeOf<GpuVirtualPartRef>());
+            virtualClustersBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<GpuVirtualClusterRef>());
+            visiblePartAppendBuffer = new ComputeBuffer(partCount, sizeof(uint), ComputeBufferType.Append);
+            visiblePartDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            visibleInstanceAppendBuffer = new ComputeBuffer(instanceCount, sizeof(uint), ComputeBufferType.Append);
+            visibleInstancePartDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            visibleDrawClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+            visibleDrawCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                shadowDrawClusterAppendBuffers[cascadeIndex] =
+                    new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+                shadowDrawCountArgsBuffers[cascadeIndex] =
+                    new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+                shadowDrawArgsBuffers[cascadeIndex] = new GraphicsBuffer(
+                    GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
+                    4,
+                    sizeof(uint));
+            }
             partVisibleBuffer = new ComputeBuffer(partCount, sizeof(uint));
             visibleClusterAppendBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<GpuVisibleRef>(), ComputeBufferType.Append);
             visibleCountBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Raw);
             clusterCandidateBuffer = new ComputeBuffer(clusterCount, sizeof(uint));
-            instanceLocalToWorldBuffer = new ComputeBuffer(instanceCount, sizeof(float) * 16);
-            instanceMaxScaleBuffer = new ComputeBuffer(instanceCount, sizeof(float));
-            instanceLodErrorBuffer = new ComputeBuffer(instanceCount, sizeof(float));
+            instanceDataBuffer = new ComputeBuffer(instanceCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuInstanceData>());
+            instanceVisibleBuffer = new ComputeBuffer(instanceCount, sizeof(uint));
 
             partsBuffer.SetData(partDataCpu);
             clustersBuffer.SetData(clusterDataCpu);
+            virtualPartsBuffer.SetData(virtualPartRefsCpu);
+            virtualClustersBuffer.SetData(virtualClusterRefsCpu);
+            visiblePartAppendBuffer.SetCounterValue(0);
+            visiblePartDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            visibleInstanceAppendBuffer.SetCounterValue(0);
+            visibleInstancePartDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            visibleDrawClusterAppendBuffer.SetCounterValue(0);
+            visibleDrawCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                shadowDrawClusterAppendBuffers[cascadeIndex].SetCounterValue(0);
+                shadowDrawCountArgsBuffers[cascadeIndex].SetData(new uint[] { 0u, 1u, 1u, 0u });
+                shadowDrawArgsBuffers[cascadeIndex].SetData(new uint[] { 0u, 1u, 0u, 0u });
+            }
             visibleClusterAppendBuffer.SetCounterValue(0);
-            instanceLocalToWorldBuffer.SetData(instanceMatrices);
-            instanceMaxScaleBuffer.SetData(instanceMaxScales);
-            instanceLodErrorBuffer.SetData(instanceLodErrors);
+            instanceDataBuffer.SetData(instanceData);
+            instanceVisibleBuffer.SetData(new uint[instanceCount]);
+            lastTransformUpdateFrame = Time.frameCount;
+            lastShadowDrawQueueFrame = -1;
+            lastShadowDrawCameraId = 0;
+            lastShadowDrawCascadeMask = 0;
             return true;
+        }
+
+        Vector4 ResolveMeshBounds(NaniteMesh mesh, int partOffset, int partCountInMesh)
+        {
+            Vector4 sphere = mesh != null ? mesh.boundingSphere : Vector4.zero;
+            if (sphere.w > 0f && !float.IsNaN(sphere.w) && !float.IsInfinity(sphere.w))
+                return sphere;
+
+            if (partCountInMesh <= 0 || partOffset < 0 || partOffset >= mergedParts.Count)
+                return new Vector4(0f, 0f, 0f, 1e30f);
+
+            Vector3 min = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+            Vector3 max = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+            int end = Mathf.Min(mergedParts.Count, partOffset + partCountInMesh);
+            for (int i = partOffset; i < end; i++)
+            {
+                Vector4 p = mergedParts[i].selfSphere;
+                Vector3 r = Vector3.one * Mathf.Max(0f, p.w);
+                Vector3 c = new Vector3(p.x, p.y, p.z);
+                min = Vector3.Min(min, c - r);
+                max = Vector3.Max(max, c + r);
+            }
+
+            Vector3 center = (min + max) * 0.5f;
+            float radius = (max - center).magnitude;
+            return new Vector4(center.x, center.y, center.z, Mathf.Max(radius, 1e-5f));
         }
 
         static bool IsBatchableProxy(NaniteRuntimeProxy proxy)
@@ -797,11 +1256,504 @@ namespace Nanite
             // Feature 提供全局 culling shader 时可批；不再强制 proxy.useGpuCulling（默认 false 会导致整帧 GPU cull 永不启用）。
             return proxy != null &&
                    proxy.isActiveAndEnabled &&
+                   proxy.NaniteRenderingActive &&
                    proxy.naniteMesh != null;
         }
 
+        public bool RecordShadowCull(
+            UnsafeCommandBuffer cmd,
+            Camera camera,
+            int cascadeIndex,
+            Matrix4x4 shadowViewMatrix,
+            Matrix4x4 shadowProjectionMatrix,
+            int shadowResolution)
+        {
+            if (cmd == null || camera == null || !SupportsGpuVisibleMask ||
+                kernelInstanceCull < 0 || kernelPartCull < 0 || kernelClusterCullByPart < 0 ||
+                cascadeIndex < 0 || cascadeIndex >= kMaxShadowCascades)
+                return false;
+
+            ComputeBuffer drawQueue = shadowDrawClusterAppendBuffers[cascadeIndex];
+            ComputeBuffer countArgs = shadowDrawCountArgsBuffers[cascadeIndex];
+            GraphicsBuffer drawArgs = shadowDrawArgsBuffers[cascadeIndex];
+            if (drawQueue == null || countArgs == null || drawArgs == null ||
+                clusterSceneIndexBuffer == null || sceneClusterCountMapped <= 0)
+                return false;
+
+            bool useVisiblePartQueue =
+                kernelClusterCullVisibleParts >= 0 &&
+                kernelFinalizeVisiblePartDispatch >= 0 &&
+                partCount >= Mathf.Max(1, ShadowPartQueueMinVirtualParts);
+            bool useVisibleInstanceQueue =
+                useVisiblePartQueue &&
+                kernelPartCullVisibleInstances >= 0 &&
+                instanceCount >= Mathf.Max(1, ShadowInstanceQueueMinInstances);
+            LastShadowUsedFusedBatch = false;
+            LastShadowUsedVisiblePartQueue = useVisiblePartQueue;
+            LastShadowUsedVisibleInstanceQueue = useVisibleInstanceQueue;
+
+            GeometryUtility.CalculateFrustumPlanes(
+                shadowProjectionMatrix * shadowViewMatrix,
+                frustumPlaneObjects);
+            for (int i = 0; i < 6; i++)
+            {
+                Plane plane = frustumPlaneObjects[i];
+                frustumPlanes[i] = new Vector4(
+                    plane.normal.x,
+                    plane.normal.y,
+                    plane.normal.z,
+                    plane.distance);
+            }
+
+            Matrix4x4 cameraGpuProjection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
+            float projectionScale = Mathf.Abs(cameraGpuProjection.m11) * 0.5f *
+                                    Mathf.Max(1, camera.pixelHeight);
+            Matrix4x4 shadowGpuProjection = GL.GetGPUProjectionMatrix(shadowProjectionMatrix, true);
+            Matrix4x4 shadowWorldToClip = shadowGpuProjection * shadowViewMatrix;
+            Vector3 cameraPosition = camera.transform.position;
+
+            cmd.SetBufferCounterValue(drawQueue, 0u);
+            if (useVisiblePartQueue)
+                cmd.SetBufferCounterValue(visiblePartAppendBuffer, 0u);
+            if (useVisibleInstanceQueue)
+                cmd.SetBufferCounterValue(visibleInstanceAppendBuffer, 0u);
+            SetShadowCullParams(
+                cmd,
+                cameraPosition,
+                projectionScale,
+                Mathf.Max(1e-3f, camera.nearClipPlane),
+                shadowWorldToClip,
+                Mathf.Max(1, shadowResolution),
+                useVisiblePartQueue,
+                useVisibleInstanceQueue);
+
+            // Instance frustum cull. The append output is disabled for this path; its buffer is
+            // still bound because Unity validates every resource declared by the kernel.
+            BindShadowInstanceKernel(cmd, kernelInstanceCull);
+            cmd.DispatchCompute(
+                shader,
+                kernelInstanceCull,
+                Mathf.Max(1, (instanceCount + kThreadGroupSize - 1) / kThreadGroupSize),
+                1,
+                1);
+
+            if (useVisibleInstanceQueue)
+                cmd.CopyCounterValue(visibleInstanceAppendBuffer, visibleInstancePartDispatchArgsBuffer, 0u);
+
+            // Part cull keeps the camera-space LOD error metric while replacing only the
+            // visibility volume with the current light cascade frustum. Large instance sets
+            // expand only the append queue produced above.
+            int activePartKernel = useVisibleInstanceQueue
+                ? kernelPartCullVisibleInstances
+                : kernelPartCull;
+            BindShadowPartKernel(cmd, activePartKernel);
+            if (useVisibleInstanceQueue)
+            {
+                cmd.DispatchCompute(shader, activePartKernel, visibleInstancePartDispatchArgsBuffer, 0u);
+            }
+            else
+            {
+                cmd.DispatchCompute(
+                    shader,
+                    activePartKernel,
+                    Mathf.Max(1, (partCount + kThreadGroupSize - 1) / kThreadGroupSize),
+                    1,
+                    1);
+            }
+
+            if (useVisiblePartQueue)
+            {
+                cmd.CopyCounterValue(visiblePartAppendBuffer, visiblePartDispatchArgsBuffer, 0u);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernelFinalizeVisiblePartDispatch,
+                    "_VisiblePartDispatchArgs",
+                    visiblePartDispatchArgsBuffer);
+                cmd.DispatchCompute(shader, kernelFinalizeVisiblePartDispatch, 1, 1, 1);
+            }
+
+            // Expand only surviving parts and append (firstTriangle, triangleCount, instance).
+            int activeClusterKernel = useVisiblePartQueue
+                ? kernelClusterCullVisibleParts
+                : kernelClusterCullByPart;
+            BindShadowClusterKernel(cmd, activeClusterKernel, drawQueue);
+            if (useVisiblePartQueue)
+            {
+                cmd.DispatchCompute(shader, activeClusterKernel, visiblePartDispatchArgsBuffer, 0u);
+            }
+            else
+            {
+                cmd.DispatchCompute(
+                    shader,
+                    activeClusterKernel,
+                    Mathf.Max(1, (partCount + kThreadGroupSize - 1) / kThreadGroupSize),
+                    1,
+                    1);
+            }
+            cmd.CopyCounterValue(drawQueue, countArgs, 0u);
+
+            int cameraId = camera.GetInstanceID();
+            if (lastShadowDrawQueueFrame != Time.frameCount ||
+                lastShadowDrawCameraId != cameraId)
+            {
+                lastShadowDrawQueueFrame = Time.frameCount;
+                lastShadowDrawCameraId = cameraId;
+                lastShadowDrawCascadeMask = 0;
+            }
+            lastShadowDrawCascadeMask |= 1 << cascadeIndex;
+            return true;
+        }
+
+        public bool RecordShadowCullBatch(
+            UnsafeCommandBuffer cmd,
+            Camera camera,
+            int cascadeCount,
+            Matrix4x4[] shadowViewMatrices,
+            Matrix4x4[] shadowProjectionMatrices,
+            int[] shadowResolutions)
+        {
+            int activeCascadeCount = Mathf.Clamp(cascadeCount, 0, kMaxShadowCascades);
+            if (cmd == null || camera == null || !SupportsGpuVisibleMask ||
+                kernelShadowCullMultiCascadeByPart < 0 || activeCascadeCount <= 0 ||
+                shadowViewMatrices == null || shadowProjectionMatrices == null || shadowResolutions == null ||
+                shadowViewMatrices.Length < activeCascadeCount ||
+                shadowProjectionMatrices.Length < activeCascadeCount ||
+                shadowResolutions.Length < activeCascadeCount ||
+                partCount >= Mathf.Max(1, ShadowPartQueueMinVirtualParts))
+                return false;
+
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                ComputeBuffer queue = shadowDrawClusterAppendBuffers[cascadeIndex];
+                if (queue == null || shadowDrawCountArgsBuffers[cascadeIndex] == null ||
+                    shadowDrawArgsBuffers[cascadeIndex] == null)
+                    return false;
+                cmd.SetBufferCounterValue(queue, 0u);
+            }
+
+            for (int cascadeIndex = 0; cascadeIndex < activeCascadeCount; cascadeIndex++)
+            {
+                GeometryUtility.CalculateFrustumPlanes(
+                    shadowProjectionMatrices[cascadeIndex] * shadowViewMatrices[cascadeIndex],
+                    frustumPlaneObjects);
+                int planeBase = cascadeIndex * 6;
+                for (int planeIndex = 0; planeIndex < 6; planeIndex++)
+                {
+                    Plane plane = frustumPlaneObjects[planeIndex];
+                    shadowBatchFrustumPlanes[planeBase + planeIndex] = new Vector4(
+                        plane.normal.x,
+                        plane.normal.y,
+                        plane.normal.z,
+                        plane.distance);
+                }
+            }
+
+            Matrix4x4 cameraGpuProjection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
+            float projectionScale = Mathf.Abs(cameraGpuProjection.m11) * 0.5f *
+                                    Mathf.Max(1, camera.pixelHeight);
+            Vector3 cameraPosition = camera.transform.position;
+            int kernel = kernelShadowCullMultiCascadeByPart;
+            cmd.SetComputeVectorParam(shader, "_CameraPos", new Vector4(
+                cameraPosition.x,
+                cameraPosition.y,
+                cameraPosition.z,
+                0f));
+            cmd.SetComputeFloatParam(shader, "_ProjectionScale", projectionScale);
+            cmd.SetComputeFloatParam(shader, "_ZNear", Mathf.Max(1e-3f, camera.nearClipPlane));
+            cmd.SetComputeIntParam(shader, "_ShadowCascadeCount", activeCascadeCount);
+            cmd.SetComputeVectorArrayParam(shader, "_ShadowFrustumPlanes", shadowBatchFrustumPlanes);
+            cmd.SetComputeIntParam(shader, "_InstanceCount", instanceCount);
+            cmd.SetComputeIntParam(shader, "_PartCount", partCount);
+            cmd.SetComputeIntParam(shader, "_ClusterCount", clusterCount);
+            cmd.SetComputeIntParam(shader, "_SceneClusterCount", sceneClusterCountMapped);
+            cmd.SetComputeIntParam(shader, "_UseGpuSceneRefs", 1);
+
+            bool pageRequestsEnabled =
+                scenePageCount > 0 &&
+                scenePageResidencyBuffer != null &&
+                scenePageRequestBuffer != null;
+            cmd.SetComputeIntParam(shader, "_PageCount", pageRequestsEnabled ? scenePageCount : 0);
+            cmd.SetComputeIntParam(shader, "_EnablePageRequests", pageRequestsEnabled ? 1 : 0);
+            cmd.SetComputeIntParam(
+                shader,
+                "_TrackPageUsage",
+                pageRequestsEnabled && sceneTrackPageUsage ? 1 : 0);
+
+            ComputeBuffer fallback = GetFallbackClusterVisibleBuffer();
+            cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_PageResidency",
+                pageRequestsEnabled ? scenePageResidencyBuffer : fallback);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_PageRequests",
+                pageRequestsEnabled ? scenePageRequestBuffer : fallback);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_ShadowVisibleDrawClusters0",
+                shadowDrawClusterAppendBuffers[0]);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_ShadowVisibleDrawClusters1",
+                shadowDrawClusterAppendBuffers[1]);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_ShadowVisibleDrawClusters2",
+                shadowDrawClusterAppendBuffers[2]);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_ShadowVisibleDrawClusters3",
+                shadowDrawClusterAppendBuffers[3]);
+
+            cmd.DispatchCompute(
+                shader,
+                kernel,
+                Mathf.Max(1, (partCount + kThreadGroupSize - 1) / kThreadGroupSize),
+                1,
+                1);
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                cmd.CopyCounterValue(
+                    shadowDrawClusterAppendBuffers[cascadeIndex],
+                    shadowDrawCountArgsBuffers[cascadeIndex],
+                    0u);
+            }
+
+            lastShadowDrawQueueFrame = Time.frameCount;
+            lastShadowDrawCameraId = camera.GetInstanceID();
+            lastShadowDrawCascadeMask = (1 << activeCascadeCount) - 1;
+            LastShadowUsedFusedBatch = true;
+            LastShadowUsedVisiblePartQueue = false;
+            LastShadowUsedVisibleInstanceQueue = false;
+            return true;
+        }
+
+        public bool DispatchShadowDrawQueueFinalizeBatch(
+            UnsafeCommandBuffer cmd,
+            ComputeShader finalizeShader,
+            int kernel,
+            int compactedClusterTriangleSlots)
+        {
+            if (cmd == null || finalizeShader == null || kernel < 0)
+                return false;
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                if (shadowDrawCountArgsBuffers[cascadeIndex] == null ||
+                    shadowDrawArgsBuffers[cascadeIndex] == null)
+                    return false;
+            }
+
+            cmd.SetComputeIntParam(
+                finalizeShader,
+                "_CompactedClusterTriangleSlots",
+                Mathf.Max(1, compactedClusterTriangleSlots));
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                cmd.SetComputeBufferParam(
+                    finalizeShader,
+                    kernel,
+                    kShadowVisibleDrawCountArgsIds[cascadeIndex],
+                    shadowDrawCountArgsBuffers[cascadeIndex]);
+                cmd.SetComputeBufferParam(
+                    finalizeShader,
+                    kernel,
+                    kShadowDrawArgsIds[cascadeIndex],
+                    shadowDrawArgsBuffers[cascadeIndex]);
+            }
+            cmd.DispatchCompute(finalizeShader, kernel, 1, 1, 1);
+            return true;
+        }
+
+        void SetShadowCullParams(
+            UnsafeCommandBuffer cmd,
+            Vector3 cameraPosition,
+            float projectionScale,
+            float zNear,
+            Matrix4x4 shadowWorldToClip,
+            int shadowResolution,
+            bool useVisiblePartQueue,
+            bool useVisibleInstanceQueue)
+        {
+            cmd.SetComputeVectorParam(shader, "_CameraPos", new Vector4(
+                cameraPosition.x,
+                cameraPosition.y,
+                cameraPosition.z,
+                0f));
+            cmd.SetComputeFloatParam(shader, "_ProjectionScale", projectionScale);
+            cmd.SetComputeFloatParam(shader, "_ZNear", zNear);
+            cmd.SetComputeMatrixParam(shader, "_WorldToClip", shadowWorldToClip);
+            cmd.SetComputeVectorParam(shader, "_ScreenSize", new Vector4(
+                shadowResolution,
+                shadowResolution,
+                1f / shadowResolution,
+                1f / shadowResolution));
+            cmd.SetComputeIntParam(shader, "_UseHzb", 0);
+            cmd.SetComputeIntParam(shader, "_HizMipCount", 1);
+            cmd.SetComputeIntParam(shader, "_ReversedZ", SystemInfo.usesReversedZBuffer ? 1 : 0);
+            cmd.SetComputeVectorArrayParam(shader, "_FrustumPlanes", frustumPlanes);
+            cmd.SetComputeIntParam(shader, "_InstanceCount", instanceCount);
+            cmd.SetComputeIntParam(shader, "_PartCount", partCount);
+            cmd.SetComputeIntParam(shader, "_ClusterCount", clusterCount);
+            cmd.SetComputeIntParam(shader, "_ClusterCandidateCount", 0);
+            cmd.SetComputeIntParam(shader, "_UseClusterCandidates", 0);
+            cmd.SetComputeIntParam(shader, "_UseGpuSceneRefs", 1);
+            cmd.SetComputeIntParam(shader, "_UseInstanceCull", 1);
+            cmd.SetComputeIntParam(shader, "_EnableVisibleInstanceQueue", useVisibleInstanceQueue ? 1 : 0);
+            cmd.SetComputeIntParam(shader, "_EnableVisiblePartQueue", useVisiblePartQueue ? 1 : 0);
+            cmd.SetComputeIntParam(shader, "_EnableVisibleAppend", 0);
+            cmd.SetComputeIntParam(shader, "_EnableVisibleDrawAppend", 1);
+            cmd.SetComputeIntParam(shader, "_EnableClusterVisibleWrite", 0);
+            cmd.SetComputeIntParam(shader, "_SceneClusterCount", sceneClusterCountMapped);
+            cmd.SetComputeIntParam(shader, "_CullPassMode", (int)CullPassMode.Legacy);
+            cmd.SetComputeIntParam(shader, "_HasPrevVisible", 0);
+            cmd.SetComputeIntParam(shader, "_EnableCullStats", 0);
+            bool pageRequestsEnabled =
+                scenePageCount > 0 &&
+                scenePageResidencyBuffer != null &&
+                scenePageRequestBuffer != null;
+            cmd.SetComputeIntParam(
+                shader,
+                "_PageCount",
+                pageRequestsEnabled ? scenePageCount : 0);
+            cmd.SetComputeIntParam(
+                shader,
+                "_EnablePageRequests",
+                pageRequestsEnabled ? 1 : 0);
+            cmd.SetComputeIntParam(
+                shader,
+                "_TrackPageUsage",
+                pageRequestsEnabled && sceneTrackPageUsage ? 1 : 0);
+        }
+
+        void BindShadowInstanceKernel(UnsafeCommandBuffer cmd, int kernel)
+        {
+            cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_InstanceVisible", instanceVisibleBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisibleInstancesOut", visibleInstanceAppendBuffer);
+        }
+
+        void BindShadowPartKernel(UnsafeCommandBuffer cmd, int kernel)
+        {
+            cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_PartVisible", partVisibleBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_InstanceVisible", instanceVisibleBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisiblePartsOut", visiblePartAppendBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_VisibleInstancePartDispatchArgs",
+                visibleInstancePartDispatchArgsBuffer);
+            cmd.SetComputeTextureParam(shader, kernel, "_HizTexture", GetFallbackHzbTexture());
+        }
+
+        void BindShadowClusterKernel(
+            UnsafeCommandBuffer cmd,
+            int kernel,
+            ComputeBuffer drawQueue)
+        {
+            ComputeBuffer fallback = GetFallbackClusterVisibleBuffer();
+            cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_PartVisible", partVisibleBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_InstanceVisible", instanceVisibleBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisibleDrawClusters", drawQueue);
+            cmd.SetComputeBufferParam(shader, kernel, "_ClusterVisible", fallback);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisibleClusters", visibleClusterAppendBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisiblePartsIn", visiblePartAppendBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_VisiblePartDispatchArgs", visiblePartDispatchArgsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_ClusterCandidates", clusterCandidateBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_PrevClusterVisible", GetFallbackPrevVisibleBuffer());
+            cmd.SetComputeBufferParam(shader, kernel, "_SecondPassCandidates", GetFallbackSecondPassBuffer());
+            cmd.SetComputeBufferParam(shader, kernel, "_Pass2Drawn", GetFallbackPass2DrawnBuffer());
+            cmd.SetComputeBufferParam(shader, kernel, "_CullStats", cullStatsBuffer ?? fallback);
+            bool pageRequestsEnabled =
+                scenePageCount > 0 &&
+                scenePageResidencyBuffer != null &&
+                scenePageRequestBuffer != null;
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_PageResidency",
+                pageRequestsEnabled ? scenePageResidencyBuffer : fallback);
+            cmd.SetComputeBufferParam(
+                shader,
+                kernel,
+                "_PageRequests",
+                pageRequestsEnabled ? scenePageRequestBuffer : fallback);
+            cmd.SetComputeTextureParam(shader, kernel, "_HizTexture", GetFallbackHzbTexture());
+        }
+
         public float LodErrorPixelsOverride { get; set; }
+        public int InstanceCount => instanceCount;
+        public int UniqueGeometryCount => geometrySlots.Count;
+        public int GeometryPartCount => geometryPartCount;
+        public int GeometryClusterCount => geometryClusterCount;
+        public int VirtualPartCount => partCount;
+        public int VirtualClusterCount => clusterCount;
+        public int PartQueueMinVirtualParts { get; set; } = 4096;
+        public int InstanceQueueMinInstances { get; set; } = 64;
+        public int ShadowPartQueueMinVirtualParts { get; set; } = 32768;
+        public int ShadowInstanceQueueMinInstances { get; set; } = 64;
         public bool PreferBvhCandidates { get; set; } = true;
+        public bool PreferPartDrivenClusterCull { get; set; } = true;
+        public bool LastUsedCpuCandidates { get; private set; }
+        public bool LastUsedPartDrivenClusterCull { get; private set; }
+        public bool LastUsedVisiblePartQueue { get; private set; }
+        public bool LastUsedVisibleInstanceQueue { get; private set; }
+        public bool LastShadowUsedVisiblePartQueue { get; private set; }
+        public bool LastShadowUsedVisibleInstanceQueue { get; private set; }
+        public bool LastShadowUsedFusedBatch { get; private set; }
+        public ComputeBuffer VisibleDrawClusterBuffer => visibleDrawClusterAppendBuffer;
+        public ComputeBuffer VisibleDrawCountArgsBuffer => visibleDrawCountArgsBuffer;
+        public ComputeBuffer GetShadowDrawClusterBuffer(int cascadeIndex) =>
+            cascadeIndex >= 0 && cascadeIndex < kMaxShadowCascades
+                ? shadowDrawClusterAppendBuffers[cascadeIndex]
+                : null;
+        public ComputeBuffer GetShadowDrawCountArgsBuffer(int cascadeIndex) =>
+            cascadeIndex >= 0 && cascadeIndex < kMaxShadowCascades
+                ? shadowDrawCountArgsBuffers[cascadeIndex]
+                : null;
+        public GraphicsBuffer GetShadowDrawArgsBuffer(int cascadeIndex) =>
+            cascadeIndex >= 0 && cascadeIndex < kMaxShadowCascades
+                ? shadowDrawArgsBuffers[cascadeIndex]
+                : null;
+        public bool IsShadowDrawQueueReady(Camera camera, int cascadeIndex) =>
+            camera != null &&
+            cascadeIndex >= 0 && cascadeIndex < kMaxShadowCascades &&
+            lastShadowDrawQueueFrame == Time.frameCount &&
+            lastShadowDrawCameraId == camera.GetInstanceID() &&
+            (lastShadowDrawCascadeMask & (1 << cascadeIndex)) != 0 &&
+            shadowDrawClusterAppendBuffers[cascadeIndex] != null &&
+            shadowDrawArgsBuffers[cascadeIndex] != null;
+        public bool IsVisibleDrawQueueReady(Camera camera) =>
+            camera != null &&
+            lastVisibleDrawQueueFrame == Time.frameCount &&
+            lastVisibleDrawCameraId == camera.GetInstanceID() &&
+            visibleDrawClusterAppendBuffer != null &&
+            visibleDrawCountArgsBuffer != null;
         public int LastClusterCandidateCount { get; private set; }
         public int LastClusterCount { get; private set; }
         public int LastCull1Drawn { get; private set; }
@@ -836,9 +1788,16 @@ namespace Nanite
             out int testedParts,
             out int candidateCount)
         {
+            using var profilerScope = kCpuBvhMarker.Auto();
             testedNodes = 0;
             testedParts = 0;
             candidateCount = 0;
+
+            // The shared GPU Scene stores geometry once and virtualizes it through
+            // compact references. The legacy CPU BVH path expects expanded arrays;
+            // keep it in the single-mesh backend instead of rebuilding that duplication.
+            if (virtualPartRefsCpu != null && virtualClusterRefsCpu != null)
+                return false;
 
             if (partDataCpu == null || partVisibleCpu == null || clusterCandidatesCpu == null)
                 return false;
@@ -877,8 +1836,8 @@ namespace Nanite
                     continue;
 
                 var localToWorld = slot.proxy.transform.localToWorldMatrix;
-                float maxScale = instanceMaxScales[s];
-                float lodErrorPixels = instanceLodErrors[s];
+                float maxScale = instanceData[s].maxScale;
+                float lodErrorPixels = instanceData[s].lodErrorPixels;
 
                 for (int pageIndex = 0; pageIndex < mesh.pageArray.Length; pageIndex++)
                 {
@@ -974,13 +1933,11 @@ namespace Nanite
         void BindInstanceBuffers(int kernel)
         {
             shader.SetInt("_InstanceCount", instanceCount);
-            shader.SetBuffer(kernel, "_InstanceLocalToWorld", instanceLocalToWorldBuffer);
-            shader.SetBuffer(kernel, "_InstanceMaxScale", instanceMaxScaleBuffer);
-            shader.SetBuffer(kernel, "_InstanceLodErrorPixels", instanceLodErrorBuffer);
+            shader.SetBuffer(kernel, "_Instances", instanceDataBuffer);
+            shader.SetBuffer(kernel, "_InstanceVisible", instanceVisibleBuffer);
         }
 
         void SetSharedParams(
-            int kernel,
             Vector3 cameraPos,
             float projectionScale,
             float zNear,
@@ -999,19 +1956,9 @@ namespace Nanite
             shader.SetVectorArray("_FrustumPlanes", frustumPlanes);
         }
 
-        void BindHzb(int kernel, Texture hzbTexture, int hzbMipCount, bool enableHzb)
+        void BindHzbTexture(int kernel, Texture hzbTexture)
         {
-            if (enableHzb)
-            {
-                shader.SetInt("_UseHzb", 1);
-                shader.SetInt("_HizMipCount", Mathf.Max(1, hzbMipCount));
-                shader.SetTexture(kernel, "_HizTexture", hzbTexture);
-                return;
-            }
-
-            shader.SetInt("_UseHzb", 0);
-            shader.SetInt("_HizMipCount", 1);
-            shader.SetTexture(kernel, "_HizTexture", GetFallbackHzbTexture());
+            shader.SetTexture(kernel, "_HizTexture", hzbTexture);
         }
 
         bool TryFindKernels()
@@ -1020,6 +1967,13 @@ namespace Nanite
             {
                 kernelPartCull = shader.FindKernel("CSPartCull");
                 kernelClusterCull = shader.FindKernel("CSClusterCull");
+                kernelClusterCullByPart = shader.FindKernel("CSClusterCullByPart");
+                kernelFinalizeVisiblePartDispatch = shader.FindKernel("CSFinalizeVisiblePartDispatch");
+                kernelClusterCullVisibleParts = shader.FindKernel("CSClusterCullVisibleParts");
+                kernelInstanceCull = shader.FindKernel("CSInstanceCull");
+                kernelPartCullVisibleInstances = shader.FindKernel("CSPartCullVisibleInstances");
+                try { kernelShadowCullMultiCascadeByPart = shader.FindKernel("CSShadowCullMultiCascadeByPart"); }
+                catch { kernelShadowCullMultiCascadeByPart = -1; }
                 try
                 {
                     kernelClearClusterVisible = shader.FindKernel("CSClearClusterVisible");
@@ -1050,14 +2004,30 @@ namespace Nanite
         {
             partsBuffer?.Release();
             clustersBuffer?.Release();
+            virtualPartsBuffer?.Release();
+            virtualClustersBuffer?.Release();
+            visiblePartAppendBuffer?.Release();
+            visiblePartDispatchArgsBuffer?.Release();
+            visibleInstanceAppendBuffer?.Release();
+            visibleInstancePartDispatchArgsBuffer?.Release();
+            visibleDrawClusterAppendBuffer?.Release();
+            visibleDrawCountArgsBuffer?.Release();
+            for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+            {
+                shadowDrawClusterAppendBuffers[cascadeIndex]?.Release();
+                shadowDrawCountArgsBuffers[cascadeIndex]?.Release();
+                shadowDrawArgsBuffers[cascadeIndex]?.Dispose();
+                shadowDrawClusterAppendBuffers[cascadeIndex] = null;
+                shadowDrawCountArgsBuffers[cascadeIndex] = null;
+                shadowDrawArgsBuffers[cascadeIndex] = null;
+            }
             partVisibleBuffer?.Release();
             visibleClusterAppendBuffer?.Release();
             visibleCountBuffer?.Release();
             clusterCandidateBuffer?.Release();
             clusterSceneIndexBuffer?.Release();
-            instanceLocalToWorldBuffer?.Release();
-            instanceMaxScaleBuffer?.Release();
-            instanceLodErrorBuffer?.Release();
+            instanceDataBuffer?.Release();
+            instanceVisibleBuffer?.Release();
             fallbackClusterVisibleBuffer?.Release();
             fallbackPrevVisibleBuffer?.Release();
             fallbackSecondPassBuffer?.Release();
@@ -1066,19 +2036,35 @@ namespace Nanite
 
             partsBuffer = null;
             clustersBuffer = null;
+            virtualPartsBuffer = null;
+            virtualClustersBuffer = null;
+            visiblePartAppendBuffer = null;
+            visiblePartDispatchArgsBuffer = null;
+            visibleInstanceAppendBuffer = null;
+            visibleInstancePartDispatchArgsBuffer = null;
+            visibleDrawClusterAppendBuffer = null;
+            visibleDrawCountArgsBuffer = null;
             partVisibleBuffer = null;
             visibleClusterAppendBuffer = null;
             visibleCountBuffer = null;
             clusterCandidateBuffer = null;
             clusterSceneIndexBuffer = null;
-            instanceLocalToWorldBuffer = null;
-            instanceMaxScaleBuffer = null;
-            instanceLodErrorBuffer = null;
+            sceneClusterFirstTriBuffer = null;
+            sceneClusterTriCountBuffer = null;
+            scenePageResidencyBuffer = null;
+            scenePageRequestBuffer = null;
+            scenePageCount = 0;
+            sceneTrackPageUsage = false;
+            instanceDataBuffer = null;
+            instanceVisibleBuffer = null;
             fallbackClusterVisibleBuffer = null;
             fallbackPrevVisibleBuffer = null;
             fallbackSecondPassBuffer = null;
             fallbackPass2DrawnBuffer = null;
             cullStatsBuffer = null;
+            lastShadowDrawQueueFrame = -1;
+            lastShadowDrawCameraId = 0;
+            lastShadowDrawCascadeMask = 0;
         }
 
         Texture GetFallbackHzbTexture()

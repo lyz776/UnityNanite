@@ -1,10 +1,16 @@
 #pragma kernel CSPartCull
 #pragma kernel CSClusterCull
+#pragma kernel CSClusterCullByPart
+#pragma kernel CSFinalizeVisiblePartDispatch
+#pragma kernel CSClusterCullVisibleParts
+#pragma kernel CSInstanceCull
+#pragma kernel CSPartCullVisibleInstances
 #pragma kernel CSClearClusterVisible
 #pragma kernel CSClearSecondPassCandidates
 #pragma kernel CSCopyUintBuffer
 #pragma kernel CSClearCullStats
 #pragma kernel CSOrMasksToVisible
+#pragma kernel CSShadowCullMultiCascadeByPart
 
 // CullPassMode:
 // 0 = legacy（全量 frustum+LOD，可选 HZB）
@@ -38,10 +44,27 @@ struct GpuClusterData
 
 StructuredBuffer<GpuPartData> _Parts;
 StructuredBuffer<GpuClusterData> _Clusters;
+// GPU Scene indirection: immutable Part/Cluster data is stored once per unique mesh.
+// Each virtual reference is only uint4(instance, geometryIndex, relation/range).
+StructuredBuffer<uint4> _VirtualParts;
+StructuredBuffer<uint4> _VirtualClusters;
 RWStructuredBuffer<uint> _PartVisible;
+AppendStructuredBuffer<uint> _VisiblePartsOut;
+StructuredBuffer<uint> _VisiblePartsIn;
+RWStructuredBuffer<uint> _VisiblePartDispatchArgs;
+AppendStructuredBuffer<uint> _VisibleInstancesOut;
+StructuredBuffer<uint> _VisibleInstancesIn;
+StructuredBuffer<uint> _VisibleInstancePartDispatchArgs;
 AppendStructuredBuffer<uint3> _VisibleClusters;
+AppendStructuredBuffer<uint3> _VisibleDrawClusters;
+AppendStructuredBuffer<uint3> _ShadowVisibleDrawClusters0;
+AppendStructuredBuffer<uint3> _ShadowVisibleDrawClusters1;
+AppendStructuredBuffer<uint3> _ShadowVisibleDrawClusters2;
+AppendStructuredBuffer<uint3> _ShadowVisibleDrawClusters3;
 RWStructuredBuffer<uint> _ClusterVisible;
 StructuredBuffer<uint> _ClusterSceneIndex;
+StructuredBuffer<uint> _SceneClusterFirstTri;
+StructuredBuffer<uint> _SceneClusterTriCount;
 StructuredBuffer<uint> _PrevClusterVisible;
 RWStructuredBuffer<uint> _SecondPassCandidates;
 RWStructuredBuffer<uint> _Pass2Drawn;
@@ -53,6 +76,8 @@ StructuredBuffer<uint> _OrMaskB;
 Texture2D<float> _HizTexture;
 SamplerState sampler_HizTexture;
 StructuredBuffer<uint> _ClusterCandidates;
+StructuredBuffer<uint> _PageResidency;
+RWStructuredBuffer<uint> _PageRequests;
 
 int _PartCount;
 int _ClusterCount;
@@ -62,16 +87,34 @@ int _UseHzb;
 int _ReversedZ;
 int _UseClusterCandidates;
 int _EnableVisibleAppend;
+int _EnableVisibleDrawAppend;
 int _EnableClusterVisibleWrite;
 int _SceneClusterCount;
 int _CullPassMode;
 int _HasPrevVisible;
 int _EnableCullStats;
+int _UseGpuSceneRefs;
+int _EnableVisiblePartQueue;
+int _EnableVisibleInstanceQueue;
+int _PageCount;
+int _EnablePageRequests;
+int _TrackPageUsage;
+
+struct GpuInstanceData
+{
+    float4x4 localToWorld;
+    float4 bounds;
+    float maxScale;
+    float lodErrorPixels;
+    uint partOffset;
+    uint partCount;
+};
 
 float4 _FrustumPlanes[6];
-StructuredBuffer<float4x4> _InstanceLocalToWorld;
-StructuredBuffer<float> _InstanceMaxScale;
-StructuredBuffer<float> _InstanceLodErrorPixels;
+float4 _ShadowFrustumPlanes[24];
+int _ShadowCascadeCount;
+StructuredBuffer<GpuInstanceData> _Instances;
+RWStructuredBuffer<uint> _InstanceVisible;
 
 float4 _CameraPos;
 float _ProjectionScale;
@@ -79,12 +122,14 @@ float _ZNear;
 float4x4 _WorldToClip;
 float4 _ScreenSize;
 int _InstanceCount;
+int _UseInstanceCull;
 
 float4 TransformSphere(float4 localSphere, int instanceIndex)
 {
     instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
-    float4x4 localToWorld = _InstanceLocalToWorld[instanceIndex];
-    float maxScale = max(_InstanceMaxScale[instanceIndex], 1e-6);
+    GpuInstanceData instanceData = _Instances[instanceIndex];
+    float4x4 localToWorld = instanceData.localToWorld;
+    float maxScale = max(instanceData.maxScale, 1e-6);
     float3 center = mul(localToWorld, float4(localSphere.xyz, 1.0)).xyz;
     float radius = localSphere.w * maxScale;
     return float4(center, radius);
@@ -93,7 +138,7 @@ float4 TransformSphere(float4 localSphere, int instanceIndex)
 float LodErrorPixels(int instanceIndex)
 {
     instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
-    return _InstanceLodErrorPixels[instanceIndex];
+    return _Instances[instanceIndex].lodErrorPixels;
 }
 
 bool SphereVisible(float4 sphere)
@@ -235,14 +280,73 @@ void CSClearCullStats(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(64, 1, 1)]
-void CSPartCull(uint3 id : SV_DispatchThreadID)
+void CSInstanceCull(uint3 id : SV_DispatchThreadID)
 {
-    uint i = id.x;
+    uint instanceIndex = id.x;
+    if (instanceIndex >= (uint)_InstanceCount)
+        return;
+
+    float4 sphere = TransformSphere(_Instances[instanceIndex].bounds, (int)instanceIndex);
+    bool visible = SphereVisible(sphere);
+    _InstanceVisible[instanceIndex] = visible ? 1u : 0u;
+    if (visible && _EnableVisibleInstanceQueue != 0)
+        _VisibleInstancesOut.Append(instanceIndex);
+}
+
+GpuPartData LoadPartData(uint workIndex, out int instanceIndex, out uint clusterStart, out uint clusterCount)
+{
+    if (_UseGpuSceneRefs != 0)
+    {
+        uint4 virtualPart = _VirtualParts[workIndex];
+        instanceIndex = (int)virtualPart.x;
+        clusterStart = virtualPart.z;
+        clusterCount = virtualPart.w;
+        return _Parts[virtualPart.y];
+    }
+
+    GpuPartData part = _Parts[workIndex];
+    instanceIndex = part.instanceIndex;
+    clusterStart = (uint)max(0, part.clusterStart);
+    clusterCount = (uint)max(0, part.clusterCount);
+    return part;
+}
+
+GpuClusterData LoadClusterData(
+    uint workIndex,
+    out int instanceIndex,
+    out int partIndex,
+    out uint globalPageIndex)
+{
+    if (_UseGpuSceneRefs != 0)
+    {
+        uint4 virtualCluster = _VirtualClusters[workIndex];
+        instanceIndex = (int)virtualCluster.x;
+        partIndex = (int)virtualCluster.z;
+        globalPageIndex = virtualCluster.w;
+        return _Clusters[virtualCluster.y];
+    }
+
+    GpuClusterData cluster = _Clusters[workIndex];
+    instanceIndex = cluster.instanceIndex;
+    partIndex = cluster.partIndex;
+    globalPageIndex = (uint)max(0, cluster.pageIndex);
+    return cluster;
+}
+
+void CullPart(uint i)
+{
     if (i >= (uint)_PartCount)
         return;
 
-    GpuPartData part = _Parts[i];
-    int instanceIndex = part.instanceIndex;
+    int instanceIndex;
+    uint unusedClusterStart;
+    uint unusedClusterCount;
+    GpuPartData part = LoadPartData(i, instanceIndex, unusedClusterStart, unusedClusterCount);
+    if (_UseInstanceCull != 0 && _InstanceVisible[instanceIndex] == 0u)
+    {
+        _PartVisible[i] = 0u;
+        return;
+    }
     float lodError = LodErrorPixels(instanceIndex);
     float4 selfSphere = TransformSphere(part.selfSphere, instanceIndex);
     float4 lodSphere = TransformSphere(part.parentSphere.w > 0 ? part.parentSphere : part.selfSphere, instanceIndex);
@@ -255,24 +359,86 @@ void CSPartCull(uint3 id : SV_DispatchThreadID)
         visible = false;
 
     _PartVisible[i] = visible ? 1u : 0u;
+    if (visible && _EnableVisiblePartQueue != 0)
+        _VisiblePartsOut.Append(i);
 }
 
 [numthreads(64, 1, 1)]
-void CSClusterCull(uint3 id : SV_DispatchThreadID)
+void CSPartCull(uint3 id : SV_DispatchThreadID)
 {
-    uint i = id.x;
-    uint workCount = (_UseClusterCandidates != 0) ? (uint)_ClusterCandidateCount : (uint)_ClusterCount;
-    if (i >= workCount)
-        return;
-    uint clusterIdx = (_UseClusterCandidates != 0) ? _ClusterCandidates[i] : i;
+    CullPart(id.x);
+}
 
-    GpuClusterData c = _Clusters[clusterIdx];
-    if (c.partIndex < 0 || c.partIndex >= _PartCount)
-        return;
-    if (_PartVisible[c.partIndex] == 0)
+// One 64-lane group owns one visible instance and expands its Part range cooperatively.
+// CopyCount writes visibleInstanceCount directly into indirectArgs.x, so this stage
+// needs no CPU readback, no prefix sum and no finalize dispatch.
+[numthreads(64, 1, 1)]
+void CSPartCullVisibleInstances(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint visibleInstanceIndex = groupId.x;
+    uint visibleInstanceCount = _VisibleInstancePartDispatchArgs[0];
+    if (visibleInstanceIndex >= visibleInstanceCount)
         return;
 
-    int instanceIndex = c.instanceIndex;
+    uint instanceIndex = _VisibleInstancesIn[visibleInstanceIndex];
+    if (instanceIndex >= (uint)_InstanceCount)
+        return;
+
+    GpuInstanceData instanceData = _Instances[instanceIndex];
+    for (uint localPartIndex = groupThreadId.x;
+         localPartIndex < instanceData.partCount;
+         localPartIndex += 64u)
+    {
+        CullPart(instanceData.partOffset + localPartIndex);
+    }
+}
+
+void AppendVisibleDrawCluster(uint sceneClusterIndex, uint instanceIndex)
+{
+    if (_EnableVisibleDrawAppend == 0 || sceneClusterIndex >= (uint)_SceneClusterCount)
+        return;
+
+    uint triangleCount = _SceneClusterTriCount[sceneClusterIndex];
+    if (triangleCount == 0u)
+        return;
+
+    _VisibleDrawClusters.Append(uint3(
+        _SceneClusterFirstTri[sceneClusterIndex],
+        triangleCount,
+        instanceIndex));
+}
+
+void RequestPageIfNeeded(uint globalPageIndex)
+{
+    if (_EnablePageRequests == 0 || globalPageIndex >= (uint)_PageCount)
+        return;
+
+    uint wordIndex = globalPageIndex >> 5u;
+    uint bit = 1u << (globalPageIndex & 31u);
+    if (_TrackPageUsage != 0 || (_PageResidency[wordIndex] & bit) == 0u)
+        InterlockedOr(_PageRequests[wordIndex], bit);
+}
+
+void CullCluster(uint clusterIdx)
+{
+    int instanceIndex;
+    int virtualPartIndex;
+    uint globalPageIndex;
+    GpuClusterData c = LoadClusterData(
+        clusterIdx,
+        instanceIndex,
+        virtualPartIndex,
+        globalPageIndex);
+    if (virtualPartIndex < 0 || virtualPartIndex >= _PartCount)
+        return;
+    if (_PartVisible[virtualPartIndex] == 0)
+        return;
+
+    // Compatibility rendering remains valid while packed streaming is introduced. Missing
+    // pages therefore emit a request but are not rejected until parent/root fallback selection
+    // is enabled in the hierarchy traversal.
+    RequestPageIfNeeded(globalPageIndex);
+
     float lodError = LodErrorPixels(instanceIndex);
     float4 selfSphere = TransformSphere(c.selfSphere, instanceIndex);
     if (!SphereVisible(selfSphere))
@@ -292,7 +458,8 @@ void CSClusterCull(uint3 id : SV_DispatchThreadID)
     }
 
     uint gi = 0xFFFFFFFFu;
-    if (_EnableClusterVisibleWrite != 0 && clusterIdx < (uint)_ClusterCount)
+    if ((_EnableClusterVisibleWrite != 0 || _EnableVisibleDrawAppend != 0) &&
+        clusterIdx < (uint)_ClusterCount)
         gi = _ClusterSceneIndex[clusterIdx];
 
     if (_CullPassMode == CULL_MODE_PASS1)
@@ -314,6 +481,8 @@ void CSClusterCull(uint3 id : SV_DispatchThreadID)
             return;
         }
 
+        AppendVisibleDrawCluster(gi, (uint)instanceIndex);
+
         if (_EnableVisibleAppend != 0)
             _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
 
@@ -334,6 +503,8 @@ void CSClusterCull(uint3 id : SV_DispatchThreadID)
         if (IsOccludedByHzb(selfSphere))
             return;
 
+        AppendVisibleDrawCluster(gi, (uint)instanceIndex);
+
         if (_EnableVisibleAppend != 0)
             _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
 
@@ -348,9 +519,185 @@ void CSClusterCull(uint3 id : SV_DispatchThreadID)
     if (IsOccludedByHzb(selfSphere))
         return;
 
+    AppendVisibleDrawCluster(gi, (uint)instanceIndex);
+
     if (_EnableVisibleAppend != 0)
         _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
 
     if (_EnableClusterVisibleWrite != 0 && gi < (uint)_SceneClusterCount)
         _ClusterVisible[gi] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void CSClusterCull(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint workCount = (_UseClusterCandidates != 0) ? (uint)_ClusterCandidateCount : (uint)_ClusterCount;
+    if (i >= workCount)
+        return;
+    uint clusterIdx = (_UseClusterCandidates != 0) ? _ClusterCandidates[i] : i;
+    CullCluster(clusterIdx);
+}
+
+// Large instance scenes avoid CPU BVH traversal and avoid scanning clusters belonging to
+// rejected parts. One lane owns a part and expands its usually-small cluster range.
+[numthreads(64, 1, 1)]
+void CSClusterCullByPart(uint3 id : SV_DispatchThreadID)
+{
+    uint partIndex = id.x;
+    if (partIndex >= (uint)_PartCount || _PartVisible[partIndex] == 0u)
+        return;
+
+    int instanceIndex;
+    uint clusterStart;
+    uint clusterCount;
+    LoadPartData(partIndex, instanceIndex, clusterStart, clusterCount);
+    uint end = min((uint)_ClusterCount, clusterStart + clusterCount);
+    for (uint clusterIndex = clusterStart; clusterIndex < end; clusterIndex++)
+        CullCluster(clusterIndex);
+}
+
+[numthreads(1, 1, 1)]
+void CSFinalizeVisiblePartDispatch(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0u)
+        return;
+    uint visiblePartCount = _VisiblePartDispatchArgs[0];
+    _VisiblePartDispatchArgs[0] = (visiblePartCount + 63u) / 64u;
+    _VisiblePartDispatchArgs[1] = 1u;
+    _VisiblePartDispatchArgs[2] = 1u;
+    _VisiblePartDispatchArgs[3] = visiblePartCount;
+}
+
+// Indirect cluster stage: only revisit parts that survived Instance/Part culling.
+[numthreads(64, 1, 1)]
+void CSClusterCullVisibleParts(uint3 id : SV_DispatchThreadID)
+{
+    uint queueIndex = id.x;
+    uint visiblePartCount = _VisiblePartDispatchArgs[3];
+    if (queueIndex >= visiblePartCount)
+        return;
+
+    uint partIndex = _VisiblePartsIn[queueIndex];
+    if (partIndex >= (uint)_PartCount)
+        return;
+
+    int instanceIndex;
+    uint clusterStart;
+    uint clusterCount;
+    LoadPartData(partIndex, instanceIndex, clusterStart, clusterCount);
+    uint end = min((uint)_ClusterCount, clusterStart + clusterCount);
+    for (uint clusterIndex = clusterStart; clusterIndex < end; clusterIndex++)
+        CullCluster(clusterIndex);
+}
+
+bool ShadowSphereVisible(float4 sphere, int cascadeIndex)
+{
+    int planeBase = cascadeIndex * 6;
+    [unroll]
+    for (int planeIndex = 0; planeIndex < 6; planeIndex++)
+    {
+        float4 p = _ShadowFrustumPlanes[planeBase + planeIndex];
+        if (dot(p.xyz, sphere.xyz) + p.w < -sphere.w)
+            return false;
+    }
+    return true;
+}
+
+void AppendShadowVisibleDrawCluster(int cascadeIndex, uint sceneClusterIndex, uint instanceIndex)
+{
+    if (sceneClusterIndex >= (uint)_SceneClusterCount)
+        return;
+
+    uint triangleCount = _SceneClusterTriCount[sceneClusterIndex];
+    if (triangleCount == 0u)
+        return;
+
+    uint3 draw = uint3(_SceneClusterFirstTri[sceneClusterIndex], triangleCount, instanceIndex);
+    if (cascadeIndex == 0)
+        _ShadowVisibleDrawClusters0.Append(draw);
+    else if (cascadeIndex == 1)
+        _ShadowVisibleDrawClusters1.Append(draw);
+    else if (cascadeIndex == 2)
+        _ShadowVisibleDrawClusters2.Append(draw);
+    else
+        _ShadowVisibleDrawClusters3.Append(draw);
+}
+
+// Small shadow scenes pay more for four independent Instance/Part/Cluster dispatch chains
+// than for their culling work. One lane owns a virtual Part, evaluates all cascade frusta,
+// and appends to four independent draw queues. Large scenes keep the hierarchical path.
+[numthreads(64, 1, 1)]
+void CSShadowCullMultiCascadeByPart(uint3 id : SV_DispatchThreadID)
+{
+    uint partIndex = id.x;
+    if (partIndex >= (uint)_PartCount)
+        return;
+
+    int instanceIndex;
+    uint clusterStart;
+    uint partClusterCount;
+    GpuPartData part = LoadPartData(partIndex, instanceIndex, clusterStart, partClusterCount);
+    float lodError = LodErrorPixels(instanceIndex);
+    float4 partSphere = TransformSphere(part.selfSphere, instanceIndex);
+    float4 partLodSphere = TransformSphere(
+        part.parentSphere.w > 0 ? part.parentSphere : part.selfSphere,
+        instanceIndex);
+    if (LodErrorIsImperceptible(part.maxParentError, partLodSphere, lodError))
+        return;
+
+    int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
+    uint partCascadeMask = 0u;
+    for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
+    {
+        if (ShadowSphereVisible(partSphere, cascadeIndex))
+            partCascadeMask |= 1u << cascadeIndex;
+    }
+    if (partCascadeMask == 0u)
+        return;
+
+    uint clusterEnd = min((uint)_ClusterCount, clusterStart + partClusterCount);
+    for (uint clusterIndex = clusterStart; clusterIndex < clusterEnd; clusterIndex++)
+    {
+        int clusterInstanceIndex;
+        int unusedPartIndex;
+        uint globalPageIndex;
+        GpuClusterData cluster = LoadClusterData(
+            clusterIndex,
+            clusterInstanceIndex,
+            unusedPartIndex,
+            globalPageIndex);
+        RequestPageIfNeeded(globalPageIndex);
+
+        float4 clusterSphere = TransformSphere(cluster.selfSphere, clusterInstanceIndex);
+        float4 parentSphere = TransformSphere(
+            cluster.parentSphere.w > 0 ? cluster.parentSphere : cluster.selfSphere,
+            clusterInstanceIndex);
+        if (!ShouldSelectClusterLod(
+                cluster.parentError,
+                cluster.selfError,
+                parentSphere,
+                clusterSphere,
+                lodError))
+            continue;
+
+        float dist = max(length(clusterSphere.xyz - _CameraPos.xyz) - clusterSphere.w, _ZNear);
+        float diameterPixels = (2.0 * clusterSphere.w * _ProjectionScale) / dist;
+        if (diameterPixels < 1.0)
+            continue;
+
+        uint sceneClusterIndex = _ClusterSceneIndex[clusterIndex];
+        for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
+        {
+            uint cascadeBit = 1u << cascadeIndex;
+            if ((partCascadeMask & cascadeBit) != 0u &&
+                ShadowSphereVisible(clusterSphere, cascadeIndex))
+            {
+                AppendShadowVisibleDrawCluster(
+                    cascadeIndex,
+                    sceneClusterIndex,
+                    (uint)clusterInstanceIndex);
+            }
+        }
+    }
 }

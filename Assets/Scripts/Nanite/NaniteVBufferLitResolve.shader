@@ -42,8 +42,10 @@ Shader "Nanite/VBufferLitResolve"
 
             HLSLPROGRAM
             #pragma target 4.5
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
             #pragma vertex vertFullscreen
             #pragma fragment fragDepthOnly
+            #pragma multi_compile_local _ NANITE_COMPACT_VBUFFER
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/ShaderVariablesFunctions.hlsl"
             #include "NaniteVBufferCommon.hlsl"
@@ -62,10 +64,18 @@ Shader "Nanite/VBufferLitResolve"
             float4 _NaniteVBufferSize; // xy=size, zw=invSize
             CBUFFER_END
 
+            #if defined(NANITE_COMPACT_VBUFFER)
+            Texture2D<uint2> _NaniteVBufferTex;
+            #else
             TEXTURE2D_FLOAT(_NaniteVBufferTex);
+            #endif
 
+            StructuredBuffer<float> _VertexData;
+            StructuredBuffer<int> _Indices;
             StructuredBuffer<int> _TriangleSubMesh;
+            StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<int> _InstanceSubMeshMaterial;
+            #include "NanitePackedPage.hlsl"
 
             struct Attributes { uint vertexID : SV_VertexID; };
             struct Varyings
@@ -76,6 +86,16 @@ Shader "Nanite/VBufferLitResolve"
             int UseNormalizedIdsInt() { return (int)_UseNormalizedIds; }
             int TriangleCountInt() { return max(0, (int)_TriangleCount); }
             int InstanceCountInt() { return max(0, (int)_InstanceCount); }
+
+            float3 DecodePositionOS(int logicalVertex)
+            {
+                int stride = max(3, (int)_VertexStride);
+                int baseOffset = logicalVertex * stride;
+                return float3(
+                    _VertexData[baseOffset + 0],
+                    _VertexData[baseOffset + 1],
+                    _VertexData[baseOffset + 2]);
+            }
 
             uint2 NaniteVBufferCoord(float2 screenUv)
             {
@@ -101,13 +121,59 @@ Shader "Nanite/VBufferLitResolve"
 
                 float2 screenUv = GetNormalizedScreenSpaceUV(input.positionCS);
                 uint2 pixelCoord = NaniteVBufferCoord(screenUv);
+                #if defined(NANITE_COMPACT_VBUFFER)
+                uint2 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
+                NaniteDecodedVBufferIds decoded = NaniteDecodeCompactVBufferIds(
+                    encoded, InstanceCountInt(), TriangleCountInt());
+                #else
                 float4 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
                 NaniteDecodedVBufferIds decoded = NaniteDecodeVBufferIds(
                     encoded, UseNormalizedIdsInt(), InstanceCountInt(), TriangleCountInt());
+                #endif
                 if (decoded.valid == 0)
                     discard;
 
+                #if defined(NANITE_COMPACT_VBUFFER)
+                int triangleId = decoded.triangleId;
+                float4x4 localToWorld = _InstanceLocalToWorld[decoded.instanceId];
+                float3 p0OS;
+                float3 p1OS;
+                float3 p2OS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    if (!NanitePackedLoadTrianglePositions(
+                            (uint)triangleId,
+                            p0OS,
+                            p1OS,
+                            p2OS))
+                        discard;
+                }
+                else
+                {
+                    int i0 = _Indices[triangleId * 3 + 0];
+                    int i1 = _Indices[triangleId * 3 + 1];
+                    int i2 = _Indices[triangleId * 3 + 2];
+                    p0OS = DecodePositionOS(i0);
+                    p1OS = DecodePositionOS(i1);
+                    p2OS = DecodePositionOS(i2);
+                }
+                float3 p0WS = mul(localToWorld, float4(p0OS, 1.0)).xyz;
+                float3 p1WS = mul(localToWorld, float4(p1OS, 1.0)).xyz;
+                float3 p2WS = mul(localToWorld, float4(p2OS, 1.0)).xyz;
+                float4 p0CS = TransformWorldToHClip(p0WS);
+                float4 p1CS = TransformWorldToHClip(p1WS);
+                float4 p2CS = TransformWorldToHClip(p2WS);
+                float2 pixelNdc = NaniteNdcFromScreenUv(screenUv);
+                NaniteBarycentrics bary = CalculateTriangleBarycentricsNdc(pixelNdc, p0CS, p1CS, p2CS, _NaniteViewInvSize);
+                float barySum = bary.value.x + bary.value.y + bary.value.z;
+                if (abs(barySum) < 1e-5)
+                    discard;
+                bary.value /= barySum;
+                float3 positionWS = p0WS * bary.value.x + p1WS * bary.value.y + p2WS * bary.value.z;
+                outputDepth = NaniteDeviceDepthFromClip(TransformWorldToHClip(positionWS));
+                #else
                 outputDepth = encoded.x;
+                #endif
             }
             ENDHLSL
         }
@@ -132,8 +198,10 @@ Shader "Nanite/VBufferLitResolve"
 
             HLSLPROGRAM
             #pragma target 4.5
-            #pragma vertex vertFullscreen
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
+            #pragma vertex vertResolve
             #pragma fragment frag
+            #pragma multi_compile_local _ NANITE_COMPACT_VBUFFER
             #pragma multi_compile _ NANITE_GBUFFER_DEPTH_SLICE
             #pragma multi_compile _ _LIGHT_LAYERS
             #pragma multi_compile _ SHADOWS_SHADOWMASK
@@ -187,8 +255,11 @@ Shader "Nanite/VBufferLitResolve"
             float4 _NaniteVBufferSize; // xy=size, zw=invSize
             CBUFFER_END
 
+            #if defined(NANITE_COMPACT_VBUFFER)
+            Texture2D<uint2> _NaniteVBufferTex;
+            #else
             TEXTURE2D_FLOAT(_NaniteVBufferTex);
-            SAMPLER(sampler_NaniteVBufferTex);
+            #endif
             TEXTURE2D(_BaseMap);
             SAMPLER(sampler_BaseMap);
             TEXTURE2D(_BumpMap);
@@ -206,16 +277,25 @@ Shader "Nanite/VBufferLitResolve"
             StructuredBuffer<int> _TriangleSubMesh;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<int> _InstanceSubMeshMaterial;
-            StructuredBuffer<float4> _InstanceSHAr;
-            StructuredBuffer<float4> _InstanceSHAg;
-            StructuredBuffer<float4> _InstanceSHAb;
-            StructuredBuffer<float4> _InstanceSHBr;
-            StructuredBuffer<float4> _InstanceSHBg;
-            StructuredBuffer<float4> _InstanceSHBb;
-            StructuredBuffer<float4> _InstanceSHC;
+            struct NaniteInstanceSH
+            {
+                float4 shAr;
+                float4 shAg;
+                float4 shAb;
+                float4 shBr;
+                float4 shBg;
+                float4 shBb;
+                float4 shC;
+            };
+            StructuredBuffer<NaniteInstanceSH> _InstanceSH;
             StructuredBuffer<uint> _TileMaterialMask;
+            #include "NanitePackedPage.hlsl"
 
-            struct Attributes { uint vertexID : SV_VertexID; };
+            struct Attributes
+            {
+                uint vertexID : SV_VertexID;
+                uint instanceID : SV_InstanceID;
+            };
             struct Varyings
             {
                 float4 positionCS : SV_POSITION;
@@ -332,22 +412,61 @@ Shader "Nanite/VBufferLitResolve"
             {
                 half4 n = half4(normalWS, 1.0h);
                 half4 vB = n.xyzz * n.yzzx;
+                NaniteInstanceSH instanceSH = _InstanceSH[instanceId];
                 half3 x1 = half3(
-                    dot(_InstanceSHAr[instanceId], n),
-                    dot(_InstanceSHAg[instanceId], n),
-                    dot(_InstanceSHAb[instanceId], n));
+                    dot(instanceSH.shAr, n),
+                    dot(instanceSH.shAg, n),
+                    dot(instanceSH.shAb, n));
                 half3 x2 = half3(
-                    dot(_InstanceSHBr[instanceId], vB),
-                    dot(_InstanceSHBg[instanceId], vB),
-                    dot(_InstanceSHBb[instanceId], vB));
+                    dot(instanceSH.shBr, vB),
+                    dot(instanceSH.shBg, vB),
+                    dot(instanceSH.shBb, vB));
                 half vC = n.x * n.x - n.y * n.y;
-                half3 x3 = _InstanceSHC[instanceId].rgb * vC;
+                half3 x3 = instanceSH.shC.rgb * vC;
                 return x1 + x2 + x3;
             }
 
-            Varyings vertFullscreen(Attributes input)
+            Varyings vertResolve(Attributes input)
             {
                 Varyings o;
+
+                if (_UseTileMaterialMask > 0.5)
+                {
+                    uint tileIndex = input.instanceID;
+                    uint tileCount = (uint)max(0, (int)_TileCount);
+                    int resolveMaterialId = ResolveMaterialIdInt();
+                    bool tileContainsMaterial =
+                        tileIndex < tileCount &&
+                        resolveMaterialId >= 0 &&
+                        resolveMaterialId < 32 &&
+                        (_TileMaterialMask[tileIndex] & (1u << resolveMaterialId)) != 0u;
+
+                    if (!tileContainsMaterial)
+                    {
+                        // Degenerate the two triangles before rasterization. This avoids relying on
+                        // NaN clip positions, whose handling differs between graphics backends.
+                        o.positionCS = float4(-2.0, -2.0, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
+                        return o;
+                    }
+
+                    uint cornerIndex = input.vertexID % 6u;
+                    float2 corner = float2(
+                        (cornerIndex == 1u || cornerIndex >= 4u) ? 1.0 : 0.0,
+                        (cornerIndex == 2u || cornerIndex == 3u || cornerIndex == 5u) ? 1.0 : 0.0);
+
+                    uint tileCountX = (uint)max(1, (int)_TileCountX);
+                    uint2 tileCoord = uint2(tileIndex % tileCountX, tileIndex / tileCountX);
+                    float tileSize = max(1.0, _TileSize);
+                    float2 screenSize = max(_ScreenParams.xy, 1.0.xx);
+                    float2 pixelMin = float2(tileCoord) * tileSize;
+                    float2 pixelMax = min(pixelMin + tileSize, screenSize);
+                    float2 uv = lerp(pixelMin, pixelMax, corner) / screenSize;
+                    float2 ndc = uv * 2.0 - 1.0;
+                    ndc.y = -ndc.y;
+                    o.positionCS = float4(ndc, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
+                    return o;
+                }
+
                 float2 uv = float2((input.vertexID << 1) & 2u, input.vertexID & 2u);
                 float2 ndc = uv * 2.0 - 1.0;
                 ndc.y = -ndc.y;
@@ -365,29 +484,23 @@ Shader "Nanite/VBufferLitResolve"
             GBufferFragOutput frag(Varyings input)
             {
                 float2 screenUv = GetNormalizedScreenSpaceUV(input.positionCS);
-                float2 screenSize = _ScreenParams.xy;
-                uint2 fullPixelCoord = uint2(screenUv * screenSize);
                 uint2 pixelCoord = NaniteVBufferCoord(screenUv);
                 int resolveMaterialId = ResolveMaterialIdInt();
 
-                // Tile mask early-out：该 tile 根本不含当前材质时，跳过昂贵的 VBuffer decode / 属性重建。
-                if (_UseTileMaterialMask > 0.5)
-                {
-                    uint tileSize = (uint)max(1, (int)_TileSize);
-                    uint tileCountX = (uint)max(1, (int)_TileCountX);
-                    uint2 tileCoord = fullPixelCoord / tileSize;
-                    uint tileIndex = tileCoord.y * tileCountX + tileCoord.x;
-                    uint mask = _TileMaterialMask[tileIndex];
-                    if (resolveMaterialId < 0 || resolveMaterialId >= 32 || (mask & (1u << resolveMaterialId)) == 0u)
-                        discard;
-                }
-
+                #if defined(NANITE_COMPACT_VBUFFER)
+                uint2 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
+                NaniteDecodedVBufferIds decoded = NaniteDecodeCompactVBufferIds(
+                    encoded,
+                    InstanceCountInt(),
+                    TriangleCountInt());
+                #else
                 float4 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
                 NaniteDecodedVBufferIds decoded = NaniteDecodeVBufferIds(
                     encoded,
                     UseNormalizedIdsInt(),
                     InstanceCountInt(),
                     TriangleCountInt());
+                #endif
                 if (decoded.valid == 0)
                     discard;
 
@@ -401,21 +514,56 @@ Shader "Nanite/VBufferLitResolve"
                 if (materialId != resolveMaterialId)
                     discard;
 
-                int i0 = _Indices[triangleId * 3 + 0];
-                int i1 = _Indices[triangleId * 3 + 1];
-                int i2 = _Indices[triangleId * 3 + 2];
-                float3 p0OS = DecodePositionOS(i0);
-                float3 p1OS = DecodePositionOS(i1);
-                float3 p2OS = DecodePositionOS(i2);
-                float2 uv0 = DecodeUv(i0);
-                float2 uv1 = DecodeUv(i1);
-                float2 uv2 = DecodeUv(i2);
-                float3 n0OS = DecodeNormalOS(i0);
-                float3 n1OS = DecodeNormalOS(i1);
-                float3 n2OS = DecodeNormalOS(i2);
-                float4 t0OS = DecodeTangentOS(i0);
-                float4 t1OS = DecodeTangentOS(i1);
-                float4 t2OS = DecodeTangentOS(i2);
+                float3 p0OS;
+                float3 p1OS;
+                float3 p2OS;
+                float2 uv0;
+                float2 uv1;
+                float2 uv2;
+                float3 n0OS;
+                float3 n1OS;
+                float3 n2OS;
+                float4 t0OS;
+                float4 t1OS;
+                float4 t2OS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    NanitePackedVertex v0;
+                    NanitePackedVertex v1;
+                    NanitePackedVertex v2;
+                    if (!NanitePackedLoadTriangle((uint)triangleId, v0, v1, v2))
+                        discard;
+                    p0OS = v0.positionOS;
+                    p1OS = v1.positionOS;
+                    p2OS = v2.positionOS;
+                    uv0 = v0.uv;
+                    uv1 = v1.uv;
+                    uv2 = v2.uv;
+                    n0OS = v0.normalOS;
+                    n1OS = v1.normalOS;
+                    n2OS = v2.normalOS;
+                    t0OS = v0.tangentOS;
+                    t1OS = v1.tangentOS;
+                    t2OS = v2.tangentOS;
+                }
+                else
+                {
+                    int i0 = _Indices[triangleId * 3 + 0];
+                    int i1 = _Indices[triangleId * 3 + 1];
+                    int i2 = _Indices[triangleId * 3 + 2];
+                    p0OS = DecodePositionOS(i0);
+                    p1OS = DecodePositionOS(i1);
+                    p2OS = DecodePositionOS(i2);
+                    uv0 = DecodeUv(i0);
+                    uv1 = DecodeUv(i1);
+                    uv2 = DecodeUv(i2);
+                    n0OS = DecodeNormalOS(i0);
+                    n1OS = DecodeNormalOS(i1);
+                    n2OS = DecodeNormalOS(i2);
+                    t0OS = DecodeTangentOS(i0);
+                    t1OS = DecodeTangentOS(i1);
+                    t2OS = DecodeTangentOS(i2);
+                }
 
                 float4x4 l2w = _InstanceLocalToWorld[instanceId];
                 float3 p0WS = mul(l2w, float4(p0OS, 1.0)).xyz;
@@ -455,9 +603,13 @@ Shader "Nanite/VBufferLitResolve"
                     uvDy *= scale;
                 }
                 float3 positionWS = p0WS * bary.value.x + p1WS * bary.value.y + p2WS * bary.value.z;
-                // RT4/GBuffer depth 必须使用 VBuffer 光栅阶段已经决议后的像素深度。
-                // 这里若用 clip-space z 做线性插值，在透视下会失真，常表现为“只有近处少量碎片正常”。
+                #if defined(NANITE_COMPACT_VBUFFER)
+                // 由透视正确的 world position 重建，不能直接线性插值三个顶点的 clip z。
+                float deviceDepth = NaniteDeviceDepthFromClip(TransformWorldToHClip(positionWS));
+                #else
+                // Legacy VBuffer 保存了光栅阶段已经决议后的像素深度。
                 float deviceDepth = encoded.x;
+                #endif
 
                 float4 baseTex = float4(1.0, 1.0, 1.0, 1.0);
                 if (_HasBaseMap > 0.5)

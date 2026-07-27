@@ -47,6 +47,47 @@ struct NaniteDecodedVBufferIds
     int valid;
 };
 
+// Formal compact VBuffer: R32G32_UINT, x=instanceId+1, y=triangleId+1.
+// Zero remains the clear/invalid value and both IDs retain their full 32-bit range.
+uint2 NaniteEncodeCompactVBufferIds(int instanceId, int triangleId)
+{
+    return uint2((uint)max(0, instanceId) + 1u, (uint)max(0, triangleId) + 1u);
+}
+
+NaniteDecodedVBufferIds NaniteDecodeCompactVBufferIds(
+    uint2 encoded,
+    int instanceCount,
+    int triangleCount)
+{
+    NaniteDecodedVBufferIds decoded;
+    decoded.instanceId = -1;
+    decoded.triangleId = -1;
+    decoded.valid = 0;
+
+    if (encoded.x == 0u || encoded.y == 0u)
+        return decoded;
+
+    decoded.instanceId = (int)(encoded.x - 1u);
+    decoded.triangleId = (int)(encoded.y - 1u);
+    if (decoded.instanceId >= 0 && decoded.instanceId < instanceCount &&
+        decoded.triangleId >= 0 && decoded.triangleId < triangleCount)
+    {
+        decoded.valid = 1;
+    }
+
+    return decoded;
+}
+
+float NaniteDeviceDepthFromClip(float4 positionCS)
+{
+    float w = abs(positionCS.w) > 1e-8 ? positionCS.w : (positionCS.w >= 0.0 ? 1e-8 : -1e-8);
+    float depth = positionCS.z / w;
+#if defined(SHADER_API_GLCORE) || defined(SHADER_API_GLES3) || defined(SHADER_API_GLES)
+    depth = depth * 0.5 + 0.5;
+#endif
+    return depth;
+}
+
 float4 NaniteEncodeVBufferIds(
     float depth01,
     int instanceId,

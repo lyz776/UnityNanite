@@ -53,8 +53,12 @@ namespace Nanite
                 remap, vertices, (UIntPtr)(uint)vertices.Length, (UIntPtr)(uint)kVertexStride);
 
             var pending = new List<int>(clusters.Count);
+            var producerGroupByCluster = new List<int>(clusters.Count);
             for (int i = 0; i < clusters.Count; i++)
+            {
                 pending.Add(i);
+                producerGroupByCluster.Add(-1);
+            }
 
             var locks = new byte[vertices.Length];
             int curMip = 1;
@@ -66,7 +70,12 @@ namespace Nanite
                 if (shouldCancel != null && shouldCancel())
                     throw new OperationCanceledException("Build DAG cancelled.");
 
-                var groups = Partition(clusters, pending, remap, vertices);
+                var groups = Partition(
+                    clusters,
+                    pending,
+                    producerGroupByCluster,
+                    remap,
+                    vertices);
                 if (kUseLocks)
                     LockBoundary(locks, groups, clusters, remap);
 
@@ -152,6 +161,7 @@ namespace Nanite
                     };
                     clusterGroup.children.AddRange(groupClusterIndices);
                     result.clusterGroupList.Add(clusterGroup);
+                    int producerGroupIndex = result.clusterGroupList.Count - 1;
 
                     var split = MeshClusterizer.Clusterize(vertices, simplified.ToArray());
                     for (int j = 0; j < split.Count; j++)
@@ -161,7 +171,10 @@ namespace Nanite
                         child.mip = curMip;
                         child.parent.error = float.MaxValue;
                         clusters.Add(child);
-                        pending.Add(clusters.Count - 1);
+                        int parentClusterIndex = clusters.Count - 1;
+                        pending.Add(parentClusterIndex);
+                        clusterGroup.parents.Add(parentClusterIndex);
+                        producerGroupByCluster.Add(producerGroupIndex);
                         producedNextLevelClusters++;
                     }
                 }
@@ -322,6 +335,7 @@ namespace Nanite
         static List<List<int>> Partition(
             List<Cluster> clusters,
             List<int> pending,
+            List<int> producerGroupByCluster,
             uint[] remap,
             Vector3[] vertices)
         {
@@ -356,14 +370,93 @@ namespace Nanite
                 (UIntPtr)(uint)kVertexStride,
                 (UIntPtr)(uint)kPartitionSize);
 
-            var partitions = new List<List<int>>((int)partitionCount);
-            for (int i = 0; i < (int)partitionCount; i++)
-                partitions.Add(new List<int>());
+            return PreserveProducerGroups(
+                pending,
+                producerGroupByCluster,
+                clusterPart,
+                Mathf.Max(1, (int)partitionCount));
+        }
 
-            for (int i = 0; i < pending.Count; i++)
-                partitions[(int)clusterPart[i]].Add(pending[i]);
+        sealed class PartitionAtom
+        {
+            public readonly List<int> clusters = new List<int>(4);
+            public readonly Dictionary<int, int> partitionVotes = new Dictionary<int, int>();
+            public int desiredPartition;
+            public int sourceOrder;
+        }
 
-            return partitions;
+        static List<List<int>> PreserveProducerGroups(
+            List<int> pending,
+            List<int> producerGroupByCluster,
+            uint[] rawPartitions,
+            int rawPartitionCount)
+        {
+            var atoms = new List<PartitionAtom>(pending.Count);
+            var atomByProducer = new Dictionary<int, PartitionAtom>();
+            for (int pendingIndex = 0; pendingIndex < pending.Count; pendingIndex++)
+            {
+                int clusterIndex = pending[pendingIndex];
+                int producer = (uint)clusterIndex < (uint)producerGroupByCluster.Count
+                    ? producerGroupByCluster[clusterIndex]
+                    : -1;
+
+                PartitionAtom atom;
+                if (producer < 0 || !atomByProducer.TryGetValue(producer, out atom))
+                {
+                    atom = new PartitionAtom { sourceOrder = pendingIndex };
+                    atoms.Add(atom);
+                    if (producer >= 0)
+                        atomByProducer.Add(producer, atom);
+                }
+
+                atom.clusters.Add(clusterIndex);
+                int rawPartition = Mathf.Clamp((int)rawPartitions[pendingIndex], 0, rawPartitionCount - 1);
+                atom.partitionVotes.TryGetValue(rawPartition, out int votes);
+                atom.partitionVotes[rawPartition] = votes + 1;
+            }
+
+            for (int atomIndex = 0; atomIndex < atoms.Count; atomIndex++)
+            {
+                PartitionAtom atom = atoms[atomIndex];
+                int bestPartition = 0;
+                int bestVotes = -1;
+                foreach (KeyValuePair<int, int> vote in atom.partitionVotes)
+                {
+                    if (vote.Value > bestVotes ||
+                        (vote.Value == bestVotes && vote.Key < bestPartition))
+                    {
+                        bestPartition = vote.Key;
+                        bestVotes = vote.Value;
+                    }
+                }
+                atom.desiredPartition = bestPartition;
+            }
+
+            atoms.Sort((a, b) =>
+            {
+                int order = a.desiredPartition.CompareTo(b.desiredPartition);
+                return order != 0 ? order : a.sourceOrder.CompareTo(b.sourceOrder);
+            });
+
+            var result = new List<List<int>>(rawPartitionCount);
+            int currentDesiredPartition = -1;
+            List<int> current = null;
+            for (int atomIndex = 0; atomIndex < atoms.Count; atomIndex++)
+            {
+                PartitionAtom atom = atoms[atomIndex];
+                bool startsNewPartition = current == null ||
+                                          atom.desiredPartition != currentDesiredPartition ||
+                                          (current.Count > 0 &&
+                                           current.Count + atom.clusters.Count > kPartitionSize);
+                if (startsNewPartition)
+                {
+                    current = new List<int>(Mathf.Max(kPartitionSize, atom.clusters.Count));
+                    result.Add(current);
+                    currentDesiredPartition = atom.desiredPartition;
+                }
+                current.AddRange(atom.clusters);
+            }
+            return result;
         }
 
         static void LockBoundary(byte[] locks, List<List<int>> groups, List<Cluster> clusters, uint[] remap)

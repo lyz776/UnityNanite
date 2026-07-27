@@ -1,0 +1,181 @@
+#pragma kernel CSTranscodeVertices
+#pragma kernel CSTranscodeIndices
+
+// NPG1 is the compact disk/streaming representation. These kernels run once per
+// residency event and produce aligned draw-time records; raster/resolve never parse NPG1.
+
+struct NaniteGpuPageDecodeEntry
+{
+    uint byteAddress;
+    uint packedBytes;
+    uint vertexSectionAddress;
+    uint indexSectionAddress;
+
+    uint flags;
+    uint vertexCount;
+    uint indexCount;
+    uint vertexRecordBytes;
+
+    float3 positionMin;
+    uint generation;
+
+    float3 positionExtent;
+    uint reserved;
+};
+
+struct NanitePageTranscodeTask
+{
+    uint pageId;
+    uint vertexBase;
+    uint indexBase;
+    uint vertexCount;
+    uint indexCount;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+// 48-byte draw-time record matching the compatibility vertex order. Expanding normal and
+// tangent here is intentional: Formal Resolve may load three corners per covered pixel, so
+// oct normalization belongs to the one-time residency event rather than the pixel hot path.
+struct NaniteResidentVertex
+{
+    float3 positionOS;
+    float2 uv;
+    float3 normalOS;
+    float4 tangentOS;
+};
+
+ByteAddressBuffer _NanitePackedPagePool;
+StructuredBuffer<NaniteGpuPageDecodeEntry> _NanitePageDecodeTable;
+StructuredBuffer<NanitePageTranscodeTask> _NanitePageTranscodeTasks;
+RWStructuredBuffer<NaniteResidentVertex> _NaniteResidentVertices;
+RWStructuredBuffer<uint> _NaniteResidentIndices;
+uint _NanitePageTranscodeTaskCount;
+
+static const uint NANITE_PAGE_INVALID = 0xFFFFFFFFu;
+static const uint NANITE_NPG1_FLAG_INDEX16 = 1u << 4u;
+static const uint NANITE_NPG1_FLAG_FLOAT_UV = 1u << 5u;
+
+uint NaniteTranscodeLoadU32(uint byteAddress)
+{
+    uint alignedAddress = byteAddress & ~3u;
+    uint bitShift = (byteAddress & 3u) * 8u;
+    uint low = _NanitePackedPagePool.Load(alignedAddress);
+    if (bitShift == 0u)
+        return low;
+    uint high = _NanitePackedPagePool.Load(alignedAddress + 4u);
+    return (low >> bitShift) | (high << (32u - bitShift));
+}
+
+uint NaniteTranscodeLoadU16(uint byteAddress)
+{
+    return NaniteTranscodeLoadU32(byteAddress) & 0xFFFFu;
+}
+
+int NaniteTranscodeLoadS16(uint byteAddress)
+{
+    return (int)(NaniteTranscodeLoadU16(byteAddress) << 16u) >> 16;
+}
+
+float NaniteTranscodeSignNotZero(float value)
+{
+    return value < 0.0 ? -1.0 : 1.0;
+}
+
+float3 NaniteTranscodeDecodeOct16(int x, int y)
+{
+    float2 oct = clamp(float2(x, y) / 32767.0, -1.0, 1.0);
+    float3 value = float3(oct, 1.0 - abs(oct.x) - abs(oct.y));
+    if (value.z < 0.0)
+    {
+        float oldX = value.x;
+        value.x = (1.0 - abs(value.y)) * NaniteTranscodeSignNotZero(oldX);
+        value.y = (1.0 - abs(oldX)) * NaniteTranscodeSignNotZero(value.y);
+    }
+    float lengthSquared = dot(value, value);
+    return lengthSquared > 1e-20
+        ? value * rsqrt(lengthSquared)
+        : float3(0.0, 0.0, 1.0);
+}
+
+bool NaniteTranscodeResolveTask(
+    uint taskIndex,
+    out NanitePageTranscodeTask task,
+    out NaniteGpuPageDecodeEntry page)
+{
+    task = (NanitePageTranscodeTask)0;
+    page = (NaniteGpuPageDecodeEntry)0;
+    if (taskIndex >= _NanitePageTranscodeTaskCount)
+        return false;
+    task = _NanitePageTranscodeTasks[taskIndex];
+    page = _NanitePageDecodeTable[task.pageId];
+    return page.byteAddress != NANITE_PAGE_INVALID &&
+           page.vertexSectionAddress != NANITE_PAGE_INVALID &&
+           page.indexSectionAddress != NANITE_PAGE_INVALID &&
+           task.vertexCount == page.vertexCount &&
+           task.indexCount == page.indexCount;
+}
+
+[numthreads(64, 1, 1)]
+void CSTranscodeVertices(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID)
+{
+    NanitePageTranscodeTask task;
+    NaniteGpuPageDecodeEntry page;
+    if (!NaniteTranscodeResolveTask(groupId.y, task, page))
+        return;
+
+    uint vertexIndex = dispatchThreadId.x;
+    if (vertexIndex >= task.vertexCount)
+        return;
+    uint sourceAddress = page.vertexSectionAddress + vertexIndex * page.vertexRecordBytes;
+
+    float3 quantizedPosition = float3(
+        NaniteTranscodeLoadU16(sourceAddress + 0u),
+        NaniteTranscodeLoadU16(sourceAddress + 2u),
+        NaniteTranscodeLoadU16(sourceAddress + 4u));
+    NaniteResidentVertex output;
+    output.positionOS = page.positionMin + quantizedPosition * (page.positionExtent / 65535.0);
+    output.normalOS = NaniteTranscodeDecodeOct16(
+        NaniteTranscodeLoadS16(sourceAddress + 6u),
+        NaniteTranscodeLoadS16(sourceAddress + 8u));
+    output.tangentOS.xyz = NaniteTranscodeDecodeOct16(
+        NaniteTranscodeLoadS16(sourceAddress + 10u),
+        NaniteTranscodeLoadS16(sourceAddress + 12u));
+    if ((page.flags & NANITE_NPG1_FLAG_FLOAT_UV) != 0u)
+    {
+        output.uv = asfloat(uint2(
+            NaniteTranscodeLoadU32(sourceAddress + 14u),
+            NaniteTranscodeLoadU32(sourceAddress + 18u)));
+        output.tangentOS.w = NaniteTranscodeLoadS16(sourceAddress + 22u) < 0 ? -1.0 : 1.0;
+    }
+    else
+    {
+        output.uv = float2(
+            f16tof32(NaniteTranscodeLoadU16(sourceAddress + 14u)),
+            f16tof32(NaniteTranscodeLoadU16(sourceAddress + 16u)));
+        output.tangentOS.w = NaniteTranscodeLoadS16(sourceAddress + 18u) < 0 ? -1.0 : 1.0;
+    }
+    _NaniteResidentVertices[task.vertexBase + vertexIndex] = output;
+}
+
+[numthreads(64, 1, 1)]
+void CSTranscodeIndices(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID)
+{
+    NanitePageTranscodeTask task;
+    NaniteGpuPageDecodeEntry page;
+    if (!NaniteTranscodeResolveTask(groupId.y, task, page))
+        return;
+
+    uint index = dispatchThreadId.x;
+    if (index >= task.indexCount)
+        return;
+    uint sourceAddress = page.indexSectionAddress +
+        index * (((page.flags & NANITE_NPG1_FLAG_INDEX16) != 0u) ? 2u : 4u);
+    uint logicalVertex = (page.flags & NANITE_NPG1_FLAG_INDEX16) != 0u
+        ? NaniteTranscodeLoadU16(sourceAddress)
+        : NaniteTranscodeLoadU32(sourceAddress);
+    // Store an absolute resident-vertex index. Raster then needs only one direct triangle
+    // index address and never has to fetch a Page table entry to recover vertexBase.
+    _NaniteResidentIndices[task.indexBase + index] = task.vertexBase + logicalVertex;
+}

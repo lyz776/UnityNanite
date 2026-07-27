@@ -12,6 +12,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 1bcb789f38310f9439a4499718dd0b93, type: 3}
   m_Name: toyota_ft1_mesh
   m_EditorClassIdentifier: Nanite::Nanite.NaniteMesh
+  sourceMesh: {fileID: 4150187935214784790, guid: cf5a632ff3708aa46a0952d32d1baa33, type: 3}
+  sourceTriangleCount: 312269
   boundingSphere: {x: 0, y: 0.72600454, z: -0.003437519, w: 2.8205516}
   subMeshCount: 1
   maxMipLevel: 8
@@ -22,3 +24,647 @@ MonoBehaviour:
   - {fileID: 11400000, guid: eb9620b0ff90a3f428cf9bc76b958957, type: 2}
   - {fileID: 11400000, guid: a721fa5708e22de4c8374827ca4076ff, type: 2}
   - {fileID: 11400000, guid: 375960d662ce771489728aa3a27e7478, type: 2}
+  - {fileID: 11400000, guid: 4826d8db254278c409b39d7656eafaf9, type: 2}
+  - {fileID: 11400000, guid: e2860636f1149034ab80fff8c462bf7b, type: 2}
+  - {fileID: 11400000, guid: 7d37ef9c28f7f1f4f95f60d009ea55ed, type: 2}
+  - {fileID: 11400000, guid: 2e3aac03f10ee4a4fbe18fa6e27cf2e4, type: 2}
+  - {fileID: 11400000, guid: 5c23de3466c5c1e4ba82f6a7a067be7f, type: 2}
+  - {fileID: 11400000, guid: 1ad958ac90760404b87dbfcde723f264, type: 2}
+  - {fileID: 11400000, guid: 36993f9d954ee9f4a8479daafb6a0dfb, type: 2}
+  - {fileID: 11400000, guid: 18669be6069388641ad936dac12779cc, type: 2}
+  - {fileID: 11400000, guid: 0c9a6d9e1e4da8e49bb25ffda6134168, type: 2}
+  - {fileID: 11400000, guid: e1018682b6f63c745b0a0c58fc93453b, type: 2}
+  - {fileID: 11400000, guid: c0f5f134fc1696e459382c2e640cfa85, type: 2}
+  - {fileID: 11400000, guid: e6083fe913aa02a45b9ca2c6a8fa7850, type: 2}
+  - {fileID: 11400000, guid: c00ca1b36646d344389578d9e15fde84, type: 2}
+  - {fileID: 11400000, guid: a383baee175ad7b42acd508da8e0f869, type: 2}
+  - {fileID: 11400000, guid: c17f2befd0531404ea429637d3cd4585, type: 2}
+  - {fileID: 11400000, guid: c1250781d8a62a743ade06b91d239134, type: 2}
+  - {fileID: 11400000, guid: c09d823ac5c96d14f9a1d9db8dd5cadc, type: 2}
+  - {fileID: 11400000, guid: a9af860c1e767ea418021c8198c84a4a, type: 2}
+  - {fileID: 11400000, guid: 1757ce3189fe07045a12a5914e437599, type: 2}
+  - {fileID: 11400000, guid: 8c40e87064498384796065da8dd3f85c, type: 2}
+  - {fileID: 11400000, guid: ee66f1cae19864c47ab449992f3118a5, type: 2}
+  - {fileID: 11400000, guid: e509ae5f49f50644eba30dec8cb22c37, type: 2}
+  - {fileID: 11400000, guid: 1d35a2a7e16bab44b89587177e9cec51, type: 2}
+  - {fileID: 11400000, guid: c6428a0fdd095b14aa10f63cf0bf99ce, type: 2}
+  - {fileID: 11400000, guid: 4ed9dcf154b05ab4abf10a5866419084, type: 2}
+  - {fileID: 11400000, guid: 6e5bbbabb544a9c479e313b3790b4a60, type: 2}
+  - {fileID: 11400000, guid: 7fc5ce07dd71ace4a961b2df9353de3f, type: 2}
+  - {fileID: 11400000, guid: cde9c7a1b5a75484bb50e3d7d417a0b5, type: 2}
+  - {fileID: 11400000, guid: 8b3cd7e794be7724484b291863fc536c, type: 2}
+  - {fileID: 11400000, guid: fd6a0f25ec3a9464ea1eaf9a2b273503, type: 2}
+  - {fileID: 11400000, guid: 9ed0de4d995f2ff4abe7288457a2493e, type: 2}
+  - {fileID: 11400000, guid: 083bed9dba2a62e4a88930f7f4c27a02, type: 2}
+  - {fileID: 11400000, guid: cd71c5bbb86c45e4795cba427caab84f, type: 2}
+  - {fileID: 11400000, guid: 529e8721451c90340adee49b615d9ea5, type: 2}
+  - {fileID: 11400000, guid: 30edc1000ddda4441b54bc22f4e47d01, type: 2}
+  - {fileID: 11400000, guid: fbba468a795f9f94bb5addda4083af74, type: 2}
+  - {fileID: 11400000, guid: f36b77402d36b6a49bdb3b230e46ef3f, type: 2}
+  - {fileID: 11400000, guid: 3993286f9171cbe47ad676c6982214b3, type: 2}
+  - {fileID: 11400000, guid: 0d899fb21eb539c42acc98903fffbbab, type: 2}
+  - {fileID: 11400000, guid: 87757fd96f9756d44aaa228a9b921225, type: 2}
+  - {fileID: 11400000, guid: ad4a22237621efc46b320c9700752981, type: 2}
+  - {fileID: 11400000, guid: cd4fda8b56b1fb946ae4aa0834e0e56f, type: 2}
+  - {fileID: 11400000, guid: 965a035dd69f97d44b2afb3d92b3a609, type: 2}
+  - {fileID: 11400000, guid: 9f6f845395e036948b3efc1265f85778, type: 2}
+  - {fileID: 11400000, guid: b1e6a15aa0556b54a96a16cf69720732, type: 2}
+  - {fileID: 11400000, guid: 9913222fdf02dd64eaa1f30cd6b9bdf6, type: 2}
+  - {fileID: 11400000, guid: 23468fa34b21b414092f1e1dc9c001f3, type: 2}
+  - {fileID: 11400000, guid: 6be5d17357f78ec48aee0a619a12f25e, type: 2}
+  - {fileID: 11400000, guid: 515d0657f8877aa41a4f2ebe054da24f, type: 2}
+  - {fileID: 11400000, guid: 16beaab76af7e0549adb3d8b52a10e6c, type: 2}
+  - {fileID: 11400000, guid: 69da66b7327536d4ea6c3a938d572541, type: 2}
+  - {fileID: 11400000, guid: 69c16b7b29f7d4e4282a97faf8f4d7f4, type: 2}
+  - {fileID: 11400000, guid: f51d7a5e580d831438cb74bfc974af91, type: 2}
+  pageStreamingInfo:
+  - pageIndex: 0
+    packedBytes: 237348
+    storageBytes: 157357
+    vertexBytes: 152500
+    indexBytes: 74850
+    hierarchyBytes: 9860
+    minMip: 6
+    maxMip: 8
+    flags: 1
+    boundingSphere: {x: -0.08856578, y: 0.36800075, z: -0.017749663, w: 3.9397573}
+  - pageIndex: 1
+    packedBytes: 247420
+    storageBytes: 188219
+    vertexBytes: 192340
+    indexBytes: 48798
+    hierarchyBytes: 6144
+    minMip: 5
+    maxMip: 6
+    flags: 0
+    boundingSphere: {x: -0.09636931, y: 0.37075686, z: -0.01757919, w: 3.9381053}
+  - pageIndex: 2
+    packedBytes: 253272
+    storageBytes: 189880
+    vertexBytes: 195740
+    indexBytes: 51000
+    hierarchyBytes: 6396
+    minMip: 4
+    maxMip: 5
+    flags: 0
+    boundingSphere: {x: -0.12944525, y: 0.38252446, z: -0.03449595, w: 3.894732}
+  - pageIndex: 3
+    packedBytes: 235376
+    storageBytes: 189035
+    vertexBytes: 174220
+    indexBytes: 54558
+    hierarchyBytes: 6460
+    minMip: 4
+    maxMip: 4
+    flags: 0
+    boundingSphere: {x: -0.13916275, y: 0.40615785, z: 0.06960181, w: 3.810357}
+  - pageIndex: 4
+    packedBytes: 255696
+    storageBytes: 192458
+    vertexBytes: 198640
+    indexBytes: 50592
+    hierarchyBytes: 6328
+    minMip: 3
+    maxMip: 4
+    flags: 0
+    boundingSphere: {x: -0.048412472, y: 0.33596134, z: -0.27694985, w: 3.6182272}
+  - pageIndex: 5
+    packedBytes: 255432
+    storageBytes: 205414
+    vertexBytes: 183940
+    indexBytes: 63660
+    hierarchyBytes: 7696
+    minMip: 3
+    maxMip: 3
+    flags: 0
+    boundingSphere: {x: 0.097478226, y: 0.29220474, z: -0.43336806, w: 3.2489457}
+  - pageIndex: 6
+    packedBytes: 238796
+    storageBytes: 186872
+    vertexBytes: 174360
+    indexBytes: 57222
+    hierarchyBytes: 7076
+    minMip: 3
+    maxMip: 3
+    flags: 0
+    boundingSphere: {x: -0.26290908, y: 0.45499834, z: 0.35843262, w: 3.468338}
+  - pageIndex: 7
+    packedBytes: 253660
+    storageBytes: 204146
+    vertexBytes: 187720
+    indexBytes: 58728
+    hierarchyBytes: 7076
+    minMip: 3
+    maxMip: 3
+    flags: 0
+    boundingSphere: {x: -0.24515425, y: 0.449345, z: 0.0058467984, w: 3.8437352}
+  - pageIndex: 8
+    packedBytes: 238848
+    storageBytes: 172234
+    vertexBytes: 194860
+    indexBytes: 38694
+    hierarchyBytes: 5156
+    minMip: 3
+    maxMip: 3
+    flags: 0
+    boundingSphere: {x: -0.24214706, y: 0.4299085, z: -0.22150347, w: 3.7169006}
+  - pageIndex: 9
+    packedBytes: 259496
+    storageBytes: 210048
+    vertexBytes: 180120
+    indexBytes: 70866
+    hierarchyBytes: 8372
+    minMip: 2
+    maxMip: 3
+    flags: 0
+    boundingSphere: {x: -0.14977144, y: 0.38657644, z: 0.055749655, w: 3.785061}
+  - pageIndex: 10
+    packedBytes: 255096
+    storageBytes: 204168
+    vertexBytes: 182880
+    indexBytes: 64386
+    hierarchyBytes: 7692
+    minMip: 2
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: -0.10762139, y: 0.37662712, z: -0.098488085, w: 2.9869006}
+  - pageIndex: 11
+    packedBytes: 257144
+    storageBytes: 203705
+    vertexBytes: 189900
+    indexBytes: 60036
+    hierarchyBytes: 7072
+    minMip: 2
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: 0.19154152, y: 0.5607409, z: 0.02193353, w: 2.7480788}
+  - pageIndex: 12
+    packedBytes: 251112
+    storageBytes: 202386
+    vertexBytes: 178940
+    indexBytes: 64344
+    hierarchyBytes: 7692
+    minMip: 2
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: -0.29025084, y: 0.46072385, z: 0.32735395, w: 3.4933748}
+  - pageIndex: 13
+    packedBytes: 240052
+    storageBytes: 192083
+    vertexBytes: 166560
+    indexBytes: 65664
+    hierarchyBytes: 7692
+    minMip: 2
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: -0.28212863, y: 0.49754366, z: 0.1256255, w: 3.6011214}
+  - pageIndex: 14
+    packedBytes: 260956
+    storageBytes: 204908
+    vertexBytes: 187840
+    indexBytes: 65286
+    hierarchyBytes: 7692
+    minMip: 2
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: -0.25785294, y: 0.46540114, z: -0.03244769, w: 3.0601747}
+  - pageIndex: 15
+    packedBytes: 237920
+    storageBytes: 179709
+    vertexBytes: 182600
+    indexBytes: 49350
+    hierarchyBytes: 5832
+    minMip: 2
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: -0.23733282, y: 0.43850762, z: -0.38904327, w: 3.5263574}
+  - pageIndex: 16
+    packedBytes: 248428
+    storageBytes: 192225
+    vertexBytes: 190420
+    indexBytes: 51486
+    hierarchyBytes: 6384
+    minMip: 1
+    maxMip: 2
+    flags: 0
+    boundingSphere: {x: -0.2646304, y: 0.45087355, z: -0.13223587, w: 3.777579}
+  - pageIndex: 17
+    packedBytes: 260020
+    storageBytes: 203522
+    vertexBytes: 176640
+    indexBytes: 74874
+    hierarchyBytes: 8368
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.15608025, y: 0.39401802, z: 0.092703424, w: 2.8313234}
+  - pageIndex: 18
+    packedBytes: 248276
+    storageBytes: 197839
+    vertexBytes: 175500
+    indexBytes: 64950
+    hierarchyBytes: 7688
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.23899859, y: 0.5967769, z: -0.4964758, w: 2.4117196}
+  - pageIndex: 19
+    packedBytes: 258880
+    storageBytes: 208029
+    vertexBytes: 180500
+    indexBytes: 69876
+    hierarchyBytes: 8368
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.062310398, y: 0.6372948, z: -0.615136, w: 2.0415502}
+  - pageIndex: 20
+    packedBytes: 248840
+    storageBytes: 194901
+    vertexBytes: 174720
+    indexBytes: 66294
+    hierarchyBytes: 7688
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.2835441, y: 0.36648202, z: -0.07238668, w: 2.708722}
+  - pageIndex: 21
+    packedBytes: 240312
+    storageBytes: 190227
+    vertexBytes: 171980
+    indexBytes: 61128
+    hierarchyBytes: 7068
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.13941956, y: 0.63702494, z: -0.054987222, w: 1.9910877}
+  - pageIndex: 22
+    packedBytes: 239136
+    storageBytes: 190816
+    vertexBytes: 167400
+    indexBytes: 63912
+    hierarchyBytes: 7688
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.6088343, y: 0.5140768, z: 0.21843007, w: 2.9468434}
+  - pageIndex: 23
+    packedBytes: 258120
+    storageBytes: 203706
+    vertexBytes: 185080
+    indexBytes: 65214
+    hierarchyBytes: 7688
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.56291264, y: 0.5412936, z: 0.30556935, w: 3.1075838}
+  - pageIndex: 24
+    packedBytes: 240928
+    storageBytes: 197946
+    vertexBytes: 161840
+    indexBytes: 70584
+    hierarchyBytes: 8368
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.6519254, y: 0.3338906, z: 0.3791141, w: 2.5508993}
+  - pageIndex: 25
+    packedBytes: 243460
+    storageBytes: 197890
+    vertexBytes: 172360
+    indexBytes: 63276
+    hierarchyBytes: 7688
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.54263943, y: 0.35483676, z: 0.15568271, w: 2.1226633}
+  - pageIndex: 26
+    packedBytes: 257460
+    storageBytes: 213422
+    vertexBytes: 178100
+    indexBytes: 70854
+    hierarchyBytes: 8368
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.26494154, y: 0.19783041, z: 0.36531234, w: 2.4677997}
+  - pageIndex: 27
+    packedBytes: 258984
+    storageBytes: 192052
+    vertexBytes: 177260
+    indexBytes: 73218
+    hierarchyBytes: 8368
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.18390019, y: 0.681133, z: -1.0275426, w: 1.9956589}
+  - pageIndex: 28
+    packedBytes: 260792
+    storageBytes: 194643
+    vertexBytes: 202440
+    indexBytes: 51768
+    hierarchyBytes: 6448
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.31602073, y: 0.28268692, z: -0.6089421, w: 3.244873}
+  - pageIndex: 29
+    packedBytes: 257156
+    storageBytes: 195553
+    vertexBytes: 192020
+    indexBytes: 57930
+    hierarchyBytes: 7068
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.057896506, y: 0.47411117, z: -0.14174822, w: 2.775725}
+  - pageIndex: 30
+    packedBytes: 259600
+    storageBytes: 211839
+    vertexBytes: 179840
+    indexBytes: 71256
+    hierarchyBytes: 8368
+    minMip: 1
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: -0.37420353, y: 0.3887605, z: 1.0694894, w: 2.4649925}
+  - pageIndex: 31
+    packedBytes: 250348
+    storageBytes: 211318
+    vertexBytes: 165100
+    indexBytes: 76872
+    hierarchyBytes: 8240
+    minMip: 0
+    maxMip: 1
+    flags: 0
+    boundingSphere: {x: 0.093324676, y: 0.4508792, z: -0.07343587, w: 2.600585}
+  - pageIndex: 32
+    packedBytes: 240648
+    storageBytes: 195155
+    vertexBytes: 160480
+    indexBytes: 72348
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.2594298, y: 0.46555117, z: -1.1905762, w: 2.1197376}
+  - pageIndex: 33
+    packedBytes: 250684
+    storageBytes: 200508
+    vertexBytes: 171720
+    indexBytes: 71142
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.20922534, y: 0.1173819, z: -0.051362634, w: 2.7018466}
+  - pageIndex: 34
+    packedBytes: 260784
+    storageBytes: 219751
+    vertexBytes: 173000
+    indexBytes: 79284
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.13364446, y: 0.7786805, z: -0.055855364, w: 1.4390923}
+  - pageIndex: 35
+    packedBytes: 259048
+    storageBytes: 212800
+    vertexBytes: 178380
+    indexBytes: 72846
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.12922806, y: 0.7017908, z: -0.6310699, w: 1.693316}
+  - pageIndex: 36
+    packedBytes: 260108
+    storageBytes: 206574
+    vertexBytes: 172220
+    indexBytes: 79386
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.04850288, y: 0.9207779, z: -0.59187925, w: 1.6743546}
+  - pageIndex: 37
+    packedBytes: 243620
+    storageBytes: 194469
+    vertexBytes: 169560
+    indexBytes: 66858
+    hierarchyBytes: 7064
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.30669042, y: 0.51663315, z: -0.22712968, w: 1.7203239}
+  - pageIndex: 38
+    packedBytes: 250952
+    storageBytes: 199746
+    vertexBytes: 170460
+    indexBytes: 72672
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.19095272, y: 0.6581775, z: -0.35147864, w: 1.673276}
+  - pageIndex: 39
+    packedBytes: 252264
+    storageBytes: 205870
+    vertexBytes: 172120
+    indexBytes: 72324
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.49920574, y: 0.4244854, z: 0.14388387, w: 1.461923}
+  - pageIndex: 40
+    packedBytes: 259496
+    storageBytes: 210199
+    vertexBytes: 173540
+    indexBytes: 77454
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.23979253, y: 0.34134346, z: 1.2384549, w: 1.9081362}
+  - pageIndex: 41
+    packedBytes: 260344
+    storageBytes: 215573
+    vertexBytes: 173160
+    indexBytes: 78684
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.37374806, y: 0.38806775, z: 0.69644505, w: 2.4495668}
+  - pageIndex: 42
+    packedBytes: 249884
+    storageBytes: 206588
+    vertexBytes: 162680
+    indexBytes: 78702
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.6720656, y: 0.6173366, z: 0.2491228, w: 2.8864088}
+  - pageIndex: 43
+    packedBytes: 244384
+    storageBytes: 200494
+    vertexBytes: 164460
+    indexBytes: 72102
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.4727885, y: 0.53783363, z: 0.7679648, w: 2.2956705}
+  - pageIndex: 44
+    packedBytes: 258964
+    storageBytes: 210624
+    vertexBytes: 184700
+    indexBytes: 67062
+    hierarchyBytes: 7064
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.752967, y: 0.65240484, z: 0.25269604, w: 1.5668578}
+  - pageIndex: 45
+    packedBytes: 254776
+    storageBytes: 202289
+    vertexBytes: 187840
+    indexBytes: 60354
+    hierarchyBytes: 6444
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.21968953, y: 0.5581219, z: 0.22682522, w: 1.767463}
+  - pageIndex: 46
+    packedBytes: 260408
+    storageBytes: 206035
+    vertexBytes: 173680
+    indexBytes: 78228
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.15057997, y: 0.76424503, z: 0.8493828, w: 0.979436}
+  - pageIndex: 47
+    packedBytes: 245376
+    storageBytes: 201708
+    vertexBytes: 170620
+    indexBytes: 67554
+    hierarchyBytes: 7064
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.3545878, y: 0.73073065, z: 0.09136701, w: 0.18867567}
+  - pageIndex: 48
+    packedBytes: 248660
+    storageBytes: 198441
+    vertexBytes: 177840
+    indexBytes: 63618
+    hierarchyBytes: 7064
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.42031723, y: 0.20252055, z: 0.29829326, w: 2.3864667}
+  - pageIndex: 49
+    packedBytes: 259344
+    storageBytes: 201631
+    vertexBytes: 180320
+    indexBytes: 71202
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.26622874, y: 0.32371145, z: 0.12578478, w: 2.494392}
+  - pageIndex: 50
+    packedBytes: 242572
+    storageBytes: 166830
+    vertexBytes: 161400
+    indexBytes: 73350
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.11352025, y: 0.6241108, z: -1.788704, w: 1.0305076}
+  - pageIndex: 51
+    packedBytes: 260348
+    storageBytes: 190690
+    vertexBytes: 172940
+    indexBytes: 78906
+    hierarchyBytes: 8364
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.04377085, y: 0.5060776, z: -1.8319281, w: 1.0932624}
+  - pageIndex: 52
+    packedBytes: 252192
+    storageBytes: 189028
+    vertexBytes: 195700
+    indexBytes: 50532
+    hierarchyBytes: 5824
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.11049533, y: 0.58486354, z: -2.0269618, w: 1.6020088}
+  - pageIndex: 53
+    packedBytes: 230088
+    storageBytes: 165018
+    vertexBytes: 180160
+    indexBytes: 44646
+    hierarchyBytes: 5144
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.41436544, y: 0.5240054, z: -1.657962, w: 0.7049341}
+  - pageIndex: 54
+    packedBytes: 248656
+    storageBytes: 177046
+    vertexBytes: 199940
+    indexBytes: 43434
+    hierarchyBytes: 5144
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.1339393, y: 0.6187241, z: -1.4478508, w: 1.2762454}
+  - pageIndex: 55
+    packedBytes: 232732
+    storageBytes: 184960
+    vertexBytes: 160300
+    indexBytes: 65232
+    hierarchyBytes: 7064
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.89117527, y: 0.3183674, z: -1.2831496, w: 0.61004835}
+  - pageIndex: 56
+    packedBytes: 249172
+    storageBytes: 192150
+    vertexBytes: 184920
+    indexBytes: 57672
+    hierarchyBytes: 6444
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.045933872, y: 0.51838887, z: -0.10929668, w: 2.7712069}
+  - pageIndex: 57
+    packedBytes: 256728
+    storageBytes: 209109
+    vertexBytes: 175700
+    indexBytes: 73206
+    hierarchyBytes: 7684
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: -0.014022098, y: 0.28960782, z: 2.2187612, w: 1.0059973}
+  - pageIndex: 58
+    packedBytes: 50012
+    storageBytes: 41620
+    vertexBytes: 36540
+    indexBytes: 12030
+    hierarchyBytes: 1304
+    minMip: 0
+    maxMip: 0
+    flags: 0
+    boundingSphere: {x: 0.56660783, y: 0.4094269, z: 2.0826054, w: 0.41994217}

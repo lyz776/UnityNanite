@@ -13,6 +13,7 @@ Shader "Nanite/VBufferPacketRaster"
 
             HLSLPROGRAM
             #pragma target 4.5
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
             #pragma vertex vert
             #pragma fragment frag
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
@@ -26,6 +27,7 @@ Shader "Nanite/VBufferPacketRaster"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            #include "NanitePackedPage.hlsl"
             int _VertexStride;
             int _InstanceId;
             float4x4 _LocalToWorld;
@@ -60,6 +62,14 @@ Shader "Nanite/VBufferPacketRaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (!NaniteCompactedTriangleValid(input.vertexID))
+                {
+                    float nan = asfloat(0x7FC00000u);
+                    o.positionCS = float4(nan, nan, nan, nan);
+                    o.packedInstance = 0.0;
+                    o.origTriId = 0u;
+                    return o;
+                }
                 int triId = NaniteResolveTriangleId(input.vertexID);
                 o.origTriId = (uint)max(0, triId);
                 o.packedInstance = 0.0;
@@ -79,12 +89,23 @@ Shader "Nanite/VBufferPacketRaster"
                 float4x4 localToWorld = _LocalToWorld;
                 if (_UseSceneInstanceBuffer != 0)
                 {
-                    instance = _TriangleInstance[triId];
+                    instance = _UseCompactedTriIds > 0.5
+                        ? NaniteResolveInstanceId(input.vertexID, 0)
+                        : _TriangleInstance[triId];
                     localToWorld = _InstanceLocalToWorld[instance];
                 }
 
-                int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
-                float3 posOS = DecodePositionOS(logicalIndex);
+                float3 posOS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                        posOS = asfloat(0x7FC00000u).xxx;
+                }
+                else
+                {
+                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    posOS = DecodePositionOS(logicalIndex);
+                }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                 o.positionCS = TransformWorldToHClip(posWS);
                 o.packedInstance = (float)instance;
@@ -126,8 +147,10 @@ Shader "Nanite/VBufferPacketRaster"
 
             HLSLPROGRAM
             #pragma target 4.5
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
             #pragma vertex vert
             #pragma fragment frag
+            #pragma multi_compile_local _ NANITE_COMPACT_VBUFFER
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "NaniteVBufferCommon.hlsl"
             #include "NaniteCompactDraw.hlsl"
@@ -139,6 +162,7 @@ Shader "Nanite/VBufferPacketRaster"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            #include "NanitePackedPage.hlsl"
 
             CBUFFER_START(NaniteRasterUniforms)
             float _VertexStride;
@@ -183,6 +207,14 @@ Shader "Nanite/VBufferPacketRaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (!NaniteCompactedTriangleValid(input.vertexID))
+                {
+                    float nan = asfloat(0x7FC00000u);
+                    o.positionCS = float4(nan, nan, nan, nan);
+                    o.packedInstance = 0.0;
+                    o.triId = 0u;
+                    return o;
+                }
                 int triId = NaniteResolveTriangleId(input.vertexID);
                 o.triId = (uint)max(0, triId);
                 o.packedInstance = 0.0;
@@ -202,19 +234,34 @@ Shader "Nanite/VBufferPacketRaster"
                 float4x4 localToWorld = UNITY_MATRIX_M;
                 if (UseSceneInstanceBufferInt() != 0)
                 {
-                    instance = _TriangleInstance[triId];
+                    instance = _UseCompactedTriIds > 0.5
+                        ? NaniteResolveInstanceId(input.vertexID, 0)
+                        : _TriangleInstance[triId];
                     localToWorld = _InstanceLocalToWorld[instance];
                 }
 
-                int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
-                float3 posOS = DecodePositionOS(logicalIndex);
+                float3 posOS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                        posOS = asfloat(0x7FC00000u).xxx;
+                }
+                else
+                {
+                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    posOS = DecodePositionOS(logicalIndex);
+                }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                 o.positionCS = TransformWorldToHClip(posWS);
                 o.packedInstance = (float)instance;
                 return o;
             }
 
+            #if defined(NANITE_COMPACT_VBUFFER)
+            uint2 frag(Varyings i) : SV_Target
+            #else
             float4 frag(Varyings i) : SV_Target
+            #endif
             {
                 int triId = (int)i.triId;
                 int subMeshId = 0;
@@ -222,6 +269,9 @@ Shader "Nanite/VBufferPacketRaster"
                     subMeshId = max(0, _TriangleSubMesh[triId]);
                 int instanceId = max(0, (int)round(i.packedInstance));
 
+                #if defined(NANITE_COMPACT_VBUFFER)
+                return NaniteEncodeCompactVBufferIds(instanceId, triId);
+                #else
                 float depth01 = NanitePackDepth01(i.positionCS);
                 return NaniteEncodeVBufferIds(
                     depth01,
@@ -232,6 +282,7 @@ Shader "Nanite/VBufferPacketRaster"
                     InstanceCountInt(),
                     TriangleCountInt(),
                     MaxSubMeshCountInt());
+                #endif
             }
             ENDHLSL
         }
@@ -247,6 +298,7 @@ Shader "Nanite/VBufferPacketRaster"
 
             HLSLPROGRAM
             #pragma target 4.5
+            #pragma multi_compile_local _ NANITE_PACKED_DIRECT_DIAGNOSTIC
             #pragma vertex vert
             #pragma fragment frag
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
@@ -261,6 +313,7 @@ Shader "Nanite/VBufferPacketRaster"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            #include "NanitePackedPage.hlsl"
 
             CBUFFER_START(NaniteRasterUniforms)
             float _VertexStride;
@@ -305,6 +358,14 @@ Shader "Nanite/VBufferPacketRaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
+                if (!NaniteCompactedTriangleValid(input.vertexID))
+                {
+                    float nan = asfloat(0x7FC00000u);
+                    o.positionCS = float4(nan, nan, nan, nan);
+                    o.triId = 0u;
+                    o.instanceId = 0u;
+                    return o;
+                }
                 int triId = NaniteResolveTriangleId(input.vertexID);
                 o.triId = (uint)max(0, triId);
                 o.instanceId = 0u;
@@ -324,12 +385,23 @@ Shader "Nanite/VBufferPacketRaster"
                 float4x4 localToWorld = _LocalToWorld;
                 if (UseSceneInstanceBufferInt() != 0)
                 {
-                    instance = _TriangleInstance[triId];
+                    instance = _UseCompactedTriIds > 0.5
+                        ? NaniteResolveInstanceId(input.vertexID, 0)
+                        : _TriangleInstance[triId];
                     localToWorld = _InstanceLocalToWorld[instance];
                 }
 
-                int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
-                float3 posOS = DecodePositionOS(logicalIndex);
+                float3 posOS;
+                if (NaniteUsePackedPageGeometry())
+                {
+                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                        posOS = asfloat(0x7FC00000u).xxx;
+                }
+                else
+                {
+                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    posOS = DecodePositionOS(logicalIndex);
+                }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                 o.positionCS = TransformWorldToHClip(posWS);
                 o.instanceId = (uint)max(0, instance);

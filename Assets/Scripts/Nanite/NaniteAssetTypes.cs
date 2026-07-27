@@ -44,4 +44,59 @@ namespace Nanite
         public int childCount;
         public int partIndex; // 叶子节点有效，其它为 -1
     }
+
+    /// <summary>常驻的轻量 Page 地址/驻留元数据；几何 payload 保存在独立二进制资源中。</summary>
+    [Serializable]
+    public struct NanitePageStreamingInfo
+    {
+        public int pageIndex;
+        public int packedBytes;
+        public int storageBytes;
+        public int vertexBytes;
+        public int indexBytes;
+        public int hierarchyBytes;
+        public int minMip;
+        public int maxMip;
+        public int flags;
+        public Vector4 boundingSphere;
+
+        public bool IsRootPage => (flags & 1) != 0;
+    }
+
+    /// <summary>
+    /// Stable reference from the mesh-level hierarchy into Page-local geometry. The flattened
+    /// geometry index follows Page/cluster order and is also the order used by GPU Scene.
+    /// </summary>
+    [Serializable]
+    public struct NaniteHierarchyClusterRef
+    {
+        public int geometryClusterIndex;
+        public int pageIndex;
+        public int pageClusterIndex;
+        public int refinementGroupIndex;
+    }
+
+    /// <summary>
+    /// One DAG refinement edge. Coarse clusters can be replaced atomically by fine clusters
+    /// only when the complete fine Page working set is resident. Root-set records have no
+    /// coarse range and seed top-down traversal from permanently resident Pages.
+    /// </summary>
+    [Serializable]
+    public struct NaniteHierarchyGroup
+    {
+        public const int CurrentVersion = 1;
+        public const int RootSetFlag = 1;
+
+        public Vector4 boundingSphere;
+        public float minLodError;
+        public float maxParentLodError;
+        public int fineClusterStart;
+        public int fineClusterCount;
+        public int coarseClusterStart;
+        public int coarseClusterCount;
+        public int mipLevel;
+        public int flags;
+
+        public bool IsRootSet => (flags & RootSetFlag) != 0;
+    }
 }
