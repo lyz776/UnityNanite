@@ -256,10 +256,14 @@ namespace Nanite
             for (int i = 0; i < page.clusterArray.Length; i++)
             {
                 ref readonly var cluster = ref page.clusterArray[i];
+                Vector4 worldGeometry = TransformSphere(
+                    cluster.geometrySphere.w > 0f ? cluster.geometrySphere : cluster.selfSphere,
+                    localToWorld,
+                    maxScale);
                 Vector4 worldSelf = TransformSphere(cluster.selfSphere, localToWorld, maxScale);
                 Vector4 worldParent = TransformSphere(cluster.parentSphere, localToWorld, maxScale);
                 stats.testedClusters++;
-                if (!SphereVisible(worldSelf, planes))
+                if (!SphereVisible(worldGeometry, planes))
                     continue;
                 if (!ShouldRenderCluster(cluster, worldSelf, worldParent, cameraPosition, projectionScale, zNear, lodErrorPixels))
                     continue;
@@ -345,19 +349,23 @@ namespace Nanite
             for (int ci = part.clusterStart; ci < clusterEnd; ci++)
             {
                 ref readonly var cluster = ref page.clusterArray[ci];
+                Vector4 worldGeometry = TransformSphere(
+                    cluster.geometrySphere.w > 0f ? cluster.geometrySphere : cluster.selfSphere,
+                    localToWorld,
+                    maxScale);
                 Vector4 worldSelf = TransformSphere(cluster.selfSphere, localToWorld, maxScale);
                 Vector4 worldParent = TransformSphere(cluster.parentSphere, localToWorld, maxScale);
                 stats.testedClusters++;
-                if (!SphereVisible(worldSelf, planes))
+                if (!SphereVisible(worldGeometry, planes))
                     continue;
                 if (!ShouldRenderCluster(cluster, worldSelf, worldParent, cameraPosition, projectionScale, zNear, lodErrorPixels))
                     continue;
 
                 // 与 GPU 一致：屏幕直径 < 1px 的整簇丢弃。
                 float dist = Mathf.Max(
-                    Vector3.Distance(new Vector3(worldSelf.x, worldSelf.y, worldSelf.z), cameraPosition) - worldSelf.w,
+                    Vector3.Distance(new Vector3(worldGeometry.x, worldGeometry.y, worldGeometry.z), cameraPosition) - worldGeometry.w,
                     zNear);
-                float diameterPixels = (2f * worldSelf.w * projectionScale) / dist;
+                float diameterPixels = (2f * worldGeometry.w * projectionScale) / dist;
                 if (diameterPixels < 1f)
                     continue;
 

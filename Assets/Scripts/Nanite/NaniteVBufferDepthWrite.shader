@@ -61,7 +61,11 @@ Shader "Nanite/VBufferDepthWrite"
                     int instanceId = (int)(input.vertexID / (uint)_GeometryVertexCount);
                     int logicalVertex = (int)(input.vertexID % (uint)_GeometryVertexCount);
                     float4x4 indexedLocalToWorld = _InstanceLocalToWorld[instanceId];
-                    float3 indexedPositionOS = DecodePositionOS(logicalVertex);
+                    float3 indexedPositionOS;
+                    if (NaniteUsePackedPageGeometry())
+                        indexedPositionOS = _NaniteResidentVertices[logicalVertex].positionOS;
+                    else
+                        indexedPositionOS = DecodePositionOS(logicalVertex);
                     float3 indexedPositionWS = mul(indexedLocalToWorld, float4(indexedPositionOS, 1.0)).xyz;
                     o.positionCS = TransformWorldToHClip(indexedPositionWS);
                     return o;

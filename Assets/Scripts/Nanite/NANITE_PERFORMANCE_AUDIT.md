@@ -157,3 +157,1169 @@ A/B 结论：
 已切换下一轮验证配置：`Assets/Settings/PC_Renderer.asset` 将 `useHzbCulling` 设为 `0`。现有准入逻辑会因此跳过 `Nanite/WriteDepth`、`Nanite/BuildHzb` 与 `Nanite/SecondCull`，Formal raster 仍写入 VBuffer/Depth，作为“Formal-only camera path”A/B。下一次 Nanite Player capture 需确认日志不再出现 `hzbActive=True` 或 `Nanite/WriteDepth`，并比较 GPU 是否从约 2.38 ms 接近普通 Mesh 的 1.32 ms。
 
 Game View 快速回归（非最终 Profiler 数据）：关 HZB 后同 4K / 12 车视角约 364.1 FPS（2.7 ms），CPU main 2.7 ms、render thread 1.7 ms、40 batches / 40 SetPass，Stats 面板 GPU 延迟落入 1.x ms 区间。相对 HZB 开启时约 309 FPS 小幅提升，说明无 HZB 的 Formal-only camera path 方向成立；仍需 Player GPU Profiler capture 确认 `Nanite/WriteDepth`、`Nanite/BuildHzb`、`Nanite/SecondCull` 已消失，并记录 Formal raster/resolve 的真实 GPU ms。
+
+## 大实例场景 indexed overflow 诊断与否决实验（2026-07-28）
+
+154 辆车、4K 的压力测试暴露出固定 128 MiB 临时索引预算的性能断崖。该场景日志中的 camera 容量仅为 87,381 clusters、每级 shadow 容量为 21,845 clusters；旧版 `CSPrepareIndexedDrawQueue` 只要可见 cluster 数超过任一容量，就把对应 indexed args 清零，并让 procedural fallback 重画整个队列。日志仍显示 `submit=indexedClusterIndirect`，因为它只表示 indexed build pass 已执行，并不表示 GPU args 最终选择了 indexed draw。
+
+该退化与 capture 一致：Nanite `FormalVisibility` 约 15.745 ms，其中 procedural draw 约 15.621 ms；主光 shadow 约 4.352 ms，其中 procedural draw 约 4.244 ms。此时 CPU/Render Thread 的长等待是 GPU 饱和后的 `WaitForLastPresentation/WaitForGPU`，不是 GPU-driven 提交产生了 19 ms C# 工作。
+
+曾实验把容量内前缀保留为 indexed、仅将溢出尾部 procedural，并尝试用 procedural indirect args 的 `startVertex` 偏移 compact queue。实机立即出现大量破面与闪烁，且帧率仍约 50 FPS。这说明该 Unity `DrawProceduralIndirect` 路径下的 `startVertex -> SV_VertexID`/primitive ABI 不能按未经验证的假设使用；实验已完整撤回，恢复此前画面正确的 all-or-nothing fallback。
+
+后续不得继续用 indirect 参数偏移拼接同一个逻辑队列。应先对照成熟 GPU-driven 实现，选择具有显式 ABI 的方案，例如独立 overflow queue、固定容量多批次 queue、mesh shader task/mesh workgroup，或 persistent work queue；并在小规模 correctness test 中验证 triangle/instance/primitive ID 后再进入压力场景。
+
+## 远距离 LOD 仍然过密：Bake 误差审计（2026-07-28）
+
+154 车场景的 debug 视图显示，车辆已经只占很少像素时仍保留大量细三角形。该问题优先级高于 Mesh Shader：Mesh Shader 只能更快地提交现有三角形，不能修复错误的几何层级选择。
+
+对 `toyota_ft1_mesh` 的全部 59 个 Page 做离线统计后，确认旧 Bake 数据存在数量级错误。模型包围球半径约 2.82，旧数据却出现 `selfError=1135.8849`；误差中位数从 mip 1 的 0.0105 逐级膨胀到 mip 8 的 1135.9。运行时把该值投影到屏幕空间后，粗层级要到极端距离才会被判为可接受，因此远处仍选择细层。
+
+| Mip | Clusters | Triangles | selfError median | selfError max | parentError median | parent MaxValue |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 2503 | 312141 | 0 | 0 | 0.0105 | 0 |
+| 1 | 1374 | 155894 | 0.0105 | 0.557 | 0.0519 | 0 |
+| 2 | 702 | 79098 | 0.0520 | 10.652 | 0.2107 | 0 |
+| 3 | 383 | 41838 | 0.2189 | 21.804 | 0.8813 | 36 |
+| 4 | 173 | 19365 | 0.8813 | 53.050 | 20.488 | 0 |
+| 5 | 94 | 10065 | 20.488 | 131.696 | 221.494 | 0 |
+| 6 | 66 | 6923 | 221.494 | 275.221 | 555.188 | 13 |
+| 7 | 46 | 4786 | 555.188 | 559.948 | 1135.885 | 28 |
+| 8 | 18 | 1949 | 1135.885 | 1135.885 | n/a | 18 |
+
+meshoptimizer 官方接口明确规定：启用 `meshopt_SimplifyErrorAbsolute` 后，`target_error` 与 `result_error` 都是对象空间绝对误差；当前原生 DLL 只是原样转发 `meshopt_simplifyWithAttributes`，不存在 DLL 层单位转换。
+
+根因位于 `NaniteMeshBuilder` 的累计公式：`BoundsMerge` 已经把最大 child self error 写入 `groupBounds.error`，旧公式随后再次加入 `maxChildSelf`，并把本次 `simplifyError` 也加入两次，导致误差近似指数增长；额外的“半径 2% 下限”也会人为扭曲实际误差。
+
+当前修复：
+
+- 每层误差严格使用 `max(child cumulative error) + current absolute simplify error`，两个量各计一次。
+- 删除人为的半径 2% 误差下限。
+- meshoptimizer 返回 NaN、Infinity 或负误差时立即终止 Bake，不再生成不可诊断资产。
+- `Nanite/Audit LOD Errors` 新增逐 mip 的 cluster、triangle、self/parent min/median/max、`MaxValue` 数量，以及误差/模型半径比值。
+
+该修改只影响新 Bake 数据，不会在运行时偷偷改变旧资产。下一验收门槛是只重烘焙 Toyota：首先确认高 mip error 回到与模型尺寸相符的范围、三角形 debug 随屏幕占比明显退化且无裂缝/闪烁；然后再测 154 车 visible cluster 数和 GPU 时间。若 root 仍停在约 1949 triangles，则下一阶段单独处理 boundary-lock/terminal group 与 disconnected component 的顶层简化，不能重新放大误差掩盖层级质量问题。
+
+### 第一轮重 Bake 结果与第二处误差语义问题
+
+第一轮修复后 Toyota 从 59 Page / maxMip 8 变为 61 Page / maxMip 9，最高误差从 1135.9 降到 33.73，mip 9 本身降到 1000 triangles，说明“重复累计”根因已解除。但完整 root/terminal resident set 并不只有 mip 9：三个 root Page 共有 139 clusters、约 14393 triangles，其中还包含卡在 mip 0～6 的分支。远距离仍会永久携带这些分支。
+
+同时，新误差仍达到模型半径的 11.96 倍。原因是 `meshopt_simplifyWithAttributes` 的 `result_error` 同时包含 position 与 normal attribute error；这个结果适合比较外观质量，却不能作为米制几何位移直接投影到屏幕像素。特别是高 mip 法线变化会把 combined error 推到 5～33，即使实际表面位移远小于该值。
+
+第二轮修改：
+
+- 保持 attribute-aware simplification 选择三角形，避免为了性能直接牺牲法线/接缝质量。
+- 新增离线双向 surface-deviation BVH：对 source/simplified 顶点、边中点和三角形中心做双向点到三角形距离查询，仅把对象空间几何位移写入 runtime LOD error；normal error 不再伪装成世界空间距离。
+- 层级 group 从 16 meshlets 调到 Nyx 同类路径采用的 32，减少跨 group 锁边与过早 terminal。
+- 普通锁边简化卡住时，使用 meshoptimizer 官方 `SimplifyPrune` 做 disconnected-component coarse fallback；被删组件到保留表面的距离会进入上述几何误差，因此只允许在投影到 sub-pixel 后消失。
+- LOD Audit 新增完整 root/terminal triangle 数及逐 mip root triangle 分布，避免再把“最高 mip triangles”误当成真正远距离成本。
+
+这一轮仍需重新 Bake 验证。准入条件是：root/terminal triangles 明显低于 14393、几何误差不再达到模型半径十余倍、远景三角形显著退化，并且近中距离无裂缝、部件提前消失或闪烁。
+
+首次执行第二轮 Bake 时，`SimplifyPrune` 对一个完全可裁剪的 disconnected group 合法返回了空 index buffer，而 DAG 尚不支持“零三角形 parent”，导致几何误差测量拒绝输入。现已增加两层防护：每个简化目标至少保留一个三角形；Prune 只有返回非空、三角形对齐且确实更小时才会替换普通结果，否则进入原有 terminal 路径保留几何。
+
+### 第二轮重 Bake：主层级已收敛，补充空 parent 语义
+
+第二轮 Toyota Bake 用时约 46.1 秒，得到 67 Page、5408 clusters、257 groups、maxMip 13。相较上一轮：
+
+- root/terminal triangles：14393 → 2433（下降 83.1%）。
+- parent=MaxValue clusters：139 → 24。
+- 真正最高层：1 cluster / 58 triangles。
+- max finite error：33.73 → 8.23；error/model-radius：11.96x → 2.92x。
+- group fanout 从最多 16 提升到 32，boundary vertex duplication 从 8.86% 降到 6.93%。
+
+剩余 root 成本中有 2279 triangles 来自 mip 2 的 22 个分支。这些分支被 `SimplifyPrune` 判定为可以完整删除，之前因为 DAG 只能表达“有 coarse parent”或 `parentError=MaxValue`，只能退回永久绘制。
+
+现在将 root residency 与无限 parent error 解耦：
+
+- `ClusterGroup.isRootSet` 显式表示分支必须常驻并可被 traversal 发现，不再借用 `float.MaxValue` 表示 residency。
+- 当 Prune 返回空 parent 时，分支仍是 root set，但 child `parentError=max(childError, groupRadius)`。
+- runtime 的投影公式是 `2 * error * projectionScale / distance`，所以 `error=radius` 精确表示整个 component 投影直径小于阈值后消失；默认 1px 下不会留下可见孔洞。
+- 普通拓扑卡住且不能完整 Prune 的 terminal 仍保留 `MaxValue`，不会冒险删除主车体。
+- Audit 分开报告 resident root-set triangles 与 never-disappearing `parent=MaxValue` triangles。
+
+### 154 车第三轮实测：LOD 修复有效，但 raster admission 仍是当前断崖
+
+第三轮 Bake 保持 5408 clusters / 257 groups / maxMip 13，root set 2433 triangles 中仅 58 triangles 为 `parent=MaxValue` 永久绘制，空 parent 的有限消失语义已经正确写入资产。
+
+但 154 车、4K capture 仍只有约 43 FPS / GPU 23.75 ms：
+
+- `Nanite/FormalVisibility`：14.696 ms，其中 `Graphics.DrawProcedural` 合计 13.969 ms。
+- `Draw Main Light Shadowmap`：5.870 ms，其中 Nanite procedural draw 同为 5.870 ms。
+- `Nanite Main Light Shadow Cull`：0.355 ms；first cull 约 0.003 ms。
+
+因此 LOD/Bake 的改进没有被 culling 成本吃掉；GPU 时间明确集中在 raster draw。当前 indexed admission 仍是 all-or-nothing：camera capacity 87381 clusters、每级 shadow capacity 21845，任一 queue 超容量就令 indexed args=0、让整个 queue procedural fallback。`submit=indexedClusterIndirect` 只说明 build pass 被记录，不能证明 GPU args 最终选择 indexed draw。
+
+已加入一次性 `AsyncGPUReadback` admission probe，按 GPU command 顺序读取 camera 与四级 shadow count args，输出每个 queue 的 `count/capacity:indexed|PROCEDURAL_FALLBACK`。探针只执行一次且不同步阻塞；其结果同时给 Editor/Player 的后续帧提供分块数 hint。必须取得该数字后才能决定多批 indexed compatibility backend 的批次数与内存预算；在此之前不再盲目扩大 transient index buffer。
+
+### 154 车 Camera indexed 分块兼容后端（待实机验收）
+
+Admission probe 的确定结果为：camera `190157/87381`，shadow0 `17394/21845`，shadow1 `60232/21845`，shadow2 `107639/21845`，shadow3 `92708/21845`。因此 camera 与三路 shadow 并未真正进入 indexed raster，而是整队退回 procedural；这解释了 4K 压测中约 14 ms 的 Formal raster。
+
+Camera 路径现改为显式 compact-cluster offset 的顺序分块：`Build chunk N -> Raster chunk N -> reuse 128 MiB index buffer`。indexed draw 的 primitive ID 使用 chunk 起点；只有最后一块拥有 procedural tail，tail 使用 `chunkOffset + indexedCapacity`，不再依赖 Unity 未保证的 `startVertex -> SV_VertexID` 行为。Compute build 使用二维 dispatch，避免 87,381 groups 超过 D3D 单维 65,535 上限。首帧为一块 indexed 加显式 tail；一次异步 count probe 返回后，当前 154 车数据会记录三块。若可见数临时超过 hint，最后一块 tail 仍保证完整性。
+
+这只是修复 submission cliff 的 Unity compatibility backend，不代表已经达到最终目标。即使全部 indexed，约 190k camera visible clusters（平均约 1235/车）仍明显偏高；正确性与 GPU 时间通过后，下一优先级是 GPU 侧 visible mip/triangle histogram，据此收紧运行时 LOD 成本闭环，而不是继续扩大临时索引内存。
+
+实机初验：154 车、4K、关闭阴影约 `92.9 FPS / 10.8 ms`，开启四级阴影约 `66.0 FPS / 15.2 ms`。相对修改前约 49 FPS，Camera 分块已解除主要 procedural admission cliff，但离 200 FPS 目标仍很远；阴影当前额外约 4.4 ms。
+
+阴影少量破面/闪烁的直接原因不是 shadow bias：通用 prepare kernel 改为“indexed 前缀 + procedural overflow”后，Shadow draw 的 overflow 仍从 compact cluster 0 解码，导致前缀重复而真实尾部丢失。现已令 shadow indexed 前缀使用 offset 0，procedural 尾部使用 `IndexedShadowClusterCapacity`，保持 queue ABI 与 Camera 路径一致。
+
+为定位仍然过高的约 190k Camera clusters，新增一次性异步 `VisibleLodAudit`：不扩大每帧 GPU queue，只回读一次 compact draw queue，并用 `firstTriangle -> baked mip` 的 CPU 诊断映射输出逐 mip 的 cluster/triangle 数。该结果将决定是运行时阈值/投影公式、DAG cut，还是 Bake 的局部分支仍在产生主要成本。
+
+## GPU screen/texel cost closure (2026-07-28)
+
+The previous 154-instance Camera queue contained 190,157 visible clusters and therefore
+could not satisfy a screen-space geometry budget. The new path keeps the 2 px geometric
+quality threshold as a baseline, but adds a GPU-only cost constraint:
+
+- `GpuInstanceData` stores the finest-cut triangle count of its unique geometry.
+- `CSInstanceCull` accumulates projected visible-instance area on GPU (Q16 screen coverage).
+- Each instance receives a share of the global screen budget instead of independently
+  receiving a full-screen budget. This closes the large-instance overlap/density hole.
+- Camera and SceneView use separate persistent GPU feedback states. The actual submitted
+  triangle count is accumulated during queue emission; `CSFinalizeSceneTriangleBudget`
+  adjusts the next-frame pressure without CPU readback.
+- The Camera target is at most one submitted triangle per output pixel. A conservative
+  8 covered-pixels/triangle estimator compensates for the fact that geometric deviation
+  is not a direct triangle-density metric; actual triangle feedback enforces the final cap.
+- Shadow cascades use an independent filtered-shadow budget of 6 texels/triangle and a
+  shadow-only error guardrail. Camera feedback never leaks into orthographic shadow LOD.
+
+Measured intermediate Main Camera results at 3840x2160:
+
+| Stage | Camera clusters | Camera triangles | Indexed chunks |
+|---|---:|---:|---:|
+| Before cost closure | 190,157 | not audited | 3 |
+| Instance-area budget, initial calibration | 125,496 | 14,329,109 | 2 |
+| Conservative density estimator | 88,529 | 9,968,883 | 2 (1.3% over one-chunk capacity) |
+
+Shadow admission changed from `17k/60k/108k/92k` in the original stress capture, and from
+`26k/66k/44k/20k` after the first Camera budget pass, to:
+
+```text
+shadow0=9033 indexed
+shadow1=21095 indexed
+shadow2=13975 indexed
+shadow3=4004 indexed
+```
+
+All four cascades are now below the 21,845-cluster indexed partition. The procedural shadow
+tail is therefore removed for this stress scene. The final Camera acceptance criterion is
+`triangles <= width*height` and `clusters <= 87,381` after the GPU feedback warm-up. Visual
+acceptance still requires checking silhouette stability and near-hero detail in Game View.
+
+## Coarse-LOD topology and material correctness (2026-07-28)
+
+The first screen-budget acceptance run reached about 244.6 FPS / 4.1 ms, but distant cars
+showed missing components and material regions changing from black to white. These are not
+normal LOD transitions. Two independent correctness faults were found and fixed:
+
+- A fully pruned disconnected hierarchy branch has finite `parentError=componentRadius` and
+  no coarse replacement geometry. The adaptive 64/96 px Camera/Shadow thresholds were also
+  being used as its disappearance threshold, so a whole component could vanish while it was
+  still tens of pixels wide. GPU Part/Cluster records now carry an exact terminal-disappear
+  flag built from `hierarchyGroups` and `hierarchyClusterRefs`. Only the base geometric
+  quality threshold (normally 2 px) may remove such a branch; adaptive thresholds still
+  choose coarser represented geometry. GPU layout version is now 8.
+- The baker previously supplied only normal.xyz to `meshopt_simplifyWithAttributes`. It now
+  supplies packed UV.xy + normal.xyz + tangent.xyzw attributes. Duplicate-position vertices
+  whose attributes differ use meshoptimizer's `SimplifyVertex_Protect` flag; dynamic
+  cross-partition boundaries independently use `SimplifyVertex_Lock`. This is the Nyx/
+  meshoptimizer permissive-simplification contract: hard-locking every attribute wedge stalls
+  the hierarchy, while omitting `Protect` lets coarse triangles cross UV/hard-normal seams.
+
+The terminal-branch runtime fix works with the existing asset. The attribute/seam fix changes
+baked topology and therefore requires rebaking Toyota. Acceptance is near/mid/far camera
+movement with no holes, no black/white material-region swap, and no persistent flicker. A
+discrete silhouette transition is still expected until temporal LOD dithering/morphing is
+implemented, but the geometry and sampled material must remain semantically identical.
+
+After this correctness gate, the next implementation step is a hybrid raster backend, not a
+second full software renderer: projected micro triangles are classified on GPU, removed from
+the indexed hardware queue, and rasterized into the same visibility ABI with atomic depth;
+larger triangles stay on the current indexed path. Page work will extend the existing
+NPG1/NZC1, root residency, Page Pool, Page Table, decode table and resident cache rather than
+creating a parallel format. The next storage milestone is for compressed resident pages to be
+consumed directly by GPU transcode/streaming while compatibility decoded geometry can be
+retired under a measured memory budget.
+
+## Unreal-style concurrent hybrid raster backend (2026-07-28)
+
+This stage follows the public Nanite implementation rather than another LOD-threshold patch.
+The primary references are *A Deep Dive into Nanite Virtualized Geometry* (Karis et al.,
+SIGGRAPH Advances in Real-Time Rendering 2021, especially slides 77 and 84–91) and Unreal's
+`NaniteRasterizer.usf` / `NaniteWritePixel.ush`:
+
+- GPU classification is per visible cluster. A 128-thread group transforms the cluster's
+  triangles and measures projected edge length. Clusters containing a triangle edge at or
+  above 32 pixels, or requiring homogeneous clipping, remain on fixed-function hardware
+  raster. Micro-triangle clusters enter the software queue.
+- The hardware queue keeps the existing indexed-indirect backend. The software queue runs on
+  RenderGraph async compute. Both branches depend only on classification and can overlap;
+  they meet at the visibility merge.
+- Software setup uses 8-bit subpixel coordinates and the same one-sided determinant rule as
+  Unreal `SetupTriangle` (`DetXY >= 0` is rejected). It does not intentionally render hidden
+  back faces to conceal cracks.
+- Unreal writes one shared 64-bit atomic visibility value. Unity 6000.3 ShaderLab exposes no
+  Shader Model 6.6 typed 64-bit UAV atomics, so the compatibility backend uses two compute
+  passes: atomic `R32_UINT` depth, then an exact-depth atomic winner payload. A fixed-function
+  depth-tested merge writes the existing `R32G32_UINT` instance/triangle ABI. This limitation
+  is explicit; it is not presented as identical to UE's single-atomic path.
+- Triangles touching a clip plane stay on hardware raster until the software path gains UE's
+  full clip handling. Shadow cascades also remain hardware-only for this first correctness
+  gate.
+
+## Source-aligned Bake hierarchy correction (2026-07-28)
+
+The post-hybrid 154-instance test reached roughly 169 FPS at 4K, but stable detached body
+panels and severe coarse-mip texture distortion remained. The GPU capture put the main
+`Nanite/FormalVisibility` work around 1.69 ms and the indexed draw itself around 0.23 ms, so
+this visual failure was treated as a Bake hierarchy fault rather than hidden with raster
+thresholds.
+
+Comparison with Nyx `MeshletBuilder.cpp` found two concrete deviations and both were removed:
+
+- Persistent attribute discontinuities now set bit 1 (`meshopt_SimplifyVertex_Protect`) on
+  both position-equivalent wedges. Per-mip partition boundaries set bit 0 (`Lock`) without
+  erasing bit 1. `Protect` is intentionally used only with `SimplifyPermissive`.
+- The experimental `SimplifyByConnectedComponents` path was deleted because Nyx simplifies
+  one complete partition group in one meshoptimizer invocation. The first validation after
+  this change showed that component allocation was not the primary crack cause; see the
+  correction below.
+- Attribute weights now match Nyx: normal xyz 0.5, tangent xyz 0.1, tangent handedness 0.5,
+  and UV xy 0.1. The comparison is exact, matching Nyx's packed-attribute equality check and
+  avoiding a guessed seam epsilon.
+
+This changes the hierarchy topology and requires a fresh Bake. The immediate acceptance gate
+is correctness, not FPS: near/mid/far cuts must retain every represented component and keep
+UV/material regions stable. Once that gate passes, early degradation/popping is addressed at
+the temporal cut-selection level; it must not be compensated by restoring the invalid
+component-wise simplifier.
+
+### Validation correction: persistent refinement boundaries
+
+The following Bake produced 63 pages / maxMip 6 and 39,623 resident root-set triangles, with
+visible cracks worse than before and about 143.7 FPS at 4K. Inspection of Nyx's
+`BuildVertexLocksByGroups` found a more fundamental mismatch: it accumulates partition locks
+with `|= meshopt_SimplifyVertex_Lock`, while this implementation cleared every previous Lock
+on each mip. That allowed a coarser generation to move a boundary already used by a finer
+refinement edge, so mixed-mip cuts could not remain watertight.
+
+Boundary Lock bits are now permanent for the rest of the Build. Attribute Protect bits remain
+orthogonal. LOD error propagation also now follows Nyx: `max(current simplifyWithAttributes
+error, inherited child error)`. The former geometry-only estimator ignored UV/tangent error,
+selected visibly corrupted parents too early, and has been removed rather than left as dead
+code. This correction may expose hierarchy branches that cannot meet the target reduction;
+those must be addressed through grouping/topology and not by unlocking an established edge.
+
+The first Protect implementation compared Unity source floats exactly, whereas Nyx compares
+the already packed vertex payload. It consequently protected sub-storage-precision noise and
+inflated the terminal root forest. Seam classification now compares UV as R16G16 half and
+normal/tangent as R10G10B10A2, matching the cited Nyx input contract. The Bake emits one
+`[Nanite][BuildDAG]` summary containing simplification success, protected vertices, cumulative
+boundary locks and resident-root triangle count so the next acceptance run can distinguish
+real seam pressure from hierarchy logic failure.
+
+### Free active-cluster repartition (2026-07-28)
+
+The persistent-boundary validation removed visible cracks, confirming that cumulative Locks
+are required. It also produced only maxMip 4, 16,590 boundary-locked vertices and 48,926
+resident-root triangles, with the 154-instance 4K test falling to about 133.9 FPS.
+
+The remaining hierarchy-depth fault came from a local constraint absent from Nyx: all coarse
+clusters generated by one refinement group were wrapped in a `PartitionAtom` and forced into
+one consumer group on the next level. Nyx instead feeds every active meshlet directly to
+`meshopt_partitionClusters` at every level. The atom constraint defeated the partitioner's
+connectivity result, increased cut boundaries and terminated the DAG early.
+
+An experiment removed `PreserveProducerGroups` and its single-consumer Bake validation. It
+reduced boundary locks from 16,590 to 11,773 and root triangles from 48,926 to 45,382, but
+visible cracks returned and maxMip remained 4. The gain was too small and the topology was
+invalid for the current atomic refinement ABI: splitting one producer's coarse clusters among
+different consumers permits only part of its fine replacement to activate. The experiment is
+reverted; producer siblings remain one partition atom and Bake rejects split consumers.
+
+The same audit reported maximum LOD error 9.68 for a model radius of 2.82. That value included
+UV/normal/tangent quadric units and cannot be projected as an object-space distance. Bake now
+runs a companion geometry-only meshoptimizer QEM evaluation with identical source, topology
+locks and target count. The attribute-aware simplification still supplies the emitted topology;
+only the companion absolute positional error drives screen-space LOD, with Nyx's 1.5x inherited
+error guard band. This removes the false “UV units are metres” residency pressure without
+weakening seam protection.
+
+Hybrid compute errors observed immediately after the asset rebuild came from releasing shared
+classification/dispatch buffers while RenderGraph commands recorded by another Scene/Game
+camera still referenced them. Geometry-generation changes now retire the old buffer set for
+four frames before release. This prevents `_HybridPrepareCountArgs`, `_HybridInputClusters`
+and `_HybridVertexData` from becoming invalid between graph recording and execution.
+
+`PC_Renderer.asset` now selects hybrid mode with the source-backed 32 px threshold. Acceptance
+must verify three things separately: no near/mid/far holes or material changes; the Frame
+Debugger contains `HybridClassifyClusters`, `HybridSoftwareRaster`, indexed hardware raster,
+and `HybridSoftwareMerge`; and the GPU profiler shows async software work overlapping the
+hardware branch.
+
+## Root-group GPU selected-cut queue (2026-07-28)
+
+The 154-instance baseline still expanded 110,572 virtual Parts even though the final cut used
+only a small subset of the 779,856 virtual Clusters. The main-camera direct draw path now
+consumes the serialized cross-Page DAG instead of scanning every mip-level Part:
+
+1. instance frustum cull appends visible instances;
+2. root groups seed a GPU-resident `uint2(instance, hierarchyRef)` queue;
+3. fixed indirect ping-pong passes evaluate screen error and complete fine-Page residency;
+4. a producer group is replaced atomically by its fine refs, or its coarse refs are emitted
+   directly into the existing indirect draw queue;
+5. missing fine working sets request their Pages and retain the resident coarse cut.
+
+Only the canonical first coarse ref evaluates a producer group. This is required by the
+current Bake ABI: all siblings produced by that group enter and leave the selected cut
+together, so traversal cannot recreate the partial-refinement cracks seen during the free
+repartition experiment. Terminal root branches retain the dedicated 1/8-pixel disappearance
+rule. Shadows deliberately stay on the validated fused Part path until the camera traversal
+passes its correctness/performance gate.
+
+The traversal kernel reflects exactly eight UAVs on DX12 (queue, draw queue, visibility and
+two-phase masks/stats, Page requests, triangle-budget feedback), matching the Windows limit
+that previously broke the direct Part kernel. C# compilation and all affected compute entry
+points pass standalone DXC validation. Runtime identifies this path as
+`GPU-RootGroup-RefineQueue-DrawIndirect` and reports unique DAG group/ref counts and the fixed
+pass count; no CPU readback is introduced. This replaces the previous
+Instance-to-Part-to-Cluster dispatch chain.
+
+## Persistent traversal, hierarchy shadows and real Page residency (2026-07-28)
+
+The first root-group validation reported the new hierarchy label but no FPS change. The log
+still showed roughly 600,925 submitted triangles, while the capture showed about 2.21 ms in
+four-cascade shadow raster and about 1.435 ms in the compatibility hybrid compute path. This
+confirmed that reducing traversal work alone cannot remove downstream raster/shadow cost.
+
+The fixed six-pass queue has therefore been replaced by a persistent queue following the
+global-task-queue structure used by Nyx `DAGCull.slang`. Its allocation and publication
+frontiers are intentionally separate: producers reserve a range, publish generation-tagged
+payloads, then cooperatively advance one contiguous `publishedWrite` frontier. Consumers
+never claim from `reservedWrite`. Termination requires no active producer and equality of
+read, published and reserved frontiers. This removes both the six CPU-recorded hierarchy
+passes and the deadlock class where all resident workers wait on unpublished slots.
+
+Main-light shadows now use a separate persistent arena and one four-view DAG traversal.
+Each task carries a cascade mask, so near and far cascades can choose different cuts while
+sharing frustum tests, residency checks and Page requests. Missing fine Pages retain the
+resident ancestor cut. The old fused Part scan remains only as a compatibility fallback;
+the production log is `shadowFrustum/fusedHierarchyPersistent`.
+
+The Page system is no longer admitted only after `EnsureAllPagesResidentForPackedRaster`:
+
+- startup uploads and transcodes only pinned root Pages;
+- GPU hierarchy traversal requests missing fine working sets asynchronously;
+- triangle metadata stores `(localIndex, globalPageId)`, not a physical resident address;
+- raster/resolve resolves `indexBase` through the double-buffered resident Page table;
+- indexed-cluster construction reads resident indices and emits an encoded
+  `(instance, residentVertex)` hardware index;
+- the duplicate full decoded vertex/index buffers are reduced to one-element legacy SRVs in
+  the packed production path.
+
+This is the required address indirection for fence-safe eviction: a Page may move to another
+slot/range without rebuilding triangle metadata. Page table, decode table, resident table,
+request masks and root pinning are also the intended shared spatial ABI for later BLAS/TLAS
+residency decisions.
+
+The previous Unity compatibility hybrid raster (two 4K R32 targets, two software triangle
+passes and a fullscreen merge) is not equivalent to Unreal's shared 64-bit visibility atomic
+and is no longer the production default. `PC_Renderer.asset` uses indexed hardware raster
+until a native/SM6.6 shared-atomic backend is available; enabling the old mode is diagnostic
+only and is rejected while the demand-resident cache is active.
+
+Static validation for this stage: 23 runtime-culling kernels, 12 compact/index kernels and
+2 Page-transcode kernels compile with DXC; camera traversal reflects 8 UAVs and four-view
+shadow traversal reflects 6 UAVs; the Nanite C# assembly compiles with Unity Roslyn.
+
+### Persistent-queue TDR postmortem and quarantine
+
+The first Unity runtime validation exposed a wave-level deadlock that standalone DXC cannot
+detect. An idle lane spun inside `ClaimPersistentHierarchyTask` while another lane in the same
+wave owned the task needed to make progress. Since a wave executes in lockstep, the owner could
+not leave the claim function to publish or finish its task. DX12 consequently reported
+`DXGI_ERROR_DEVICE_HUNG (887a0006)` and Unity crashed while waiting on a fence.
+
+Idle lanes now return immediately; the active owner loops back after completion and drains any
+children it published. Both traversal kernels also have a hard 4096-task per-lane watchdog, so
+a malformed DAG or future protocol regression drops remaining work instead of hanging DX12.
+
+The saved `UnityNanite_2026-07-29_12-26-32` capture validated the bounded rollback at 154
+instances: GPU frame time was about 6.68 ms (roughly 166 FPS), split primarily between Formal
+Visibility (2.206 ms), four-cascade main-light shadows (1.773 ms), and FirstCull (1.619 ms).
+The overlay reported only about 17K submitted triangles, so Bake/LOD density is no longer the
+dominant cost. FirstCull still recorded 18 compute dispatches because the bounded hierarchy
+required six refinement rounds.
+
+The attempted camera-only re-admission failed at runtime. Although it produced `passes=1`, the
+154-instance scene dropped most of its selected cut and rose to about 146.7 ms / 6.8 FPS. The
+reason is fundamental to this scalar protocol: making idle lanes return prevents a wave
+deadlock, but those lanes can all terminate before the last active producer publishes its
+children, leaving queued work with no consumers. Making them spin recreates the original wave
+deadlock. A correct single-dispatch implementation needs cooperative wave/group scheduling or
+a native work-graph/mesh-shader path, not another atomic threshold adjustment.
+
+Both persistent gates are therefore disabled in `PC_Renderer.asset` and are experimental-only.
+The production path remains the bounded six-pass DAG traversal plus `fusedDirect` shadows.
+Demand-resident Page addressing and packed raster remain active. Do not request further user
+validation of the scalar persistent implementation.
+
+## 2026-07-29 architecture reset: heterogeneous GPU Scene
+
+The 154-copy Toyota result is not an acceptance result for a general GPU-driven renderer. It
+contains one geometry asset and nearly one material layout, so it does not exercise the costs
+that dominate a real heterogeneous scene: unique meshes, variable SubMesh counts, material
+parameter/texture diversity, shader families, Page churn and raster-bin fan-out.
+
+### Retraction: Screen-Space Geometry Budget
+
+The project-specific `Screen-Space Geometry Budget` has been removed in full. It allocated a
+triangle budget from the projected area of an entire instance bound and fed the previous
+frame's aggregate triangle count back into the LOD error. This is not the graph-cut criterion
+used by the inspected UE/NVIDIA/Nyx implementations. It caused both observed failure modes:
+near instances could become coarse abruptly, while distant instances could stop refining the
+cut even when their micro triangles still aliased.
+
+Production LOD selection is again based only on projected object-space geometric error and
+the generating-group/self-group conditions of a unique DAG cut. "One triangle per pixel" is
+an efficiency target used after cut selection and for HW/SW raster classification; it is not
+an instance-area triangle allocator.
+
+The removed path includes its Inspector fields, serialized Renderer fields, two compute
+kernels, feedback buffers, shader parameters and the `finestLodTriangleCount` instance ABI
+member. The unsafe scalar persistent traversal switches were also removed from the production
+Inspector and quarantined behind a compile-time false gate.
+
+### Source comparison used for the reset
+
+| Reference | Inspected implementation | Contract adopted here |
+|---|---|---|
+| Unreal Nanite | `NaniteRasterizer.usf`, `NaniteWritePixel.ush` | selected cluster first; then raster-bin/HW-SW classification into one visibility contract |
+| Nyx | `MiniEngine/Model/Shaders/DAGCull.slang`, `VBufferMesh.slang`, `ResolveVBufferToGBuffer.slang`, `GeometryStreaming.cpp` | GPU hierarchy queues, VBuffer resolve separation, explicit Page residency |
+| NVIDIA `vk_lod_clusters` (`70506fd`) | `traversal.glsl`, `traversal_run.comp.glsl`, `traversal_run_groups.comp.glsl`, `docs/lod_generation.md` | projected group error and generating/self-group unique graph cut |
+| `nanite-webgpu` (`b9cd33f`) | `nanite.wgsl.ts`, `cullMeshletsPass.wgsl.ts` | compact mesh/instance tables and GPU-created visible work lists |
+
+Reference implementations are kept outside the repository; cited upstream URLs and commit
+identifiers provide reproducible provenance without recording a contributor's local path.
+
+### Replacement matrix
+
+| Subsystem | Previous/current limitation | Required production replacement | Status |
+|---|---|---|---|
+| GPU Scene material mapping | rectangular `instances * sceneMaxSubMeshes` table | per-instance `materialSlotOffset/count` plus compact slot stream | implemented, layout v7 |
+| Material execution | one full-screen draw per unique Unity Material; hard cap 32 | GPU material/raster bins; one indirect tile list per shader family; parameter table and texture indirection | next blocker |
+| Arbitrary shaders | silently copied a small URP-Lit property subset | explicit shader-family ABI; unsupported shaders use a declared fallback/ordinary renderer | not implemented |
+| Geometry Scene | geometry shared per unique mesh, instances separate | retain; move all mutable instance records to a persistent dirty-range GPU Scene | partial |
+| LOD selection | bounded six-round root-group refinement | unique generating/self-group graph cut; cooperative queue or mesh/task shader scheduler | bounded path correct, scheduler incomplete |
+| Raster | indexed HW path plus quarantined compatibility SW path | cluster footprint/classification, concurrent HW/SW queues, shared visibility atomic/merge | incomplete |
+| Pages | Page ID/table/root pinning exists; payload still oversized | compact cluster-local encoding, meshopt/LZ4 blocks, dependency/fixup metadata, strict upload/eviction budget | partial |
+| Shadows | four-view cull and HW raster | independent shadow cuts and raster bins; no camera-cut reuse | partial |
+| Mesh Shader | absent | task/mesh work emission from the same selected-cluster queue | absent |
+| RT | no production bridge | resident cluster list -> shared BLAS cache; instance table -> TLAS; Page residency gates BLAS lifetime | planned |
+
+### Material/shader scalability boundary
+
+No renderer can execute an unbounded number of unrelated shader programs in one draw merely
+by calling it GPU-driven. UE also classifies work into material/raster bins with compatible
+shader code. The production contract for this Unity implementation will therefore be:
+
+1. SubMesh count and material-instance count may be large without rectangular CPU/GPU tables.
+2. Materials using the same supported shader family share one GPU parameter/texture table and
+   one indirect bin sequence; different parameter values do not create SetPass calls.
+3. A genuinely different shader program creates a shader-family bin. The number of shader
+   families, not the number of objects/material instances, bounds CPU submission.
+4. Unsupported custom shaders are explicit compatibility draws or rejected at import; they
+   are never silently rendered as white/default Lit and called supported.
+
+The first ABI step is now in source: `_InstanceMaterialRange[instance] = (offset,count)` and
+`_InstanceSubMeshMaterial[offset + subMesh]`. This removes the worst heterogeneous SubMesh
+memory multiplier and is the stable lookup consumed by the upcoming material-bin builder.
+
+### Unique-mesh spatial traversal (2026-07-29)
+
+After restoring the correct continuous-LOD cut, the 154-instance capture exposed a separate
+submission multiplier: immutable geometry was shared, but camera and shadow culling still
+expanded every visible instance across every Part (`154 * 718 = 110,572` virtual Parts for
+one Toyota mesh). That is GPU Scene indirection without GPU Scene traversal.
+
+The production Part candidate path now uses an immutable eight-way spatial hierarchy per
+unique mesh. Instances store only `spatialRootOffset/count`; nodes contain conservative
+unions of descendant bounds, parent-error spheres and maximum parent error. A bounded
+breadth-first indirect queue rejects whole subtrees by frustum and projected error before
+leaf Parts enter the existing unique graph-cut test. This follows the accumulated traversal
+metric used in NVIDIA `vk_lod_clusters/shaders/instance_classify_lod.comp.glsl` (lines
+176-245), while deliberately remaining independent of the obsolete producer-group atomic
+replacement graph.
+
+The same nodes drive a separate four-cascade shadow queue. Tasks carry a cascade mask, so a
+node rejected by one shadow frustum stops expanding for that cascade without repeating the
+tree walk four times. Camera and shadow queues have separate storage because their
+RenderGraph command streams may overlap. Neither path spins, reads a count back to the CPU,
+or duplicates nodes per instance. The old flat Part kernels remain compatibility fallbacks.
+
+This stage changes traversal cost, not LOD policy, and needs no rebake. Static admission:
+
+- Nanite runtime C# compiles with Unity 6000.3.10f1 Roslyn (only the three pre-existing API
+  warnings remain);
+- camera seed/traverse, fused shadow seed/traverse, and flat shadow fallback compile with
+  DXC SM6;
+- runtime logging reports `GPU-InstanceQueue-SpatialNode-PartQueue-ClusterIndirect` plus
+  unique spatial node/pass counts;
+- the scalar persistent path and atomic producer-group traversal remain quarantined.
+
+### Material family bin foundation (2026-07-29)
+
+The former tile path encoded `1 << materialId`, which imposed a hard scene limit of 32
+Materials and still submitted one full-screen GBuffer resolve per Material. That is a
+material loop, not the raster/shader-family binning used by Nanite.
+
+Material identity is now independent of execution family. The compact material table admits
+up to 65,535 stable IDs, while its `shaderFamily` field selects compatible code/state.
+Textureless URP-Lit parameter variants are grouped into at most eight state families
+(environment reflection, specular highlight and receive-shadow state) and resolve directly
+from `_NaniteMaterialData` in one pass per present family. The tile classifier writes family
+bits rather than Material bits, so its fixed 32-bit mask limits shader families, not scene
+material count. CPU family lookup is cached at scene rebuild and no longer re-inspects Unity
+Material properties every frame.
+
+Materials with unique sampled textures or unsupported shader programs deliberately remain
+family zero and use an exact compatibility bin. This is an explicit boundary, not the final
+texture solution: the next material milestone is a virtual texture/descriptor cache whose
+stable handles live in `GpuMaterialData`, after which textured variants of the same shader
+family can use the same single screen resolve. A fixed oversized Texture2DArray is rejected
+because it would resample arbitrary formats/sizes, reserve worst-case memory and merely move
+the heterogeneous-scene limit.
+
+Static admission for this increment: all 25 runtime-culling kernels, both float and compact
+material-classification variants, and the Nanite C# assembly compile successfully. ShaderLab
+import remains the authoritative validation for the modified GBuffer pass.
+
+### Traversal-produced HW/SW raster bins and packed Page decode (2026-07-29)
+
+The first Hybrid implementation was structurally wrong for production: after culling had
+already produced the selected cluster cut, another compute pass scanned the complete draw
+queue, decoded every triangle to estimate edge size, and appended the cluster to separate HW
+or SW buffers. Packed Page raster disabled this path entirely, so the production Page route
+could never exercise software rasterization.
+
+The current spatial production path now classifies at the point where
+`CSClusterCullVisibleParts` accepts a cluster. It retains the complete selected-cluster list
+for depth/debug/compatibility consumers and additionally writes exactly one raster bin:
+
+- a cluster entirely inside all six camera planes whose conservative projected bounding-
+  sphere diameter is at most the SW threshold enters the software bin;
+- clipping cases, large clusters, and clusters exceeding the 7-bit triangle-range payload
+  enter the fixed-function indexed bin;
+- both bins receive GPU counters; the SW counter is converted to a bounded 2D indirect
+  dispatch without CPU readback;
+- a RenderGraph dependency token releases indexed HW raster and async-compute SW raster from
+  the same cull result, allowing them to overlap on separate visibility targets.
+
+This follows the decision placement in NVIDIA
+`vk_lod_clusters/shaders/traversal_run_groups.comp.glsl` (SW selection during traversal) and
+the bin ABI in UE `NaniteRasterizer.usf` (`RasterizerBinHeaders` and `RasterizerBinData`).
+NPG1 V3 now carries the baked object-space longest triangle edge used by that decision; V1/V2
+assets conservatively substitute the geometry-sphere diameter until they are re-Baked.
+
+Hybrid vertex fetch now resolves the same stable `(Page ID, local index)` address as indexed
+HW raster and reads the resident Page Table/vertex/index cache directly. Compatibility mode
+binds correctly typed one-element fallbacks for every Page SRV, preventing Unity compute
+resource-validation failures and stale bindings. Cluster admission reads one uploaded
+object-space sphere instead of reparsing Page headers or decoding all cluster triangles.
+
+Unity ShaderLab does not currently expose the same portable shared 64-bit visibility atomic
+contract used by UE and NVIDIA. HW and SW therefore still write separate targets and merge
+afterward; this is an explicit remaining cost, not claimed parity. The obsolete post-cull
+classifier remains only as a fallback for non-spatial compatibility paths. Runtime-culling
+UAV reflection was checked after bin integration: the production visible-Part kernel uses
+four UAVs, while generic and hierarchy fallbacks remain at seven, below the existing eight-
+UAV compatibility limit.
+
+Static admission for this increment: Unity Roslyn compiles the Nanite assembly with only the
+three pre-existing API warnings; all 26 runtime-culling kernels and all 12 compact/indexed/
+hybrid raster kernels compile with DXC SM6.0.
+
+### Budgeted asynchronous Page publication (2026-07-29)
+
+The demand-resident path previously used asynchronous GPU request readback but performed the
+expensive work inside its callback: it fetched a Page range, decompressed LZ4, uploaded the
+packed slot, published tables and dispatched resident-cache transcode in one main-thread
+burst. That made the readback asynchronous in name only and recreated the CPU active-time
+spikes this renderer is intended to remove.
+
+Streaming is now a staged pipeline:
+
+1. the double-buffered GPU request mask is read back without a wait;
+2. the callback only updates Page touches, deduplicates Page IDs and captures immutable bulk
+   byte ranges on the main thread;
+3. bounded batches validate and unpack NZC1/LZ4 Pages on ThreadPool workers;
+4. completed Pages enter a generation-tagged main-thread queue;
+5. each frame consumes that queue under both Page-count and byte budgets, uploads packed
+   slots, publishes only dirty Page-table ranges, dispatches GPU transcode, then publishes
+   the resident-ready generation;
+6. evicted slots and decoded vertex/index ranges remain quarantined until their graphics
+   fence passes.
+
+The generation tag is part of the pending-request identity. A late worker result from a
+disposed/rebuilt scene can neither publish stale bytes nor clear a new request that happens
+to reuse the same Page ID. Outstanding decode work is capped independently from the upload
+budget, preventing a constrained pool from accumulating the whole virtual asset while it is
+waiting for retired slots.
+
+The disk side now also uses one bulk TextAsset per Nanite mesh. Every Page stores an offset
+and length into that blob, compressed Pages decode directly from the shared range, and the
+Page Pool caches `TextAsset.bytes` once per bulk asset. Runtime upload reuses one fixed
+256-KiB staging array and resident transcode reuses its task array. Together these remove the
+former per-Page bulk copy, repeated whole-blob materialization and per-request upload arrays.
+
+This follows the same separation of request, IO/decode, upload, fixup/publication and safe
+retirement visible in Nyx `GeometryStreaming.cpp` and UE's Nanite streaming manager. The
+current Unity `TextAsset` source is memory-backed, so this stage removes main-thread decode
+and publication spikes but is not yet true file/Addressables IO. Replacing the byte-range
+source does not change the Page Table or GPU transcode ABI.
+
+Static admission for this increment: the Nanite C# assembly compiles with Unity Roslyn with
+only the three pre-existing API warnings; all 41 kernels across runtime culling, compact/
+hybrid raster, Page transcode and material tile classification compile with DXC SM6.0; the
+modified Nanite sources pass `git diff --check` (line-ending notices only).
+
+### GPU Scene dirty-range instance publication (2026-07-29)
+
+The spatial traversal backend and visibility/resolve backend previously detected transform
+changes incrementally but uploaded the complete instance tables whenever one object moved.
+That scales CPU-to-GPU traffic with total scene population rather than the number of changed
+objects. Both backends now coalesce their already sorted dirty instance IDs into contiguous
+`ComputeBuffer.SetData` ranges. Transform matrices, traversal scale/LOD parameters and
+per-instance probe SH use the same policy; the periodic all-probe refresh remains a deliberate
+full upload. Repeated `Transform.lossyScale` native-property reads were also collapsed to one
+read per inspected instance.
+
+This closes the publication half of the persistent GPU Scene contract: immutable geometry is
+shared per unique mesh, material-slot tables are compact, and sparse mutable instance changes
+no longer rewrite every record. Discovering changed GameObject Transforms still requires a
+linear comparison because standard Unity `Transform` has no renderer-owned change stream.
+An ECS/Entities integration can feed the same range uploader directly without changing the
+GPU instance ABI.
+
+## 2026-07-29 production closure: sparse Hybrid, material bins and resident cuts
+
+This increment closes three costs/correctness gaps that were still hidden by the homogeneous
+Toyota test.
+
+### Sparse HW/SW visibility merge
+
+The compatibility Hybrid backend no longer clears two full-resolution `R32_UINT` images and
+runs a fullscreen merge. Software clusters mark 16x16 coverage tiles, the mask is compacted
+to an indirect tile list, and only those pixels are cleared and merged. Hardware and software
+raster still start from the same traversal-produced cut and can run concurrently; clipping
+and large clusters stay on indexed hardware raster. This preserves the shared VBuffer ABI
+without pretending that Unity ShaderLab exposes Unreal's 64-bit visibility atomic.
+
+### Heterogeneous material execution contract
+
+URP/Lit materials are now split into two GPU execution levels:
+
+- textureless parameter variants share a shader/state family draw;
+- textured variants sharing shader state and the same Base/Normal/Metallic/Occlusion/Emission
+  bindings share one compatibility bin, while per-material color, scalar and UV-ST values
+  remain in `GpuMaterialData`.
+
+The tile classifier stores shader-family bits and a compatibility-bin Bloom mask; the resolve
+fragment performs the exact bin comparison, so Bloom collisions can only add work, not shade
+the wrong pixels. A genuinely unrelated shader program is no longer silently approximated as
+white Lit: it is explicitly returned to its native `MeshRenderer` when available. Adding a
+new GPU shader family requires an explicit resolve implementation, matching Unreal's material
+bin contract rather than an impossible "arbitrary shaders in one draw" promise.
+
+### Demand-resident direct spatial cut
+
+The fast `GPU-spatial-cut` path now has the same resident-ancestor guarantee as the slower DAG
+scheduler. A nonresident fine Page is requested but never submitted to raster; its resident
+producer-group coarse set stays selected until every Page in the fine working set is decoded
+and its Page Table generation is published.
+
+The initial implementation checked that working set once per coarse cluster, which multiplied
+Page-table traffic by visible cluster count. Production now builds a compact
+`(instance, refinement-group)` residency cache once per view and cluster admission reads one
+`uint`. The cache is linear in the groups belonging to each instance's mesh; it does not form
+an `all instances x all scene groups` Cartesian product, which is essential for heterogeneous
+scenes. GPU layout version is 14.
+
+Static gate for this closure:
+
+- all 27 runtime traversal/shadow kernels compile with DXC SM6.0 `-Ges -WX`;
+- all 47 compute variants across traversal, Hybrid/index construction, Page transcode and
+  material classification compile;
+- runtime and Editor Nanite assemblies compile with Unity 6000.3.10f1 Roslyn (only the three
+  pre-existing obsolete/hiding warnings remain in the runtime assembly);
+- scoped `git diff --check` passes.
+
+### Completion boundary before runtime acceptance
+
+| Requested subsystem | Production state | Remaining runtime gate |
+|---|---|---|
+| GPU Scene | shared immutable geometry, compact material ranges, dirty-range instances, linear per-mesh residency metadata | heterogeneous mesh/material stress capture |
+| GPU traversal | instance + unique-mesh spatial hierarchy + indirect Part/Cluster cut, no readback | verify Page churn does not increase FirstCull |
+| Indirect raster | chunked indexed camera/shadow queues with procedural overflow safety | verify Hybrid keeps indexed path admitted |
+| Four-cascade shadows | fused spatial queue, cascade masks, independent texel LOD and resident fallback | cascade stability and total shadow GPU ms |
+| Page format/compression | NPG1 quantized payload, NZC1 LZ4, one bulk asset, Page/decode tables | payload/resident/pool counters under motion |
+| Residency/streaming | root pinning, async request/decode, budgeted upload, double-buffer publication and fence retirement | sustained camera-motion churn test |
+| Bake/continuous LOD | meshoptimizer attributes, cumulative locks, free active-cluster repartition, group error cut | asset-specific quality remains a Bake acceptance item |
+| HW/SW Hybrid | traversal bins, async SW raster, sparse tile clear/merge, shared VBuffer resolve | ShaderLab import plus GPU pass timings |
+| Heterogeneous materials/textures | family bins, texture/state compatibility bins, exact fallback for unsupported shader programs | multi-texture/multi-shader scene batch count |
+
+Mesh Shader and RT reuse remain intentionally outside this scope as requested. True on-demand
+disk IO is also source-provider dependent: the current bulk `TextAsset` removes per-Page files
+and main-thread decompression but is memory-backed by Unity. The Page Table and staged
+streaming ABI are ready for an Addressables/AssetBundle range provider without changing
+traversal or raster.
+
+## 2026-07-29 capture-directed raster closure
+
+Capture `UnityNanite_2026-07-29_15-04-18` moved the optimization target away from traversal:
+`Nanite/FirstCull` was about 0.003 ms, while four-cascade shadow raster was 4.616 ms and Formal
+Visibility was 2.926 ms. The saved admission probe also identified the concrete shadow
+overflow: camera `68995/87381`, shadow queues `0, 144, 62439, 69454`, while the old fixed
+quarter slices admitted only 21845 clusters per cascade.
+
+The production changes are therefore raster-directed:
+
+- traversal-produced HW/SW bins are enabled whenever dual Formal raster is not *actually*
+  active. Merely leaving its Inspector option enabled while HZB is inactive no longer forces
+  the post-cull compatibility classifier;
+- both FirstCull and SecondCull write the RenderGraph dependency used by async software
+  raster, so the merged cut cannot race the SW queue;
+- raster-bin readiness is stamped with frame and camera identity instead of a global boolean;
+- indexed scratch sizing uses instance-expanded GPU Scene demand rather than unique mesh
+  cluster count. The configured 128-MiB ceiling is now usable in an instanced scene instead of
+  silently allocating only the unique-geometry fraction;
+- the four shadow queues allocate slices on the GPU from their actual counts. A greedy
+  near-to-far prefix shares the complete 87381-cluster scratch, builds each admitted slice via
+  indirect dispatch, and exposes the per-cascade admitted count to the procedural tail shader.
+  This halves the known overflow for the captured queue distribution without a readback or a
+  larger buffer;
+- CSM geometry uses a two-shadow-texel minimum error target. Camera visibility retains its
+  authored pixel threshold; the shadow bias is per-cascade because its projection scale is
+  already expressed in that cascade's texels.
+
+The HW/SW split follows NVIDIA `vk_lod_clusters`: bin during traversal, require a clip-safe
+cluster for SW raster, and submit HW and SW lists independently. The shadow change follows the
+same Nanite view principle: shadows receive an independent texel-space cut rather than
+replaying the camera cut. Static admission compiles all 51 Nanite compute entry points with
+DXC SM6.0 `-Ges -WX`, compiles the Nanite runtime C# assembly with Unity's Roslyn response
+file (only the three pre-existing Unity API warnings), and passes scoped `git diff --check`.
+
+### Runtime acceptance: `UnityNanite_2026-07-29_15-45-57`
+
+At 3840x2160 with 154 instances and four cascades, shadow raster dropped from the previous
+4.616 ms to 2.607 ms. The representative GPU frame was 9.39 ms and the capture median was
+8.438 ms; Formal remained 2.737 ms. The new probe reported camera `115886/87381` and a
+four-cascade sum of `231486/87381`, confirming both that the shared shadow allocator is active
+and that the remaining cost is raster admission rather than traversal.
+
+The same run exposed a RenderGraph lifetime bug: a successful traversal-bin producer was
+occasionally followed by an auxiliary dispatch that reset its global ready flag, returning
+Formal to `post-cull compatibility classification`. Only successful producers now update the
+frame/camera stamp; non-producing work cannot erase it. Camera and Hybrid indexed construction
+also use an exact GPU-written indirect dispatch instead of launching the full 87381-cluster
+capacity for partial or empty chunks. Hybrid can consume the probe-selected second indexed
+chunk, eliminating the procedural suffix of the 115886-cluster camera queue while preserving
+the asynchronous software bin.
+
+Terminal/disconnected geometry previously survived until 0.125 camera pixels and 0.25 shadow
+texels, contradicting the pipeline's pixel budget and producing distant moire. The production
+cut now retires terminal detail below 0.5 camera pixels and one shadow texel. Shadow geometric
+error starts at two texels and rises conservatively to four in the far cascade, matching CSM
+filtering/world-texel density without changing the near-camera LOD threshold.
+
+Formal material resolve also folds each textureless URP/Lit state family into the first
+textured compatibility bin with the same shader state. Those pixels retain exact per-material
+parameters and skip texture samples by their material flags; textured pixels retain the exact
+compatibility-bin comparison. This removes one resolve batch from the homogeneous Toyota
+acceptance scene and prevents textureless parameter variants from adding SetPass work in a
+heterogeneous scene.
+
+### Runtime acceptance: `UnityNanite_2026-07-29_16-06-19`
+
+The next 154-instance 4K capture improved again without changing the rendered scene: shadow
+raster was 2.431 ms, Formal was 2.286 ms, the representative GPU frame was 8.31 ms and the
+1621-frame median was 8.633 ms. This is a real reduction from the 15:04 GPU frame of 10.11 ms,
+but the Editor Statistics counter stayed near 115 FPS. Raw thread data explains the apparent
+plateau: the Main Thread averaged 9.884 ms, including 4.391 ms waiting for presentation and
+1.787 ms collecting Profiler GPU samples. URP single-camera CPU work averaged 1.423 ms,
+RenderGraph recording 0.292 ms, and the Nanite GPU-cull dispatch marker 0.093 ms. There is no
+multi-millisecond Nanite CPU traversal hotspot in this capture; Editor/Profiler presentation
+and the 8.3-ms GPU frame are the current bounds.
+
+The Hybrid log still reported `post-cull compatibility classification` even though the spatial
+traversal produced valid raster bins. RenderGraph records the consumer before FirstCull
+executes, so querying execution-time frame stamps at record time can never admit that queue.
+Hybrid now uses a record-time producer capability contract and RenderGraph dependency, while
+the frame/camera stamp remains an execution-time diagnostic. The contract is based on the
+actual direct Part/Cluster producer resources and no longer depends on the optional CPU-BVH
+preference. The separate classification pass is retained only for genuine compatibility
+paths.
+
+The probe also measured shadow queues `9917, 41130, 82388, 85470`. With four equal atlas tiles,
+the distant cascades were spending roughly four to eight times their useful texel coverage on
+sub-texel geometry. Shadow error allocation now scales geometrically by cascade footprint
+(`1,2,4,8` over the two-texel base target), while terminal disconnected detail still survives
+to one texel. This is the shadow-space counterpart of the camera pixel budget and targets the
+remaining 2.431-ms shadow raster cost without weakening near-cascade detail.
+
+Finally, adaptive material-tile classification is admitted by the number of executed
+shader/texture bins rather than the number of Unity `Material` objects. Parameter variants
+folded into one family/compatibility bin no longer cause a redundant 4K classification pass;
+heterogeneous scenes with multiple real execution bins still use tile rejection.
+
+Material tile rejection is now a true GPU execution queue rather than a full tile grid with
+off-screen vertices. Classification appends each occupied tile to one of 32 shader-family and
+32 compatibility-Bloom queues and writes 64 indirect draw records. Resolve submits the exact
+queue for the current bin; Bloom collisions only add fragment comparisons and cannot select a
+wrong material. Textureless families folded into a textured state bin publish that bin in
+`GpuMaterialData`, keeping CPU batching, tile compaction and fragment exact-match semantics
+identical. Consequently heterogeneous material cost scales with the tiles touched by each
+execution bin instead of `screen tiles * material bins`.
+
+### Runtime acceptance: `UnityNanite_2026-07-29_16-38-44`
+
+Traversal-produced bins were correct and the editor counter reached 134.4 FPS at 4K, but the
+representative GPU frame regressed to 9.005 ms. Formal indexed HW raster was 2.211 ms while the
+async compatibility SW path cost another 1.136 ms; compared with the 16:06 hardware-only
+Formal cost of 2.286 ms, moving work at the public 32-pixel UE threshold saved only 0.075 ms
+and added over one millisecond. Four-cascade shadow raster was also the largest GPU marker at
+3.274 ms. Raw CPU data moved in the opposite direction: FirstCull record/submit fell from
+0.2815 to 0.2148 ms and RenderGraph execution recording from 0.7145 to 0.5567 ms. This capture
+therefore rejects CPU traversal and feature accumulation as the active optimization target.
+
+The HW/SW split now uses a backend-specific cost model instead of copying UE's native-atomic
+threshold as a universal constant. A clip-safe cluster must both fit the 16-pixel upper guard
+and have conservative projected sphere coverage no greater than one pixel per triangle. This
+keeps genuinely dense micropolygons on async SW raster while returning ordinary small clusters
+to indexed HW, whose measured crossover is much better in Unity's two-atomic-pass plus sparse
+merge implementation.
+
+Shadow indexed construction now packs only real triangles. Previously every admitted cluster
+reserved and drew the Bake maximum of 128 triangles, filling unused slots with degenerates;
+this wasted shadow vertex work precisely inside the 3.274-ms draw marker. Each cluster group
+now reserves `triangleCount * 3` indices from the cascade's existing safe fixed region and the
+indirect index count is the exact atomic sum. Camera Formal keeps its fixed layout because its
+fragment stage still needs deterministic `SV_PrimitiveID -> cluster/triangle` addressing;
+shadow depth does not, so the optimization is exact and requires no new ID buffer or readback.
+
+Static admission after this change compiles all 52 compute entry points with DXC SM6.0
+`-Ges -WX`, compiles the runtime C# assembly with Unity Roslyn, and passes scoped
+`git diff --check`. Runtime acceptance should compare `HybridSoftwareRaster`, Formal HW and
+`Draw Main Light Shadowmap` against this capture; a frame-rate-only comparison is insufficient
+because profiler collection and presentation wait dominate the Editor CPU graph.
+
+## 2026-07-29 16:55 capture: restore the mature visibility/streaming contracts
+
+Capture `UnityNanite_2026-07-29_16-55-17` establishes the real baseline for this closure:
+
+- representative GPU frame 9.453 ms, median frame 7.613 ms;
+- Formal visibility 2.964 ms (`HW=2.032`, async compatibility SW `=1.060`);
+- four-cascade shadow raster 2.631 ms, shadow cull 0.488 ms;
+- actual camera cut 115,886 clusters / 13,020,752 triangles;
+- shadow cuts 9,917 / 39,657 / 74,089 / 70,686 clusters.
+
+`Formal Resolve tri=600925` was only unique source geometry and has been renamed
+`uniqueGeometryTriangles`; it must not be interpreted as per-frame raster work.
+
+### Geometry bounds are not LOD error bounds
+
+The previous Bake stored one group-level error sphere in every coarse meshlet's
+`selfSphere`. Frustum, HZB, spatial BVH, shadow culling and HW/SW admission then treated that
+large shared sphere as the meshlet's geometry. This defeats exactly the hierarchy that a
+GPU-driven renderer depends on.
+
+The ABI now carries three distinct values:
+
+- `geometrySphere`: tight per-meshlet geometry bound, used only by visibility/raster routing;
+- `selfSphere`: generating-group error sphere, used only to project the self LOD error;
+- `parentSphere`: parent-group error sphere, used only to project the parent LOD error.
+
+Initial and generated meshlets obtain `geometrySphere` and the meshoptimizer normal cone from
+`meshopt_computeClusterBounds`; Part bounds and spatial BVH nodes merge tight geometry bounds.
+Page NPG1 V2 stores the additional sphere and packed cone in an 80-byte cluster record while
+remaining able to read V1 (`geometrySphere=selfSphere`, cone fail-open). Camera culling uses
+the official meshoptimizer sphere-cone equation. Four-cascade directional shadows use the
+infinite-light form only for positive, near-uniform transforms and one-sided materials.
+
+### Conservative main/post HZB, not prev-visible filtering
+
+The old implementation mixed a previous-visible bit mask with occlusion and still copied or
+ORed roughly 780k uint entries three times per frame even though the shader no longer consumed
+that history. The production contract is now:
+
+1. main pass tests the selected cut against the previous-frame HZB;
+2. rejected clusters enter the post-pass candidate mask;
+3. the main pass raster builds the current HZB;
+4. the post pass retests only candidates and appends disocclusions directly to the same
+   visibility and HW/SW queues.
+
+The redundant full-scene mask merge and history copy are removed. HZB reduction now stores
+the farthest depth of every tile (min for reversed-Z, max for conventional Z). Occlusion uses
+a projected sphere rectangle, a mip covering that rectangle and four conservative samples;
+the earlier nearest-depth/center-only test was not a valid occlusion proof.
+
+This follows NVIDIA `vk_lod_clusters/shaders/culling.glsl` (`intersectHiz`, far HIZ and a
+rectangle-derived mip) and its two-pass build setup rather than adding another Unity-specific
+visibility heuristic.
+
+### Priority Page residency and compact Bake products
+
+The request UAV is now one uint priority per virtual Page. Traversal performs an atomic max of
+projected geometric error, and asynchronous readback sorts missing Pages by that priority
+before applying decode/upload budgets. Resident writes remain usage touches for LRU. This
+implements the near/high-error ordering called out in NVIDIA `docs/streaming.md` while
+retaining root pinning, generation-safe double tables and fence-quarantined eviction.
+
+Bake still produces one LZ4-compressed bulk payload, but Page metadata is now stored as
+sub-assets of the single `NaniteMesh` asset. A re-Bake removes the legacy `_pN.asset` and
+per-Page `.bytes` products, leaving one mesh asset plus one bulk payload instead of dozens of
+top-level files. Runtime draw paths continue to consume the 64-byte decode table and decoded
+resident cache; no NPG header parsing returns to a triangle or pixel hot path.
+
+### Source correspondence and static gate
+
+The implementation was checked against:
+
+- NVIDIA `vk_lod_clusters/docs/lod_generation.md` and `docs/streaming.md`;
+- NVIDIA `shaders/culling.glsl`, `traversal_run_groups.comp.glsl` and
+  `render_raster_clusters_sw.comp.glsl`;
+- Nyx `MiniEngine/Model/MeshletBuilder.cpp` for permissive attribute simplification,
+  per-generation locks and packed-attribute protection;
+- meshoptimizer `meshoptimizer.h` for the normal-cone contract.
+
+All 52 Nanite compute entry points compile with DXC SM6.0 `-Ges -WX`. Runtime and Editor
+assemblies compile with Unity 6000.3.10f1 Roslyn; only the three pre-existing Unity API
+warnings remain. Runtime acceptance requires a V2 re-Bake because V1 assets deliberately
+fail open to the old broad geometry sphere and cannot demonstrate the new culling result.
+
+## 2026-07-29 18:03 experiment: retained main/post VBuffer (rejected)
+
+> This experiment is not the current production path. Capture
+> `UnityNanite_2026-07-29_18-26-38` proved that its Pass2 ownership contract was invalid in
+> this implementation, so the code was fully rolled back. The description below records the
+> rejected design and must not be read as an accepted optimization.
+
+The 154-instance, 4K capture measured 7.436 ms on the GPU. Formal Visibility was 2.137 ms,
+the four-cascade shadow raster was 1.403 ms and asynchronous software raster was 0.601 ms.
+The remaining structural waste was `Nanite/WriteDepth` at 1.042 ms: the main cut was first
+drawn into depth for current-frame HZB, then the merged main/post cut was drawn again into the
+formal VBuffer. HZB construction and post culling themselves cost only 0.051 and 0.032 ms.
+
+The rejected RenderGraph path attempted a main/post visibility contract:
+
+1. FirstCull emits the main HW/SW bins using previous-frame HZB.
+2. The former WriteDepth event rasterizes those bins directly into the retained formal
+   VBuffer and camera depth. There is no separate depth-only geometry draw.
+3. Current HZB is built from that formal main depth.
+4. Before post traversal, the already-consumed append storage is reset in place. SecondCull
+   therefore emits only disocclusions, without allocating a second full-scene queue.
+5. The post HW/SW raster preserves the main VBuffer and appends only recovered geometry.
+6. Material resolve consumes the combined retained VBuffer once.
+
+This matches the two-pass ownership in NVIDIA `build_setup.comp.glsl` and
+`traversal_run_groups.comp.glsl`: pass 1 work is consumed before `setupSecondPass`, pass 2
+rejects already-rendered work and emits only clusters visible against current HIZ. HW/SW
+selection remains traversal-time binning as in `rasterBinning` and the clipped-size test in
+`traversal_run_groups.comp.glsl`; it is not reclassified per object on the CPU.
+
+Because URP native GBuffer geometry can overwrite camera depth after the early main raster,
+the resolve path takes one R32 final-depth snapshot and conservatively rejects retained
+Nanite IDs that no longer own the depth sample. This is a screen copy rather than another
+geometry raster and preserves mixed ordinary/Nanite occlusion correctness.
+
+Low-frequency telemetry is now automatic and asynchronous. Every 120 Game-camera frames the
+GPU publishes main clusters, previous-HZB rejects and post recoveries; the admission audit
+also publishes main HW/SW queue counts and a one-shot mip/triangle distribution. No
+synchronous `GetData` or per-frame full queue readback is added.
+
+Its acceptance criterion was the disappearance of the old ~1.042 ms depth-only geometry
+draw. Runtime evidence rejected that hypothesis before the path was admitted.
+
+## 2026-07-29 18:26 rejection: restore merged raster and gate HZB by measured benefit
+
+Capture `UnityNanite_2026-07-29_18-26-38` regressed from roughly 142 FPS to 105 FPS. GPU time
+rose from 7.436 ms to 8.89 ms and Formal Visibility rose from 2.137 ms to 5.128 ms, while the
+new `Nanite/MainVisibility` draw was only 0.117 ms. Telemetry simultaneously reported
+`cameraMainClusters=92924`, `hzbRejected=0`, `postRecovered=0`.
+
+The cause was deterministic: `kCompactSelectionPass2` is deliberately ineligible for the
+direct visible draw queue. The post compact therefore scanned the merged visibility mask;
+when indexed state was invalid, Formal reset indirect arguments to the full mesh and redrew
+the approximately 92,924-cluster cut. The retained main/post VBuffer experiment, depth
+snapshot validation and post queue reset have been removed. Formal again compacts and
+rasters one merged selection using the previously validated path.
+
+HZB admission now uses asynchronous Pass2 telemetry instead of scene cluster count alone.
+The measured useful reject count is `max(0, pass2Candidates - pass2Recovered)`. Three probe
+samples below both 128 clusters and 0.2% reject ratio suppress the complete WriteDepth,
+BuildHzb and SecondCull chain for 600 frames. A short periodic probe re-admits it when a view
+becomes meaningfully occluded. Registry, camera, geometry-generation and material resolution
+changes reset the controller and invalidate stale HZB history. No synchronous readback or
+new Inspector switch was added.
+
+## 2026-07-29 18:40 acceptance and NPG1 V3 raster metric closure
+
+Capture `UnityNanite_2026-07-29_18-40-51` accepts the rollback and benefit admission. At 4K
+with 154 instances, the representative GPU frame is 6.727 ms, Formal Visibility is 1.863 ms,
+the four-cascade shadow raster is 1.392 ms, and the Editor counter is about 154 FPS. Workload
+telemetry reports 92,924 main clusters, zero HZB rejects/recoveries, enters cooldown on frame
+30, and periodically re-probes without retaining the rejected main/post VBuffer path.
+
+The next completed feature is the formal HW/SW raster cost input. The previous traversal bin
+treated a cluster's complete bounding-sphere diameter as its longest triangle edge. That can
+keep genuinely dense, spatially broad meshlets on HW and is not the NVIDIA algorithm.
+
+- Bake computes the exact object-space longest edge of every generated meshlet.
+- NPG1 V3 adds the scalar to its cluster record (84 bytes); V1/V2 decode with the old sphere-
+  diameter behavior, so migration is conservative rather than destructive.
+- GPU Scene layout 15 publishes the scalar once per unique mesh cluster. Instance scale and
+  camera projection turn it into pixels during spatial traversal; no vertex decode or CPU
+  per-instance classification is introduced.
+- Clip-plane safety and the measured Unity compatibility-backend density gate remain intact.
+  Only dense clusters whose actual longest edge is below the SW threshold move to the async
+  queue; sparse or clipped clusters remain on indexed HW.
+- The non-spatial compatibility classifier consumes the same unique-geometry metric buffer,
+  so fallback and production paths no longer disagree.
+
+This implements the `bbox.longestEdge / bbox extent` decision in NVIDIA
+`vk_lod_clusters/shaders/traversal_run_groups.comp.glsl` and its cluster-bounds construction
+in `scene_cluster_lod.cpp`, adapted to the existing sphere projection and non-uniform instance
+scale. Static admission compiles all 45 affected compute kernels with DXC SM6.0 `-Ges -WX`,
+compiles the Unity C# assembly, and passes scoped `git diff --check`. Runtime acceptance
+requires one V3 re-Bake and compares the automatic `hybrid=hw:...,sw:...` probe plus Formal HW
+and async SW timings against the 18:40 capture.
+
+## 2026-07-29 shadow scratch lifetime and end-to-end HZB admission
+
+The V3 re-Bake changed the HW/SW split but did not improve the complete frame. Telemetry made
+both masking costs explicit: the camera cut was 63,029 clusters and HZB rejected 29,895, while
+the four shadow cuts totalled 150,699 clusters. The old shadow index scratch admitted only
+87,381 simultaneous cluster slots, so roughly 63k shadow clusters still used the procedural
+vertex path. HZB also paid about 0.84 ms for WriteDepth, BuildHzb and SecondCull before its
+Formal saving was known.
+
+The native URP shadow graph now gives the shared index allocation the correct lifetime:
+
+1. one fused traversal emits all four cascade-local queues;
+2. cascade N builds its compact real-triangle index stream into the complete scratch buffer;
+3. cascade N raster consumes it immediately;
+4. only then may cascade N+1 overwrite the scratch.
+
+RenderGraph ordering fences encode `build0 -> draw0 -> build1 -> draw1 ...`; normal URP shadow
+renderer lists remain in the matching cascade raster pass. The buffer stays bounded at the
+existing budget and no longer needs four simultaneous slices. Admission telemetry therefore
+compares the largest individual cascade with capacity (`shadowReuseMax`), not the meaningless
+sum of four non-overlapping lifetimes. A procedural tail remains only as a correctness fallback
+when one individual cascade alone exceeds the whole allocation.
+
+Adaptive HZB admission now measures the counterfactual instead of inferring it from reject
+counts. Unity GPU recorders asynchronously sample:
+
+- HZB-on total = WriteDepth + BuildHzb + SecondCull + Formal;
+- HZB-off total = Formal without the occlusion chain.
+
+After GPU-delay-safe warm-up, twelve samples of each mode are compared with a 0.05 ms margin.
+The faster mode remains active for 600 frames and is then re-probed, so camera motion or a new
+occluder layout can change the decision. This adds no synchronous GPU readback and no Inspector
+switch. Reject-count admission remains only as the fallback on platforms without GPU marker
+timings.
+
+## 2026-07-29 production HW/SW tile raster module
+
+The former compatibility software path was not a production rasterizer. One lane owned one
+triangle, serially walked its complete pixel bounding box, and then repeated that walk in a
+second kernel to recover the winning primitive. Its tile list only reduced clear and merge
+coverage. This explains why moving clusters from HW to SW often added roughly one millisecond
+instead of reducing the complete frame.
+
+The camera path now uses a bounded GPU linked tile-work queue:
+
+1. traversal still emits HW/SW cluster bins directly;
+2. each SW triangle is transformed and set up once, then linked into only the 16x16 tiles it
+   overlaps;
+3. one workgroup owns one covered tile, cooperatively loads triangle batches, and keeps each
+   pixel's best depth plus primitive in registers;
+4. every covered pixel writes depth and winner exactly once;
+5. queue overflow atomically marks the complete cluster, appends it back to the HW bin once,
+   and invalidates its partial SW work. Geometry is never dropped to meet a budget.
+
+Setup and raster are separate RenderGraph passes. After setup finalizes overflow and the HW
+indirect count, async SW tile resolve and indexed HW build/raster consume the same fence in
+parallel. The sparse tile merge retains the existing RG32UI VBuffer ABI. This is the Unity
+fallback for the packed 64-bit visibility atomic used by Unreal Nanite and NVIDIA's
+`vk_lod_clusters/render_raster_clusters_sw.comp.glsl`; it avoids pretending that ShaderLab
+exposes an unsupported typed 64-bit UAV atomic while preserving one-winner correctness.
+
+The same classifier, linked queue, node-overflow rule and scratch allocation now service all
+four directional shadow cascades. The existing lifetime remains
+`build0 -> draw0 -> build1 -> draw1 ...`, so neither index scratch nor tile work is multiplied
+by four. Shadow SW setup applies the same directional depth and normal bias inputs as URP's
+hardware `ShadowCaster`, and a depth-only sparse tile pass merges into the native cascade
+viewport. The normal Mesh renderer list remains untouched.
+
+Camera and four-cascade shadow have independent end-to-end GPU admission. Each measures
+hybrid and hardware-only for eight warm-up plus twelve sample frames, keeps hybrid only when
+the complete measured stage wins by at least 0.05 ms, and re-probes after 600 frames. The
+controller is reset by camera, resolution, registry or geometry-generation changes. It adds
+no synchronous readback and no serialized Inspector tuning switch. HZB admission settles
+first so its own A/B switch cannot contaminate the hybrid comparison.
+
+Static acceptance completed:
+
+- all new compute entry points compile with DXC SM6.0, strict syntax and warnings-as-errors;
+- Nanite runtime C# compiles against the modified URP runtime;
+- URP runtime compiles with the shadow-bias context extension;
+- scoped `git diff --check` passes.
+
+Runtime acceptance is intentionally one combined checkpoint. Wait for both
+`[Nanite][HybridCostProbe] camera` and `four-cascade-shadow`, then capture an unprofiled FPS
+and one GPU Profiler frame. The production result is valid whether a stage selects `hybrid`
+or `hardware-only`: admission must retain the faster complete path, preserve all four shadow
+cascades, and show no missing surfaces or UV/material regression.
+
+## 2026-07-29 20:04 HW/SW module runtime acceptance
+
+Capture `UnityNanite_2026-07-29_20-04-55` validates the complete controller and fallback:
+
+- camera hybrid: 2.340 ms;
+- camera hardware-only: 2.040 ms;
+- four-cascade hybrid shadow: 5.586 ms;
+- four-cascade hardware-only shadow: 1.556 ms;
+- both decisions: `hardware-only`, with a scheduled 600-frame re-probe;
+- HZB independently selected enabled: 3.115 ms versus 3.349 ms;
+- unprofiled 3840x2160 Game view: about 186 FPS (5.4 ms), Main Thread about 4.3 ms;
+- GPU capture: Formal Visibility 3.270 ms, main-light shadow atlas 0.918 ms;
+- visual submission: no reported holes, UV regression or cascade failure.
+
+This accepts the module's correctness, scheduling, bounded-memory behavior and production
+cost closure. It does not prove a positive SW crossover on the tested DX12 GPU. In this
+workload HW raster remains substantially faster, especially for four 1024-pixel shadow
+cascades, so the production result correctly pays neither SW path in steady state. A future
+native 64-bit visibility atomic/subgroup-specialized backend can improve the crossover, but
+is not allowed to regress this accepted hardware-only floor.
+
+### Project completion after this checkpoint
+
+| Module | Architecture implemented | Runtime accepted |
+|---|---:|---:|
+| GPU Scene | 90% | 75% |
+| GPU traversal / indirect queue | 92% | 82% |
+| Camera VBuffer / indirect raster | 90% | 82% |
+| Four independent shadow cascades | 93% | 90% |
+| Page format and compression | 88% | 78% |
+| Residency / streaming | 82% | 65% |
+| Bake / continuous LOD / hierarchy quality | 78% | 68% |
+| HW/SW hybrid raster | 92% | 72% |
+| Heterogeneous materials and textures | 78% | 45% |
+
+The HW/SW runtime percentage is intentionally lower than its architecture percentage: both
+paths execute correctly and self-select, but only the HW floor wins on this capture. The
+largest remaining product gap is heterogeneous shader/texture execution; the largest
+geometry-quality gap is a higher-quality continuous hierarchy bake. Streaming needs eviction
+pressure, camera teleport and multi-asset stress acceptance rather than more nominal code.

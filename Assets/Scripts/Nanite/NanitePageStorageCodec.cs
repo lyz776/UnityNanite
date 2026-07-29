@@ -67,21 +67,45 @@ namespace Nanite
 
         public static bool TryUnpack(byte[] storageBlob, out byte[] packedPage, out string error)
         {
+            return TryUnpack(
+                storageBlob,
+                0,
+                storageBlob != null ? storageBlob.Length : 0,
+                out packedPage,
+                out error);
+        }
+
+        public static bool TryUnpack(
+            byte[] storageBlob,
+            int storageOffset,
+            int storageLength,
+            out byte[] packedPage,
+            out string error)
+        {
             packedPage = null;
             error = null;
-            if (storageBlob == null || storageBlob.Length < sizeof(uint))
+            if (storageBlob == null || storageOffset < 0 || storageLength < sizeof(uint) ||
+                storageOffset > storageBlob.Length - storageLength)
             {
                 error = "Page storage blob is empty.";
                 return false;
             }
 
-            if (ReadUInt32(storageBlob, 0) != Magic)
+            if (ReadUInt32(storageBlob, storageOffset) != Magic)
             {
-                packedPage = storageBlob;
+                if (storageOffset == 0 && storageLength == storageBlob.Length)
+                {
+                    packedPage = storageBlob;
+                }
+                else
+                {
+                    packedPage = new byte[storageLength];
+                    Buffer.BlockCopy(storageBlob, storageOffset, packedPage, 0, storageLength);
+                }
                 return NanitePageBinaryCodec.TryValidateBlob(packedPage, out error);
             }
 
-            if (storageBlob.Length < HeaderBytes)
+            if (storageLength < HeaderBytes)
             {
                 error = "Compressed Page header is truncated.";
                 return false;
@@ -89,22 +113,22 @@ namespace Nanite
 
             try
             {
-                ushort version = ReadUInt16(storageBlob, 4);
-                byte codec = storageBlob[6];
-                int unpackedBytes = ReadInt32(storageBlob, 8);
-                int payloadBytes = ReadInt32(storageBlob, 12);
+                ushort version = ReadUInt16(storageBlob, storageOffset + 4);
+                byte codec = storageBlob[storageOffset + 6];
+                int unpackedBytes = ReadInt32(storageBlob, storageOffset + 8);
+                int payloadBytes = ReadInt32(storageBlob, storageOffset + 12);
                 if (version != Version)
                     throw new InvalidDataException($"Unsupported Page storage version {version}.");
                 if (codec != CodecLz4Block)
                     throw new InvalidDataException($"Unsupported Page storage codec {codec}.");
                 if (unpackedBytes <= 0 || unpackedBytes > 64 * 1024 * 1024)
                     throw new InvalidDataException($"Invalid unpacked Page size {unpackedBytes}.");
-                if (payloadBytes <= 0 || payloadBytes != storageBlob.Length - HeaderBytes)
+                if (payloadBytes <= 0 || payloadBytes != storageLength - HeaderBytes)
                     throw new InvalidDataException("Compressed Page payload size mismatch.");
 
                 packedPage = DecompressLz4Block(
                     storageBlob,
-                    HeaderBytes,
+                    storageOffset + HeaderBytes,
                     payloadBytes,
                     unpackedBytes);
                 if (!NanitePageBinaryCodec.TryValidateBlob(packedPage, out error))

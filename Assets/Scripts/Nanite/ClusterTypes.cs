@@ -47,6 +47,12 @@ namespace Nanite
         public float minLodError;
         public float maxParentLodError;
         public int mipLevel;
+        /// <summary>
+        /// This group starts a permanently resident hierarchy branch. Root residency is
+        /// independent from maxParentLodError: a pruned component can remain discoverable
+        /// in the root set while using a finite error to disappear below one pixel.
+        /// </summary>
+        public bool isRootSet;
     }
 
     /// <summary>离线 Nanite 构建结果：全部 Cluster + 各级 Cluster Group + 最大 Mip。</summary>
@@ -66,6 +72,15 @@ namespace Nanite
     {
         public int mip;
         public int[] indices = Array.Empty<int>();
+        // Geometry bounds are intentionally independent from the group LOD spheres.
+        // A generated cluster shares its LOD error sphere with siblings, but frustum,
+        // HZB, shadow and raster admission must use the much tighter meshlet bounds.
+        public LODBounds geometry;
+        // Object-space longest triangle edge. Raster binning projects this value
+        // directly instead of treating the complete cluster bound as one triangle.
+        public float longestEdge;
+        // meshoptimizer cone_axis_s8.xyz + cone_cutoff_s8 packed little-endian.
+        public uint packedCone;
         public LODBounds self;
         public LODBounds parent;
     }

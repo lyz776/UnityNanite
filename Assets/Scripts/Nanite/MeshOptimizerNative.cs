@@ -106,7 +106,7 @@ namespace Nanite
             [In] Vector3[] vertexPositions,
             UIntPtr vertexCount,
             UIntPtr vertexPositionsStride,
-            [In] Vector3[] vertexAttributes,
+            [In] float[] vertexAttributes,
             UIntPtr vertexAttributesStride,
             [In] float[] attributeWeights,
             UIntPtr attributeCount,
@@ -133,5 +133,8 @@ namespace Nanite
     internal static class MeshoptSimplifyVertexFlags
     {
         public const byte Lock = 1 << 0;
+        // meshoptimizer 0.22+: preserve attribute wedges without turning them
+        // into topological boundary locks. Requires SimplifyPermissive.
+        public const byte Protect = 1 << 1;
     }
 }

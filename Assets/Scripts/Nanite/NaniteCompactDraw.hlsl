@@ -9,6 +9,11 @@ StructuredBuffer<uint3> _CompactedDrawClusters;
 float _UseCompactedTriIds;
 float _UseDirectVisibleDrawQueue;
 float _CompactedClusterTriangleSlots;
+float _CompactedClusterOffset;
+
+#ifndef NANITE_COMPACT_CLUSTER_EXTRA_OFFSET
+#define NANITE_COMPACT_CLUSTER_EXTRA_OFFSET 0u
+#endif
 
 uint NaniteCompactedTriangleSlots()
 {
@@ -17,7 +22,9 @@ uint NaniteCompactedTriangleSlots()
 
 uint NaniteCompactedClusterIndex(uint vertexID)
 {
-    return (vertexID / 3u) / NaniteCompactedTriangleSlots();
+    return (uint)max(0, (int)_CompactedClusterOffset) +
+        NANITE_COMPACT_CLUSTER_EXTRA_OFFSET +
+        (vertexID / 3u) / NaniteCompactedTriangleSlots();
 }
 
 uint NaniteCompactedTriangleInCluster(uint vertexID)
@@ -64,7 +71,9 @@ int NaniteResolveInstanceId(uint vertexID, int fallbackInstanceId)
 
 uint NaniteCompactedClusterIndexFromPrimitive(uint primitiveID)
 {
-    return primitiveID / NaniteCompactedTriangleSlots();
+    return (uint)max(0, (int)_CompactedClusterOffset) +
+        NANITE_COMPACT_CLUSTER_EXTRA_OFFSET +
+        primitiveID / NaniteCompactedTriangleSlots();
 }
 
 uint NaniteCompactedTriangleInClusterFromPrimitive(uint primitiveID)

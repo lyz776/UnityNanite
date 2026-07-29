@@ -72,6 +72,7 @@ namespace UnityEngine.Rendering.Universal.Internal
             internal UniversalLightData lightData;
             internal UniversalShadowData shadowData;
             internal MainLightShadowCasterPass pass;
+            internal int cascadeIndex;
             internal TextureHandle shadowmapTexture;
             internal readonly RendererList[] shadowRendererLists = new RendererList[k_MaxCascades];
             internal readonly RendererListHandle[] shadowRendererListsHandle = new RendererListHandle[k_MaxCascades];
@@ -82,7 +83,10 @@ namespace UnityEngine.Rendering.Universal.Internal
             internal MainLightShadowCasterPass pass;
             internal Camera camera;
             internal UniversalLightData lightData;
+            internal UniversalShadowData shadowData;
             internal BufferHandle orderingFence;
+            internal int cascadeIndex;
+            internal bool batch;
         }
 
         /// <summary>
@@ -516,7 +520,11 @@ namespace UnityEngine.Rendering.Universal.Internal
             rasterCommandBuffer.SetGlobalVector(MainLightShadowConstantBuffer._ShadowParams, s_EmptyShadowParams);
         }
 
-        void RenderMainLightCascadeShadowmap(RasterCommandBuffer cmd, ref PassData data, bool isRenderGraph)
+        void RenderMainLightCascadeShadowmap(
+            RasterCommandBuffer cmd,
+            ref PassData data,
+            bool isRenderGraph,
+            int singleCascadeIndex = -1)
         {
             var lightData = data.lightData;
 
@@ -528,15 +536,23 @@ namespace UnityEngine.Rendering.Universal.Internal
 
             using (new ProfilingScope(cmd, ProfilingSampler.Get(URPProfileId.MainLightShadow)))
             {
+                int firstCascade = singleCascadeIndex >= 0 ? singleCascadeIndex : 0;
+                int lastCascadeExclusive = singleCascadeIndex >= 0
+                    ? singleCascadeIndex + 1
+                    : m_ShadowCasterCascadesCount;
+                bool initializeAtlas = firstCascade == 0;
+                bool finalizeAtlas = lastCascadeExclusive == m_ShadowCasterCascadesCount;
+
                 // Need to start by setting the Camera position and worldToCamera Matrix as that is not set for passes executed before normal rendering
-                ShadowUtils.SetCameraPosition(cmd, data.cameraData.worldSpaceCameraPos);
+                if (initializeAtlas)
+                    ShadowUtils.SetCameraPosition(cmd, data.cameraData.worldSpaceCameraPos);
 
                 // For non-RG, need set the worldToCamera Matrix as that is not set for passes executed before normal rendering,
                 // otherwise shadows will behave incorrectly when Scene and Game windows are open at the same time (UUM-63267).
-                if (!isRenderGraph)
+                if (initializeAtlas && !isRenderGraph)
                     ShadowUtils.SetWorldToCameraAndCameraToWorldMatrices(cmd, data.cameraData.GetViewMatrix());
 
-                for (int cascadeIndex = 0; cascadeIndex < m_ShadowCasterCascadesCount; ++cascadeIndex)
+                for (int cascadeIndex = firstCascade; cascadeIndex < lastCascadeExclusive; ++cascadeIndex)
                 {
                     Vector4 shadowBias = ShadowUtils.GetShadowBias(ref shadowLight, shadowLightIndex, data.shadowData, m_CascadeSlices[cascadeIndex].projectionMatrix, m_CascadeSlices[cascadeIndex].resolution);
                     ShadowUtils.SetupShadowCasterConstantBuffer(cmd, ref shadowLight, shadowBias);
@@ -570,12 +586,15 @@ namespace UnityEngine.Rendering.Universal.Internal
                             m_RenderTargetHeight));
                 }
 
-                data.shadowData.isKeywordSoftShadowsEnabled = shadowLight.light.shadows == LightShadows.Soft && data.shadowData.supportsSoftShadows;
-                cmd.SetKeyword(ShaderGlobalKeywords.MainLightShadows, data.shadowData.mainLightShadowCascadesCount == 1);
-                cmd.SetKeyword(ShaderGlobalKeywords.MainLightShadowCascades, data.shadowData.mainLightShadowCascadesCount > 1);
-                ShadowUtils.SetSoftShadowQualityShaderKeywords(cmd, data.shadowData);
+                if (finalizeAtlas)
+                {
+                    data.shadowData.isKeywordSoftShadowsEnabled = shadowLight.light.shadows == LightShadows.Soft && data.shadowData.supportsSoftShadows;
+                    cmd.SetKeyword(ShaderGlobalKeywords.MainLightShadows, data.shadowData.mainLightShadowCascadesCount == 1);
+                    cmd.SetKeyword(ShaderGlobalKeywords.MainLightShadowCascades, data.shadowData.mainLightShadowCascadesCount > 1);
+                    ShadowUtils.SetSoftShadowQualityShaderKeywords(cmd, data.shadowData);
 
-                SetupMainLightShadowReceiverConstants(cmd, ref shadowLight, data.shadowData);
+                    SetupMainLightShadowReceiverConstants(cmd, ref shadowLight, data.shadowData);
+                }
             }
         }
 
@@ -680,7 +699,29 @@ namespace UnityEngine.Rendering.Universal.Internal
             }
         }
 
-        private void CullExternalMainLightShadowCasters(
+        private void InitRendererList(
+            ref PassData passData,
+            ScriptableRenderContext context,
+            RenderGraph renderGraph,
+            bool useRenderGraph,
+            int cascadeIndex)
+        {
+            int shadowLightIndex = passData.lightData.mainLightIndex;
+            if (m_CreateEmptyShadowmap || passData.externalOnly || shadowLightIndex == -1 ||
+                cascadeIndex < 0 || cascadeIndex >= m_ShadowCasterCascadesCount)
+                return;
+
+            ShadowDrawingSettings settings = new(passData.renderingData.cullResults, shadowLightIndex)
+            {
+                useRenderingLayerMaskTest = UniversalRenderPipeline.asset.useRenderingLayers
+            };
+            if (useRenderGraph)
+                passData.shadowRendererListsHandle[cascadeIndex] = renderGraph.CreateShadowRendererList(ref settings);
+            else
+                passData.shadowRendererLists[cascadeIndex] = context.CreateShadowRendererList(ref settings);
+        }
+
+        private void CullExternalMainLightShadowCastersBatch(
             UnsafeCommandBuffer cmd,
             Camera camera,
             UniversalLightData lightData)
@@ -700,21 +741,43 @@ namespace UnityEngine.Rendering.Universal.Internal
                     shadowLight,
                     m_CascadeSlices,
                     m_ShadowCasterCascadesCount));
-            for (int cascadeIndex = 0; cascadeIndex < m_ShadowCasterCascadesCount; ++cascadeIndex)
-            {
-                ShadowSliceData slice = m_CascadeSlices[cascadeIndex];
-                ExternalShadowCasterRegistry.CullMainLightShadowCasters(
-                    new ExternalMainLightShadowCullContext(
-                        cmd,
-                        camera,
-                        shadowLight,
-                        cascadeIndex,
-                        m_ShadowCasterCascadesCount,
-                        slice.viewMatrix,
-                        slice.projectionMatrix,
-                        slice.splitData.cullingSphere,
-                        slice.resolution));
-            }
+        }
+
+        private void CullExternalMainLightShadowCasterCascade(
+            UnsafeCommandBuffer cmd,
+            Camera camera,
+            UniversalLightData lightData,
+            UniversalShadowData shadowData,
+            int cascadeIndex)
+        {
+            if (cmd == null || camera == null || lightData == null ||
+                cascadeIndex < 0 || cascadeIndex >= m_ShadowCasterCascadesCount)
+                return;
+
+            int shadowLightIndex = lightData.mainLightIndex;
+            if (shadowLightIndex < 0 || shadowLightIndex >= lightData.visibleLights.Length)
+                return;
+
+            VisibleLight shadowLight = lightData.visibleLights[shadowLightIndex];
+            ShadowSliceData slice = m_CascadeSlices[cascadeIndex];
+            Vector4 shadowBias = ShadowUtils.GetShadowBias(
+                ref shadowLight,
+                shadowLightIndex,
+                shadowData,
+                slice.projectionMatrix,
+                slice.resolution);
+            ExternalShadowCasterRegistry.CullMainLightShadowCasters(
+                new ExternalMainLightShadowCullContext(
+                    cmd,
+                    camera,
+                    shadowLight,
+                    cascadeIndex,
+                    m_ShadowCasterCascadesCount,
+                    slice.viewMatrix,
+                    slice.projectionMatrix,
+                    slice.splitData.cullingSphere,
+                    slice.resolution,
+                    shadowBias));
         }
 
         internal TextureHandle Render(RenderGraph graph, ContextContainer frameData)
@@ -724,7 +787,14 @@ namespace UnityEngine.Rendering.Universal.Internal
             UniversalLightData lightData = frameData.Get<UniversalLightData>();
             UniversalShadowData shadowData = frameData.Get<UniversalShadowData>();
 
-            TextureHandle shadowTexture;
+            TextureHandle shadowTexture = !m_CreateEmptyShadowmap
+                ? UniversalRenderer.CreateRenderGraphTexture(
+                    graph,
+                    m_MainLightShadowDescriptor,
+                    k_MainLightShadowMapTextureName,
+                    true,
+                    ShadowUtils.m_ForceShadowPointSampling ? FilterMode.Point : FilterMode.Bilinear)
+                : graph.defaultResources.defaultShadowTexture;
             BufferHandle externalCullFence = default;
 
             if (!m_CreateEmptyShadowmap && m_HasExternalShadowCasters)
@@ -745,18 +815,117 @@ namespace UnityEngine.Rendering.Universal.Internal
                     cullPassData.pass = this;
                     cullPassData.camera = cameraData.camera;
                     cullPassData.lightData = lightData;
+                    cullPassData.shadowData = shadowData;
                     cullPassData.orderingFence = externalCullFence;
+                    cullPassData.batch = true;
                     builder.AllowPassCulling(false);
                     builder.AllowGlobalStateModification(true);
                     builder.UseBuffer(externalCullFence, AccessFlags.Write);
                     builder.SetRenderFunc((ExternalCullPassData data, UnsafeGraphContext context) =>
                     {
-                        data.pass.CullExternalMainLightShadowCasters(
+                        data.pass.CullExternalMainLightShadowCastersBatch(
                             context.cmd,
                             data.camera,
                             data.lightData);
                     });
                 }
+            }
+
+            // Indexed shadow geometry reuses one bounded scratch index buffer.
+            // Record each cascade as build -> raster before the next cascade is
+            // allowed to overwrite that allocation. This is the same lifetime
+            // model used by GPU-driven per-view work queues and removes the
+            // four-cascade procedural overflow without growing persistent VRAM.
+            bool splitExternalCascades =
+                !m_CreateEmptyShadowmap &&
+                m_HasExternalShadowCasters &&
+                ExternalShadowCasterRegistry.HasMainLightShadowCullProviders;
+            if (splitExternalCascades)
+            {
+                BufferHandle dependencyFence = externalCullFence;
+                for (int cascadeIndex = 0; cascadeIndex < m_ShadowCasterCascadesCount; ++cascadeIndex)
+                {
+                    BufferHandle buildFence = graph.CreateBuffer(new BufferDesc
+                    {
+                        name = $"MainLightExternalShadowBuildFence{cascadeIndex}",
+                        count = 1,
+                        stride = sizeof(uint),
+                        target = GraphicsBuffer.Target.Structured
+                    });
+                    using (var builder = graph.AddUnsafePass<ExternalCullPassData>(
+                               $"Build External Main Light Shadow {cascadeIndex}",
+                               out var buildPassData,
+                               m_ExternalShadowCullProfilingSampler))
+                    {
+                        buildPassData.pass = this;
+                        buildPassData.camera = cameraData.camera;
+                        buildPassData.lightData = lightData;
+                        buildPassData.shadowData = shadowData;
+                        buildPassData.cascadeIndex = cascadeIndex;
+                        buildPassData.orderingFence = buildFence;
+                        buildPassData.batch = false;
+                        builder.AllowPassCulling(false);
+                        builder.AllowGlobalStateModification(true);
+                        if (dependencyFence.IsValid())
+                            builder.UseBuffer(dependencyFence, AccessFlags.Read);
+                        builder.UseBuffer(buildFence, AccessFlags.Write);
+                        builder.SetRenderFunc((ExternalCullPassData data, UnsafeGraphContext context) =>
+                        {
+                            data.pass.CullExternalMainLightShadowCasterCascade(
+                                context.cmd,
+                                data.camera,
+                                data.lightData,
+                                data.shadowData,
+                                data.cascadeIndex);
+                        });
+                    }
+
+                    BufferHandle rasterFence = graph.CreateBuffer(new BufferDesc
+                    {
+                        name = $"MainLightExternalShadowRasterFence{cascadeIndex}",
+                        count = 1,
+                        stride = sizeof(uint),
+                        target = GraphicsBuffer.Target.Structured
+                    });
+                    using (var builder = graph.AddRasterRenderPass<PassData>(
+                               $"{passName} Cascade {cascadeIndex}",
+                               out var passData,
+                               profilingSampler))
+                    {
+                        InitPassData(ref passData, renderingData, cameraData, lightData, shadowData);
+                        passData.cascadeIndex = cascadeIndex;
+                        InitRendererList(
+                            ref passData,
+                            default(ScriptableRenderContext),
+                            graph,
+                            true,
+                            cascadeIndex);
+                        if (!passData.externalOnly)
+                            builder.UseRendererList(passData.shadowRendererListsHandle[cascadeIndex]);
+                        builder.SetRenderAttachmentDepth(
+                            shadowTexture,
+                            cascadeIndex == 0 ? AccessFlags.Write : AccessFlags.ReadWrite);
+                        builder.AllowGlobalStateModification(true);
+                        builder.AllowPassCulling(false);
+                        builder.UseBuffer(buildFence, AccessFlags.Read);
+                        builder.UseBuffer(rasterFence, AccessFlags.Write);
+                        if (cascadeIndex == m_ShadowCasterCascadesCount - 1)
+                            builder.SetGlobalTextureAfterPass(
+                                shadowTexture,
+                                MainLightShadowConstantBuffer._MainLightShadowmapID);
+                        builder.SetRenderFunc((PassData data, RasterGraphContext context) =>
+                        {
+                            data.pass.RenderMainLightCascadeShadowmap(
+                                context.cmd,
+                                ref data,
+                                true,
+                                data.cascadeIndex);
+                        });
+                    }
+                    dependencyFence = rasterFence;
+                }
+
+                return shadowTexture;
             }
 
             using (var builder = graph.AddRasterRenderPass<PassData>(passName, out var passData, profilingSampler))
@@ -772,12 +941,7 @@ namespace UnityEngine.Rendering.Universal.Internal
                             builder.UseRendererList(passData.shadowRendererListsHandle[cascadeIndex]);
                     }
 
-                    shadowTexture = UniversalRenderer.CreateRenderGraphTexture(graph, m_MainLightShadowDescriptor, k_MainLightShadowMapTextureName, true, ShadowUtils.m_ForceShadowPointSampling ? FilterMode.Point : FilterMode.Bilinear);
                     builder.SetRenderAttachmentDepth(shadowTexture, AccessFlags.Write);
-                }
-                else
-                {
-                    shadowTexture = graph.defaultResources.defaultShadowTexture;
                 }
 
                 builder.AllowGlobalStateModification(true);

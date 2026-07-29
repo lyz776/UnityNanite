@@ -55,18 +55,22 @@ namespace Nanite
     }
 
     /// <summary>
-    /// Versioned little-endian Nanite Page blob. V1 keeps hierarchy metadata lossless,
+    /// Versioned little-endian Nanite Page blob. V2 separates tight geometry bounds
+    /// from group LOD spheres and stores a quantized meshlet normal cone. V3 stores
+    /// the object-space longest triangle edge used by traversal-time HW/SW binning.
     /// quantizes position/normal/tangent/UV and uses 16-bit local indices when possible.
     /// </summary>
     public static class NanitePageBinaryCodec
     {
         public const uint Magic = 0x3147504E; // "NPG1"
-        public const int CurrentVersion = 1;
+        public const int CurrentVersion = 3;
         public const int HeaderSize = 136;
 
         const int SectionCount = 7;
         const int CrcOffset = 16;
-        const int ClusterBytes = 60;
+        const int ClusterBytesV1 = 60;
+        const int ClusterBytesV2 = 80;
+        public const int ClusterRecordBytes = 84;
         const int PartBytes = 48;
         const int BvhNodeBytes = 60;
         const int QuantizedVertexHalfUvBytes = 20;
@@ -92,6 +96,7 @@ namespace Nanite
 
         struct Header
         {
+            public int version;
             public NanitePageBinaryFlags flags;
             public int totalSize;
             public uint crc;
@@ -243,7 +248,13 @@ namespace Nanite
 
                 ValidateSectionSize(header, Section.Vertices, header.vertexCount, vertexRecordBytes);
                 ValidateSectionSize(header, Section.Indices, header.indexCount, index16 ? 2 : 4);
-                ValidateSectionSize(header, Section.Clusters, header.clusterCount, ClusterBytes);
+                ValidateSectionSize(
+                    header,
+                    Section.Clusters,
+                    header.clusterCount,
+                    header.version >= 3
+                        ? ClusterRecordBytes
+                        : (header.version >= 2 ? ClusterBytesV2 : ClusterBytesV1));
                 ValidateSectionSize(header, Section.Parts, header.partCount, PartBytes);
                 ValidateSectionSize(header, Section.ClusterMip, header.clusterMipCount, sizeof(int));
                 ValidateSectionSize(header, Section.BvhNodes, header.bvhNodeCount, BvhNodeBytes);
@@ -359,7 +370,7 @@ namespace Nanite
             long bytes = sizeof(int);
             bytes += (long)(page.vertexData?.Length ?? 0) * sizeof(float);
             bytes += (long)(page.indiceArray?.Length ?? 0) * sizeof(int);
-            bytes += (long)(page.clusterArray?.Length ?? 0) * ClusterBytes;
+            bytes += (long)(page.clusterArray?.Length ?? 0) * ClusterRecordBytes;
             bytes += (long)(page.parts?.Length ?? 0) * PartBytes;
             bytes += (long)(page.clusterMip?.Length ?? 0) * sizeof(int);
             bytes += (long)(page.bvhNodes?.Length ?? 0) * BvhNodeBytes;
@@ -440,11 +451,13 @@ namespace Nanite
                 int headerSize = reader.ReadUInt16();
                 if (magic != Magic)
                     throw new InvalidDataException($"Invalid Page magic 0x{magic:X8}.");
-                if (version != CurrentVersion)
-                    throw new InvalidDataException($"Unsupported Page version {version}; expected {CurrentVersion}.");
+                if (version < 1 || version > CurrentVersion)
+                    throw new InvalidDataException(
+                        $"Unsupported Page version {version}; supported range is 1..{CurrentVersion}.");
                 if (headerSize != HeaderSize)
                     throw new InvalidDataException($"Unsupported Page header size {headerSize}; expected {HeaderSize}.");
 
+                header.version = version;
                 header.flags = (NanitePageBinaryFlags)reader.ReadUInt32();
                 header.totalSize = reader.ReadInt32();
                 header.crc = reader.ReadUInt32();
@@ -607,7 +620,7 @@ namespace Nanite
 
         static byte[] EncodeClusters(NaniteCluster[] source)
         {
-            using var stream = new MemoryStream(checked(source.Length * ClusterBytes));
+            using var stream = new MemoryStream(checked(source.Length * ClusterRecordBytes));
             using var writer = new BinaryWriter(stream);
             for (int i = 0; i < source.Length; i++)
             {
@@ -616,8 +629,11 @@ namespace Nanite
                 writer.Write(cluster.indiceCount);
                 writer.Write(cluster.selfError);
                 writer.Write(cluster.parentError);
+                WriteVector4(writer, cluster.geometrySphere);
+                writer.Write(cluster.longestEdge);
                 WriteVector4(writer, cluster.selfSphere);
                 WriteVector4(writer, cluster.parentSphere);
+                writer.Write(cluster.packedCone);
                 writer.Write(cluster.subMeshId);
                 writer.Write(cluster.partIndex);
                 writer.Write(cluster.vertexOffset);
@@ -632,14 +648,32 @@ namespace Nanite
             using var reader = new BinaryReader(stream);
             for (int i = 0; i < result.Length; i++)
             {
+                int indiceIndex = reader.ReadInt32();
+                int indiceCount = reader.ReadInt32();
+                float selfError = reader.ReadSingle();
+                float parentError = reader.ReadSingle();
+                Vector4 geometrySphere = header.version >= 2
+                    ? ReadVector4(reader)
+                    : default;
+                float longestEdge = header.version >= 3
+                    ? reader.ReadSingle()
+                    : 0f;
+                Vector4 selfSphere = ReadVector4(reader);
+                Vector4 parentSphere = ReadVector4(reader);
+                uint packedCone = header.version >= 2 ? reader.ReadUInt32() : 0x7F000000u;
                 result[i] = new NaniteCluster
                 {
-                    indiceIndex = reader.ReadInt32(),
-                    indiceCount = reader.ReadInt32(),
-                    selfError = reader.ReadSingle(),
-                    parentError = reader.ReadSingle(),
-                    selfSphere = ReadVector4(reader),
-                    parentSphere = ReadVector4(reader),
+                    indiceIndex = indiceIndex,
+                    indiceCount = indiceCount,
+                    selfError = selfError,
+                    parentError = parentError,
+                    geometrySphere = header.version >= 2 ? geometrySphere : selfSphere,
+                    longestEdge = header.version >= 3
+                        ? longestEdge
+                        : 2f * (header.version >= 2 ? geometrySphere.w : selfSphere.w),
+                    selfSphere = selfSphere,
+                    parentSphere = parentSphere,
+                    packedCone = packedCone,
                     subMeshId = reader.ReadInt32(),
                     partIndex = reader.ReadInt32(),
                     vertexOffset = reader.ReadInt32()
@@ -961,7 +995,10 @@ namespace Nanite
             {
                 if (a[i].indiceIndex == b[i].indiceIndex && a[i].indiceCount == b[i].indiceCount &&
                     a[i].selfError.Equals(b[i].selfError) && a[i].parentError.Equals(b[i].parentError) &&
+                    a[i].geometrySphere.Equals(b[i].geometrySphere) &&
+                    a[i].longestEdge.Equals(b[i].longestEdge) &&
                     a[i].selfSphere.Equals(b[i].selfSphere) && a[i].parentSphere.Equals(b[i].parentSphere) &&
+                    a[i].packedCone == b[i].packedCone &&
                     a[i].subMeshId == b[i].subMeshId && a[i].partIndex == b[i].partIndex &&
                     a[i].vertexOffset == b[i].vertexOffset)
                     continue;

@@ -24,7 +24,6 @@ struct NaniteGpuPageDecodeEntry
 };
 #endif
 
-#if defined(NANITE_PACKED_DIRECT_DIAGNOSTIC)
 struct NaniteGpuResidentPageEntry
 {
     uint vertexBase;
@@ -36,7 +35,6 @@ struct NaniteGpuResidentPageEntry
     uint reserved0;
     uint reserved1;
 };
-#endif
 
 struct NaniteResidentVertex
 {
@@ -94,18 +92,18 @@ void NanitePackedInitializeVertex(out NanitePackedVertex vertex)
 ByteAddressBuffer _NanitePackedPagePool;
 StructuredBuffer<NaniteGpuPageDecodeEntry> _NanitePageDecodeTable;
 float _NanitePackedDirectDiagnostic;
-StructuredBuffer<NaniteGpuResidentPageEntry> _NaniteResidentPageTable;
 #endif
+StructuredBuffer<NaniteGpuResidentPageEntry> _NaniteResidentPageTable;
 StructuredBuffer<NaniteResidentVertex> _NaniteResidentVertices;
 StructuredBuffer<uint> _NaniteResidentIndices;
 StructuredBuffer<uint2> _TrianglePageRefs;
 float _UsePackedPageGeometry;
 
 static const uint NANITE_PAGE_INVALID = 0xFFFFFFFFu;
+static const uint NANITE_RESIDENT_GEOMETRY_READY = 1u << 0u;
 #if defined(NANITE_PACKED_DIRECT_DIAGNOSTIC)
 static const uint NANITE_NPG1_FLAG_INDEX16 = 1u << 4u;
 static const uint NANITE_NPG1_FLAG_FLOAT_UV = 1u << 5u;
-static const uint NANITE_RESIDENT_GEOMETRY_READY = 1u << 0u;
 #endif
 
 bool NaniteUsePackedPageGeometry()
@@ -169,27 +167,29 @@ bool NanitePackedResolveTriangleContext(
 {
     context = (NanitePackedTriangleContext)0;
 
+    // triangleRef is a stable virtual address: local index offset + Page ID.
+    // Resolve indexBase through the current table generation so streaming and
+    // eviction never require rebuilding per-triangle metadata.
     uint2 triangleRef = _TrianglePageRefs[triangleId];
-    if (triangleRef.x == NANITE_PAGE_INVALID)
-        return false;
-    context.firstResidentIndex = triangleRef.x;
-
-    #if defined(NANITE_PACKED_DIRECT_DIAGNOSTIC)
-    if (triangleRef.y == NANITE_PAGE_INVALID)
+    if (triangleRef.x == NANITE_PAGE_INVALID ||
+        triangleRef.y == NANITE_PAGE_INVALID)
         return false;
     NaniteGpuResidentPageEntry residentPage = _NaniteResidentPageTable[triangleRef.y];
     if ((residentPage.flags & NANITE_RESIDENT_GEOMETRY_READY) == 0u ||
+        residentPage.indexBase == NANITE_PAGE_INVALID ||
         residentPage.indexCount < 3u ||
-        triangleRef.x < residentPage.indexBase ||
-        triangleRef.x - residentPage.indexBase > residentPage.indexCount - 3u)
+        triangleRef.x > residentPage.indexCount - 3u)
         return false;
+    context.firstResidentIndex = residentPage.indexBase + triangleRef.x;
+
+    #if defined(NANITE_PACKED_DIRECT_DIAGNOSTIC)
     if (_NanitePackedDirectDiagnostic < 0.5)
     {
         context.useResident = 1u;
         return true;
     }
 
-    uint localTriangleIndex = (triangleRef.x - residentPage.indexBase) / 3u;
+    uint localTriangleIndex = triangleRef.x / 3u;
     NaniteGpuPageDecodeEntry page = _NanitePageDecodeTable[triangleRef.y];
     if (page.byteAddress == NANITE_PAGE_INVALID ||
         page.vertexSectionAddress == NANITE_PAGE_INVALID ||

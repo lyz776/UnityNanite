@@ -20,6 +20,7 @@ namespace UnityEngine.Rendering.Universal
         public readonly Matrix4x4 projectionMatrix;
         public readonly Vector4 cullingSphere;
         public readonly int shadowResolution;
+        public readonly Vector4 shadowBias;
 
         internal ExternalMainLightShadowCullContext(
             UnsafeCommandBuffer commandBuffer,
@@ -30,7 +31,8 @@ namespace UnityEngine.Rendering.Universal
             Matrix4x4 viewMatrix,
             Matrix4x4 projectionMatrix,
             Vector4 cullingSphere,
-            int shadowResolution)
+            int shadowResolution,
+            Vector4 shadowBias)
         {
             this.commandBuffer = commandBuffer;
             this.camera = camera;
@@ -41,6 +43,7 @@ namespace UnityEngine.Rendering.Universal
             this.projectionMatrix = projectionMatrix;
             this.cullingSphere = cullingSphere;
             this.shadowResolution = shadowResolution;
+            this.shadowBias = shadowBias;
         }
     }
 
@@ -251,6 +254,9 @@ namespace UnityEngine.Rendering.Universal
                 }
             }
         }
+
+        internal static bool HasMainLightShadowCullProviders =>
+            s_MainLightCullProviders.Count > 0;
 
         internal static void CullMainLightShadowCastersBatch(ExternalMainLightShadowCullBatchContext context)
         {

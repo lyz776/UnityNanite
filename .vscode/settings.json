@@ -68,5 +68,5 @@
         "*.slnx": "*.csproj"
     },
     "dotnet.defaultSolution": "UnityNanite.slnx",
-    "cmake.sourceDirectory": "C:/Users/lyz20/Unity/UnityNanite/Native/API_CPP"
+    "cmake.sourceDirectory": "${workspaceFolder}/Native/API_CPP"
 }

@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 using Unity.Profiling;
+using UnityEngine.Profiling;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
@@ -32,7 +34,7 @@ namespace Nanite
         enum FormalRasterizationMode
         {
             HardwareOnly = 0,
-            HybridReserved = 1
+            HybridSoftwareHardware = 1
         }
 
         enum PassKind
@@ -118,19 +120,19 @@ namespace Nanite
             public bool enableMaterialTileCulling = false;
             [Tooltip("Only register the tile classify pass when enough distinct materials can amortize its fixed dispatch cost.")]
             public bool adaptiveMaterialTileCulling = true;
-            [Tooltip("Minimum scene material count for adaptive tile classification. One or two materials are normally cheaper as direct fullscreen resolves.")]
-            [Min(1)] public int materialTileMinMaterialCount = 3;
+            [Tooltip("Minimum executed shader/texture bin count for adaptive tile classification. Materials folded into one compatible bin count once.")]
+            [Min(1)] public int materialTileMinMaterialCount = 2;
             [Tooltip("实例未移动时刷新 Light Probe SH 的间隔。0=只在移动时刷新；大场景建议 30~120。")]
             [Min(0)] public int lightProbeRefreshInterval = 30;
             [Header("GPU Page Pool")]
-            [Tooltip("Use NPG1/NZC1 for storage, then transcode each resident Page once into the aligned GPU geometry cache. Admission currently requires the complete Page set to fit; compatibility geometry remains the fallback.")]
+            [Tooltip("Use NPG1/NZC1 storage and transcode only resident Pages into the aligned GPU geometry cache. Root Pages stay pinned; finer Pages stream on GPU demand.")]
             public bool enablePackedPageRaster = true;
             [Tooltip("Diagnostic only: compile and select the direct NPG1 Page decode variant. Production keeps this disabled and reads only the resident geometry cache.")]
             public bool enablePackedDirectDiagnostic = false;
             [Tooltip("One-time GPU transcode from resident NPG1 Pages into aligned draw-time geometry. Required by the production packed Page path.")]
             public ComputeShader pageTranscodeShader;
-            [Tooltip("允许异步读回 Page 请求并上传非 root Page。Packed Page 尚未直接供光栅消费时应保持关闭，避免上传重复几何的纯开销。")]
-            public bool enablePageStreamingUploads = false;
+            [Tooltip("Asynchronously read GPU Page requests and upload non-root Pages. Required by demand-resident packed raster; no synchronous GetData is used.")]
+            public bool enablePageStreamingUploads = true;
             [Tooltip("Packed Page Pool hard budget. The runtime allocates only enough 256 KiB slots for the current scene up to this cap; root pages are permanently pinned.")]
             [Min(1)] public int pagePoolMaxMiB = 128;
             [Tooltip("Frames between asynchronous GPU Page request readbacks. No synchronous GetData is used.")]
@@ -147,7 +149,9 @@ namespace Nanite
             [Tooltip("全屏 DepthFill。全分辨率时 Raster 已写深度且 Merge 写 Stencil，默认关闭以省一次全屏 Pass。")]
             public bool enableFormalDepthFill = false;
             [Tooltip("软/硬光栅统一入口。当前仅硬光栅可用，Hybrid 为预留。")]
-            public int formalRasterizationMode = (int)FormalRasterizationMode.HardwareOnly;
+            public int formalRasterizationMode = (int)FormalRasterizationMode.HybridSoftwareHardware;
+            [Tooltip("Upper diameter guard for the HW/SW cost model. Software raster also requires conservative projected coverage <= one pixel per triangle; this Unity two-pass compatibility backend has a lower crossover than UE's native 64-bit atomic path.")]
+            [Range(4f, 64f)] public float hybridSoftwareMaxEdgePixels = 16f;
             public ComputeShader hzbBuilderShader;
             [Tooltip("全局批量剔除 Compute；留空则使用第一个启用 GPU Culling 的 Proxy 上的 shader。")]
             public ComputeShader gpuCullingShader;
@@ -291,6 +295,8 @@ namespace Nanite
             public static readonly int ClusterVisible = Shader.PropertyToID("_ClusterVisible");
             public static readonly int InstanceLocalToWorld = Shader.PropertyToID("_InstanceLocalToWorld");
             public static readonly int InstanceSubMeshMaterial = Shader.PropertyToID("_InstanceSubMeshMaterial");
+            public static readonly int InstanceMaterialRange = Shader.PropertyToID("_InstanceMaterialRange");
+            public static readonly int MaterialData = Shader.PropertyToID("_NaniteMaterialData");
             public static readonly int InstanceSh = Shader.PropertyToID("_InstanceSH");
             public static readonly int MaxSubMeshCount = Shader.PropertyToID("_MaxSubMeshCount");
             public static readonly int UseSceneInstanceBuffer = Shader.PropertyToID("_UseSceneInstanceBuffer");
@@ -304,9 +310,19 @@ namespace Nanite
             public static readonly int CompactedDrawClusters = Shader.PropertyToID("_CompactedDrawClusters");
             public static readonly int UseDirectVisibleDrawQueue = Shader.PropertyToID("_UseDirectVisibleDrawQueue");
             public static readonly int CompactedClusterTriangleSlots = Shader.PropertyToID("_CompactedClusterTriangleSlots");
+            public static readonly int CompactedClusterOffset = Shader.PropertyToID("_CompactedClusterOffset");
+            public static readonly int UseIndexedShadowDynamicSlice = Shader.PropertyToID("_UseIndexedShadowDynamicSlice");
+            public static readonly int IndexedShadowCascadeIndex = Shader.PropertyToID("_IndexedShadowCascadeIndex");
+            public static readonly int IndexedShadowSliceData = Shader.PropertyToID("_IndexedShadowSliceData");
             public static readonly int DebugVizMode = Shader.PropertyToID("_DebugVizMode");
             public static readonly int TileMaterialMask = Shader.PropertyToID("_TileMaterialMask");
+            public static readonly int TileMaterialBinList = Shader.PropertyToID("_TileMaterialBinList");
+            public static readonly int TileMaterialBinArgs = Shader.PropertyToID("_TileMaterialBinArgs");
+            public static readonly int UseCompactedTileBins = Shader.PropertyToID("_UseCompactedTileBins");
             public static readonly int ResolveMaterialId = Shader.PropertyToID("_ResolveMaterialId");
+            public static readonly int ResolveMaterialMode = Shader.PropertyToID("_ResolveMaterialMode");
+            public static readonly int ResolveMaterialFamily = Shader.PropertyToID("_ResolveMaterialFamily");
+            public static readonly int ResolveAbsorbedFamily = Shader.PropertyToID("_ResolveAbsorbedFamily");
             public static readonly int TileCountX = Shader.PropertyToID("_TileCountX");
             public static readonly int TileCountY = Shader.PropertyToID("_TileCountY");
             public static readonly int TileCount = Shader.PropertyToID("_TileCount");
@@ -344,6 +360,15 @@ namespace Nanite
             public static readonly int NaniteShadowViewProj = Shader.PropertyToID("_NaniteShadowViewProj");
             public static readonly int UseIndexedClusterRaster = Shader.PropertyToID("_UseIndexedClusterRaster");
             public static readonly int GeometryVertexCount = Shader.PropertyToID("_GeometryVertexCount");
+            public static readonly int NaniteSoftwareDepth = Shader.PropertyToID("_NaniteSoftwareDepth");
+            public static readonly int NaniteSoftwareWinner = Shader.PropertyToID("_NaniteSoftwareWinner");
+            public static readonly int NaniteSoftwareClusters = Shader.PropertyToID("_NaniteSoftwareClusters");
+            public static readonly int NaniteSoftwareTileList = Shader.PropertyToID("_NaniteSoftwareTileList");
+            public static readonly int NaniteSoftwareScreenWidth = Shader.PropertyToID("_NaniteSoftwareScreenWidth");
+            public static readonly int NaniteSoftwareScreenHeight = Shader.PropertyToID("_NaniteSoftwareScreenHeight");
+            public static readonly int NaniteSoftwareTileCountX = Shader.PropertyToID("_NaniteSoftwareTileCountX");
+            public static readonly int NaniteSoftwareTileSize = Shader.PropertyToID("_NaniteSoftwareTileSize");
+            public static readonly int NaniteSoftwareViewportOrigin = Shader.PropertyToID("_NaniteSoftwareViewportOrigin");
         }
 
         public Settings settings = new Settings();
@@ -372,6 +397,14 @@ namespace Nanite
         int kernelCompactFinalizeShadowQueues = -1;
         int kernelPrepareIndexedDrawQueue = -1;
         int kernelBuildIndexedDrawQueue = -1;
+        int kernelPrepareIndexedShadowDrawQueue = -1;
+        int kernelBuildIndexedShadowDrawQueue = -1;
+        int kernelPrepareHybridDispatch = -1;
+        int kernelClearHybridTileHeads = -1;
+        int kernelClearHybridTileWork = -1;
+        int kernelBuildHybridTileWork = -1;
+        int kernelSoftwareRasterTiles = -1;
+        int kernelClassifyHybridClusters = -1;
 
         const int kCompactSelectionFirst = 1;
         const int kCompactSelectionMerged = 2;
@@ -422,6 +455,182 @@ namespace Nanite
         int perfMaterialBatchAccum;
         double perfTileCoverageAccum;
         int perfTileCoverageSampleCount;
+        bool indexedAdmissionProbeRequested;
+        int indexedAdmissionProbeVersion;
+        int indexedAdmissionProbeWarmupVersion;
+        int indexedAdmissionProbeWarmupFrame;
+        int indexedAdmissionProbePending;
+        readonly uint[] indexedAdmissionProbeCounts = new uint[7];
+        int indexedAdmissionProbeShadowMask;
+        bool indexedAdmissionProbeFailed;
+        int indexedCameraChunkHint = 1;
+        int indexedHybridChunkHint = 1;
+        int lastAutomaticCullStatsFrame = -1;
+        // HZB is a conditional accelerator. A large scene does not justify an extra
+        // depth pass, pyramid build and second traversal when they reject nothing.
+        const int kHzbAdmissionProbeInterval = 10;
+        const int kHzbAdmissionSteadyInterval = 120;
+        const int kHzbAdmissionNoBenefitSamples = 3;
+        const int kHzbAdmissionCooldownFrames = 600;
+        const float kHzbAdmissionMinRejectRatio = 0.002f;
+        const int kHzbAdmissionMinRejectedClusters = 128;
+        bool hzbAdmissionAllowed = true;
+        bool hzbAdmissionProbeMode = true;
+        int hzbAdmissionCameraId;
+        int hzbAdmissionRegistryRevision = -1;
+        int hzbAdmissionGeometryGeneration = -1;
+        int hzbAdmissionWidth;
+        int hzbAdmissionHeight;
+        int hzbAdmissionResetFrame = -1;
+        int hzbAdmissionLastStatsFrame = -1;
+        int hzbAdmissionNoBenefitCount;
+        int hzbAdmissionDisabledUntilFrame = -1;
+        enum HzbCostProbePhase
+        {
+            MeasureEnabled,
+            MeasureDisabled,
+            SteadyEnabled,
+            SteadyDisabled
+        }
+        const int kHzbCostWarmupFrames = 8;
+        const int kHzbCostSampleCount = 12;
+        const int kHzbCostReprobeFrames = 600;
+        const double kHzbCostDecisionMarginMs = 0.05;
+        Recorder hzbWriteDepthGpuRecorder;
+        Recorder hzbBuildGpuRecorder;
+        Recorder hzbSecondCullGpuRecorder;
+        Recorder hzbFormalGpuRecorder;
+        HzbCostProbePhase hzbCostProbePhase = HzbCostProbePhase.MeasureEnabled;
+        int hzbCostPhaseStartFrame = -1;
+        int hzbCostSamples;
+        double hzbCostEnabledTotalMs;
+        double hzbCostEnabledFormalMs;
+        double hzbCostDisabledFormalMs;
+        double hzbCostLastEnabledMs;
+        double hzbCostLastDisabledMs;
+        sealed class HybridCostAdmissionState
+        {
+            internal bool steady;
+            internal bool testingEnabled = true;
+            internal bool allowed = true;
+            internal int phaseStartFrame = -1;
+            internal int samples;
+            internal double enabledTotalMs;
+            internal double disabledTotalMs;
+            internal double lastEnabledMs;
+            internal double lastDisabledMs;
+            internal int nextProbeFrame;
+
+            internal bool UseHybrid => steady ? allowed : testingEnabled;
+
+            internal void Reset(int frame)
+            {
+                steady = false;
+                testingEnabled = true;
+                allowed = true;
+                phaseStartFrame = frame;
+                samples = 0;
+                enabledTotalMs = 0.0;
+                disabledTotalMs = 0.0;
+                nextProbeFrame = 0;
+            }
+        }
+        const int kHybridCostWarmupFrames = 8;
+        const int kHybridCostSampleCount = 12;
+        const int kHybridCostReprobeFrames = 600;
+        const double kHybridCostDecisionMarginMs = 0.05;
+        readonly HybridCostAdmissionState cameraHybridCost = new HybridCostAdmissionState();
+        readonly HybridCostAdmissionState shadowHybridCost = new HybridCostAdmissionState();
+        Recorder hybridFormalGpuRecorder;
+        Recorder hybridShadowCullGpuRecorder;
+        Recorder hybridShadowDrawGpuRecorder;
+        int hybridCostCameraId;
+        int hybridCostRegistryRevision = -1;
+        int hybridCostGeometryGeneration = -1;
+        int hybridCostWidth;
+        int hybridCostHeight;
+        int hybridCostLastUpdateFrame = -1;
+        bool visibleLodAuditRequested;
+        int visibleLodAuditVersion;
+        ComputeBuffer hybridHardwareClusterBuffer;
+        ComputeBuffer hybridSoftwareClusterBuffer;
+        ComputeBuffer hybridHardwareCountArgsBuffer;
+        ComputeBuffer hybridSoftwareCountArgsBuffer;
+        ComputeBuffer hybridClassifyDispatchArgsBuffer;
+        ComputeBuffer hybridSoftwareDispatchArgsBuffer;
+        GraphicsBuffer hybridDependencyBuffer;
+        GraphicsBuffer hybridTraversalDependencyBuffer;
+        GraphicsBuffer hybridSoftwareTileHeadBuffer;
+        GraphicsBuffer hybridSoftwareTileNodeBuffer;
+        GraphicsBuffer hybridSoftwareTileNodeCounterBuffer;
+        GraphicsBuffer hybridSoftwareFallbackFlagsBuffer;
+        GraphicsBuffer hybridSoftwareTileListBuffer;
+        GraphicsBuffer hybridSoftwareTileCountArgsBuffer;
+        GraphicsBuffer hybridSoftwareTileDispatchArgsBuffer;
+        GraphicsBuffer hybridSoftwareTileDrawArgsBuffer;
+        int hybridSoftwareTileCapacity;
+        int hybridSoftwareTileNodeCapacity;
+        int hybridSoftwareFallbackCapacity;
+        RenderTexture hybridShadowSoftwareDepth;
+        RenderTexture hybridShadowWinnerFallback;
+        int hybridShadowTextureSize;
+        int hybridShadowReadyFrame = -1;
+        int hybridShadowReadyCascade = -1;
+        const int kHybridSoftwareTileSize = 16;
+        const int kHybridSoftwareTileNodesPerTile = 128;
+        sealed class RetiredHybridBuffers
+        {
+            internal ComputeBuffer hardwareClusters;
+            internal ComputeBuffer softwareClusters;
+            internal ComputeBuffer hardwareCountArgs;
+            internal ComputeBuffer softwareCountArgs;
+            internal ComputeBuffer classifyDispatchArgs;
+            internal ComputeBuffer softwareDispatchArgs;
+            internal GraphicsBuffer dependency;
+            internal int releaseFrame;
+
+            internal void Release()
+            {
+                hardwareClusters?.Release();
+                softwareClusters?.Release();
+                hardwareCountArgs?.Release();
+                softwareCountArgs?.Release();
+                classifyDispatchArgs?.Release();
+                softwareDispatchArgs?.Release();
+                dependency?.Dispose();
+            }
+        }
+        readonly List<RetiredHybridBuffers> retiredHybridBuffers = new List<RetiredHybridBuffers>(4);
+        sealed class RetiredHybridTileBuffers
+        {
+            internal GraphicsBuffer heads;
+            internal GraphicsBuffer nodes;
+            internal GraphicsBuffer nodeCounter;
+            internal GraphicsBuffer fallbackFlags;
+            internal GraphicsBuffer list;
+            internal GraphicsBuffer countArgs;
+            internal GraphicsBuffer dispatchArgs;
+            internal GraphicsBuffer drawArgs;
+            internal int releaseFrame;
+
+            internal void Release()
+            {
+                heads?.Dispose();
+                nodes?.Dispose();
+                nodeCounter?.Dispose();
+                fallbackFlags?.Dispose();
+                list?.Dispose();
+                countArgs?.Dispose();
+                dispatchArgs?.Dispose();
+                drawArgs?.Dispose();
+            }
+        }
+        readonly List<RetiredHybridTileBuffers> retiredHybridTileBuffers = new List<RetiredHybridTileBuffers>(2);
+        int hybridClusterCapacity;
+        int hybridGeometryGeneration = -1;
+        int hybridQueueFrame = -1;
+        int hybridQueueSelectionKey;
+        bool hybridUsesTraversalBins;
         Dictionary<int, CameraHzbState> cameraHzb = new Dictionary<int, CameraHzbState>();
         Dictionary<int, NaniteRuntimeSelection> firstSelections = new Dictionary<int, NaniteRuntimeSelection>();
         Dictionary<int, NaniteRuntimeSelection> secondSelections = new Dictionary<int, NaniteRuntimeSelection>();
@@ -429,7 +638,9 @@ namespace Nanite
         Dictionary<int, List<NaniteVisibleClusterRef>> mergedVisibleScratch = new Dictionary<int, List<NaniteVisibleClusterRef>>();
         Dictionary<int, HashSet<ulong>> mergedKeyScratch = new Dictionary<int, HashSet<ulong>>();
         GraphicsBuffer tileMaterialMaskBuffer;
+        GraphicsBuffer tileMaterialBinListBuffer;
         GraphicsBuffer tileIndirectArgsBuffer;
+        const int kMaterialTileBinCount = 64;
         int tileMaskCapacity;
         int tileCountX;
         int tileCountY;
@@ -438,7 +649,9 @@ namespace Nanite
         int lastGpuScenePrepareCameraId;
         int lastProxyStatsWritebackFrame = -1;
         int lastPipelineAdmissionFrame = -1;
+        readonly HashSet<int> warnedUnsupportedMaterialProxies = new HashSet<int>();
         int kernelMaterialTileClassify = -1;
+        int kernelClearMaterialTileBins = -1;
         LocalKeyword keywordCompactVBufferClassify;
         bool keywordCompactVBufferClassifyInitialized;
         bool loggedCompactVBufferUnsupported;
@@ -448,6 +661,7 @@ namespace Nanite
         GlobalKeyword keywordOutputDepth;
         bool copyDepthKeywordsInitialized;
         Func<Camera, Light, bool> externalMainLightShadowProvider;
+        Action<ExternalMainLightShadowCullContext> externalMainLightShadowCullProvider;
         Action<ExternalMainLightShadowCullBatchContext> externalMainLightShadowCullBatchProvider;
         Action<ExternalMainLightShadowDrawContext> externalMainLightShadowDrawProvider;
         readonly Matrix4x4[] shadowBatchViewMatrices = new Matrix4x4[4];
@@ -552,6 +766,14 @@ namespace Nanite
             kernelCompactFinalizeShadowQueues = -1;
             kernelPrepareIndexedDrawQueue = -1;
             kernelBuildIndexedDrawQueue = -1;
+            kernelPrepareIndexedShadowDrawQueue = -1;
+            kernelBuildIndexedShadowDrawQueue = -1;
+            kernelPrepareHybridDispatch = -1;
+            kernelClearHybridTileHeads = -1;
+            kernelClearHybridTileWork = -1;
+            kernelBuildHybridTileWork = -1;
+            kernelSoftwareRasterTiles = -1;
+            kernelClassifyHybridClusters = -1;
             if (settings.visibleTriangleCompactShader == null)
                 return;
             try
@@ -579,11 +801,33 @@ namespace Nanite
                 {
                     kernelPrepareIndexedDrawQueue = settings.visibleTriangleCompactShader.FindKernel("CSPrepareIndexedDrawQueue");
                     kernelBuildIndexedDrawQueue = settings.visibleTriangleCompactShader.FindKernel("CSBuildIndexedDrawQueue");
+                    kernelPrepareIndexedShadowDrawQueue = settings.visibleTriangleCompactShader.FindKernel("CSPrepareIndexedShadowDrawQueue");
+                    kernelBuildIndexedShadowDrawQueue = settings.visibleTriangleCompactShader.FindKernel("CSBuildIndexedShadowDrawQueue");
                 }
                 catch
                 {
                     kernelPrepareIndexedDrawQueue = -1;
                     kernelBuildIndexedDrawQueue = -1;
+                    kernelPrepareIndexedShadowDrawQueue = -1;
+                    kernelBuildIndexedShadowDrawQueue = -1;
+                }
+                try
+                {
+                    kernelClearHybridTileHeads = settings.visibleTriangleCompactShader.FindKernel("CSClearHybridTileHeads");
+                    kernelClearHybridTileWork = settings.visibleTriangleCompactShader.FindKernel("CSClearHybridTileWork");
+                    kernelBuildHybridTileWork = settings.visibleTriangleCompactShader.FindKernel("CSBuildHybridTileWork");
+                    kernelSoftwareRasterTiles = settings.visibleTriangleCompactShader.FindKernel("CSSoftwareRasterTiles");
+                    kernelPrepareHybridDispatch = settings.visibleTriangleCompactShader.FindKernel("CSPrepareHybridDispatch");
+                    kernelClassifyHybridClusters = settings.visibleTriangleCompactShader.FindKernel("CSClassifyHybridClusters");
+                }
+                catch
+                {
+                    kernelClearHybridTileHeads = -1;
+                    kernelClearHybridTileWork = -1;
+                    kernelBuildHybridTileWork = -1;
+                    kernelSoftwareRasterTiles = -1;
+                    kernelPrepareHybridDispatch = -1;
+                    kernelClassifyHybridClusters = -1;
                 }
             }
             catch
@@ -595,6 +839,14 @@ namespace Nanite
                 kernelCompactFinalizeShadowQueues = -1;
                 kernelPrepareIndexedDrawQueue = -1;
                 kernelBuildIndexedDrawQueue = -1;
+                kernelPrepareIndexedShadowDrawQueue = -1;
+                kernelBuildIndexedShadowDrawQueue = -1;
+                kernelPrepareHybridDispatch = -1;
+                kernelClearHybridTileHeads = -1;
+                kernelClearHybridTileWork = -1;
+                kernelBuildHybridTileWork = -1;
+                kernelSoftwareRasterTiles = -1;
+                kernelClassifyHybridClusters = -1;
             }
         }
 
@@ -804,6 +1056,10 @@ namespace Nanite
         {
             internal Camera camera;
             internal int selectionKey;
+            internal int clusterOffset;
+            internal bool allowProceduralFallback;
+            internal ComputeBuffer drawClusters;
+            internal ComputeBuffer drawCountArgs;
         }
 
         void RecordVisibleTriangleCompactPass(
@@ -828,13 +1084,19 @@ namespace Nanite
                     EnsureVisibleTrianglesCompacted(context.cmd, data.camera, selections, data.selectionKey);
                 });
             }
+
         }
 
         void RecordIndexedDrawBuildPass(
             RenderGraph renderGraph,
             Camera camera,
             int selectionKey,
-            ProfilingSampler profilingSampler)
+            ProfilingSampler profilingSampler,
+            int clusterOffset = 0,
+            bool allowProceduralFallback = true,
+            ComputeBuffer drawClusters = null,
+            ComputeBuffer drawCountArgs = null,
+            GraphicsBuffer dependencyBuffer = null)
         {
             if (!settings.enableIndexedClusterRaster || camera == null)
                 return;
@@ -846,11 +1108,24 @@ namespace Nanite
             {
                 passData.camera = camera;
                 passData.selectionKey = selectionKey;
+                passData.clusterOffset = clusterOffset;
+                passData.allowProceduralFallback = allowProceduralFallback;
+                passData.drawClusters = drawClusters;
+                passData.drawCountArgs = drawCountArgs;
                 builder.AllowPassCulling(false);
                 builder.AllowGlobalStateModification(true);
+                if (dependencyBuffer != null)
+                    builder.UseBuffer(renderGraph.ImportBuffer(dependencyBuffer), AccessFlags.Read);
                 builder.SetRenderFunc((CompactRgPassData data, UnsafeGraphContext context) =>
                 {
-                    TryBuildCameraIndexedDraw(context.cmd, data.camera, data.selectionKey);
+                    TryBuildCameraIndexedDraw(
+                        context.cmd,
+                        data.camera,
+                        data.selectionKey,
+                        data.clusterOffset,
+                        data.allowProceduralFallback,
+                        data.drawClusters,
+                        data.drawCountArgs);
                 });
             }
         }
@@ -903,6 +1178,8 @@ namespace Nanite
             if (!CanRunForCamera(ref renderingData))
                 return;
 
+            UpdateHzbBenefitAdmission(renderingData.cameraData.camera);
+            UpdateHybridCostAdmission(renderingData.cameraData.camera);
             SyncPassEvents();
             recordedHzbDepthSource = TextureHandle.nullHandle;
             NaniteRuntimeRegistry.MarkFeatureDrivenFrame();
@@ -990,33 +1267,213 @@ namespace Nanite
             return true;
         }
 
+
         bool TryBuildCameraIndexedDraw(
             UnsafeCommandBuffer cmd,
             Camera camera,
-            int selectionKey)
+            int selectionKey,
+            int clusterOffset = 0,
+            bool allowProceduralFallback = true,
+            ComputeBuffer drawClusters = null,
+            ComputeBuffer drawCountArgs = null)
         {
+            bool useOverrideQueue = drawClusters != null && drawCountArgs != null;
             if (!settings.enableIndexedClusterRaster || cmd == null || camera == null ||
                 sceneVisibilityBackend == null || !sceneVisibilityBackend.IndexedDrawAvailable ||
                 batchedCulling == null || !lastCompactUsedDirectQueue ||
                 !HasValidCompactForSelection(selectionKey) ||
-                !batchedCulling.IsVisibleDrawQueueReady(camera) ||
+                (!useOverrideQueue && !batchedCulling.IsVisibleDrawQueueReady(camera)) ||
                 kernelPrepareIndexedDrawQueue < 0 || kernelBuildIndexedDrawQueue < 0)
                 return false;
+
+            drawClusters ??= batchedCulling.VisibleDrawClusterBuffer;
+            drawCountArgs ??= batchedCulling.VisibleDrawCountArgsBuffer;
 
             bool built = sceneVisibilityBackend.DispatchIndexedDrawQueue(
                 cmd,
                 settings.visibleTriangleCompactShader,
                 kernelPrepareIndexedDrawQueue,
                 kernelBuildIndexedDrawQueue,
-                batchedCulling.VisibleDrawClusterBuffer,
-                batchedCulling.VisibleDrawCountArgsBuffer);
+                drawClusters,
+                drawCountArgs,
+                -1,
+                clusterOffset,
+                allowProceduralFallback);
             if (built)
             {
                 lastIndexedDrawFrame = Time.frameCount;
                 lastIndexedDrawSelectionKey = selectionKey;
                 lastIndexedDrawGeometryGeneration = sceneVisibilityBackend.GeometryGeneration;
+                RequestIndexedAdmissionProbeOnce(cmd);
             }
             return built;
+        }
+
+        void RequestIndexedAdmissionProbeOnce(UnsafeCommandBuffer cmd)
+        {
+            const int probeVersion = 16;
+            if (indexedAdmissionProbeWarmupVersion != probeVersion)
+            {
+                indexedAdmissionProbeWarmupVersion = probeVersion;
+                indexedAdmissionProbeWarmupFrame = Time.frameCount + 32;
+                return;
+            }
+            if (Time.frameCount < indexedAdmissionProbeWarmupFrame)
+                return;
+            if ((indexedAdmissionProbeRequested && indexedAdmissionProbeVersion == probeVersion) ||
+                cmd == null || batchedCulling == null ||
+                sceneVisibilityBackend == null || batchedCulling.InstanceCount < 100)
+                return;
+
+            ComputeBuffer cameraCount = batchedCulling.VisibleDrawCountArgsBuffer;
+            if (cameraCount == null)
+                return;
+            indexedAdmissionProbeRequested = true;
+            indexedAdmissionProbeVersion = probeVersion;
+            indexedAdmissionProbePending = 1;
+            indexedAdmissionProbeShadowMask = 0;
+            indexedAdmissionProbeFailed = false;
+            RequestIndexedAdmissionCount(cmd, cameraCount, 0);
+            for (int cascade = 0; cascade < 4; cascade++)
+            {
+                ComputeBuffer shadowCount = batchedCulling.GetShadowDrawCountArgsBuffer(cascade);
+                if (shadowCount == null)
+                    continue;
+                indexedAdmissionProbePending++;
+                indexedAdmissionProbeShadowMask |= 1 << cascade;
+                RequestIndexedAdmissionCount(cmd, shadowCount, cascade + 1);
+            }
+            if (batchedCulling.HardwareRasterCountArgsBuffer != null)
+            {
+                indexedAdmissionProbePending++;
+                RequestIndexedAdmissionCount(cmd, batchedCulling.HardwareRasterCountArgsBuffer, 5);
+            }
+            if (batchedCulling.SoftwareRasterCountArgsBuffer != null)
+            {
+                indexedAdmissionProbePending++;
+                RequestIndexedAdmissionCount(cmd, batchedCulling.SoftwareRasterCountArgsBuffer, 6);
+            }
+        }
+
+        void RequestIndexedAdmissionCount(UnsafeCommandBuffer cmd, ComputeBuffer buffer, int slot)
+        {
+            cmd.RequestAsyncReadback(buffer, sizeof(uint), 0, request =>
+            {
+                if (request.hasError || request.GetData<uint>().Length == 0)
+                    indexedAdmissionProbeFailed = true;
+                else
+                    indexedAdmissionProbeCounts[slot] = request.GetData<uint>()[0];
+
+                indexedAdmissionProbePending--;
+                if (indexedAdmissionProbePending != 0)
+                    return;
+
+                if (indexedAdmissionProbeFailed || sceneVisibilityBackend == null)
+                {
+                    Debug.LogWarning("[Nanite][IndexedAdmissionProbe] asynchronous count readback failed.");
+                    return;
+                }
+
+                int cameraCapacity = sceneVisibilityBackend.IndexedDrawClusterCapacity;
+                indexedCameraChunkHint = Mathf.Clamp(
+                    Mathf.CeilToInt(indexedAdmissionProbeCounts[0] / (float)Mathf.Max(1, cameraCapacity)),
+                    1,
+                    16);
+                indexedHybridChunkHint = Mathf.Clamp(
+                    Mathf.CeilToInt(indexedAdmissionProbeCounts[5] / (float)Mathf.Max(1, cameraCapacity)),
+                    1,
+                    16);
+                uint shadowMax = 0;
+                for (int cascade = 0; cascade < 4; cascade++)
+                {
+                    if ((indexedAdmissionProbeShadowMask & (1 << cascade)) != 0)
+                        shadowMax = Math.Max(shadowMax, indexedAdmissionProbeCounts[cascade + 1]);
+                }
+                string message =
+                    "[Nanite][IndexedAdmissionProbe] " +
+                    $"camera={indexedAdmissionProbeCounts[0]}/{cameraCapacity}:" +
+                    $"indexedChunks={indexedCameraChunkHint}, " +
+                    $"shadowReuseMax={shadowMax}/{cameraCapacity}:" +
+                    $"{(shadowMax <= (uint)cameraCapacity ? "all-indexed" : "indexed+procedural-tail")}, " +
+                    $"hybrid=hw:{indexedAdmissionProbeCounts[5]},sw:{indexedAdmissionProbeCounts[6]}";
+                for (int cascade = 0; cascade < 4; cascade++)
+                {
+                    if ((indexedAdmissionProbeShadowMask & (1 << cascade)) == 0)
+                        continue;
+                    uint count = indexedAdmissionProbeCounts[cascade + 1];
+                    message += $", shadow{cascade}={count}";
+                }
+                Debug.Log(message + ".");
+                RequestVisibleLodAuditOnce(indexedAdmissionProbeCounts[0]);
+            });
+        }
+
+        void RequestVisibleLodAuditOnce(uint expectedVisibleClusters)
+        {
+            const int auditVersion = 9;
+            if ((visibleLodAuditRequested && visibleLodAuditVersion == auditVersion) ||
+                expectedVisibleClusters == 0u ||
+                batchedCulling == null || sceneVisibilityBackend == null)
+                return;
+            ComputeBuffer queue = batchedCulling.VisibleDrawClusterBuffer;
+            if (queue == null)
+                return;
+
+            visibleLodAuditRequested = true;
+            visibleLodAuditVersion = auditVersion;
+            AsyncGPUReadback.Request(queue, request =>
+            {
+                if (request.hasError || sceneVisibilityBackend == null)
+                {
+                    Debug.LogWarning("[Nanite][VisibleLodAudit] asynchronous queue readback failed.");
+                    return;
+                }
+
+                var data = request.GetData<uint>();
+                int availableEntries = data.Length / 3;
+                int entryCount = Mathf.Min(availableEntries, checked((int)expectedVisibleClusters));
+                const int binCount = 32;
+                var clusterBins = new int[binCount];
+                var triangleBins = new ulong[binCount];
+                int unmapped = 0;
+                ulong totalTriangles = 0;
+                for (int entry = 0; entry < entryCount; entry++)
+                {
+                    int baseIndex = entry * 3;
+                    uint firstTriangle = data[baseIndex];
+                    uint triangleCount = data[baseIndex + 1];
+                    if (!sceneVisibilityBackend.TryGetGeometryMipForFirstTriangle(firstTriangle, out int mip))
+                    {
+                        unmapped++;
+                        continue;
+                    }
+
+                    int bin = Mathf.Clamp(mip, 0, binCount - 1);
+                    clusterBins[bin]++;
+                    triangleBins[bin] += triangleCount;
+                    totalTriangles += triangleCount;
+                }
+
+                var message = new StringBuilder(512);
+                message.Append("[Nanite][VisibleLodAudit] camera clusters=")
+                    .Append(entryCount)
+                    .Append(" triangles=")
+                    .Append(totalTriangles)
+                    .Append(" unmapped=")
+                    .Append(unmapped)
+                    .Append(" | ");
+                for (int mip = 0; mip < binCount; mip++)
+                {
+                    if (clusterBins[mip] == 0)
+                        continue;
+                    message.Append("mip").Append(mip)
+                        .Append('=')
+                        .Append(clusterBins[mip])
+                        .Append('c').Append('/')
+                        .Append(triangleBins[mip]).Append("t; ");
+                }
+                Debug.Log(message.ToString());
+            });
         }
 
         bool HasValidIndexedDraw(int selectionKey)
@@ -1049,12 +1506,365 @@ namespace Nanite
                 return false;
 
             int minClusters = Mathf.Max(0, settings.hzbMinClusterCount);
-            return minClusters <= 0 || sceneVisibilityBackend.ClusterCount >= minClusters;
+            bool largeEnough = minClusters <= 0 || sceneVisibilityBackend.ClusterCount >= minClusters;
+            return largeEnough && hzbAdmissionAllowed;
+        }
+
+        bool EnsureHzbCostRecorders()
+        {
+            hzbWriteDepthGpuRecorder ??= Recorder.Get("Nanite/WriteDepth");
+            hzbBuildGpuRecorder ??= Recorder.Get("Nanite/BuildHzb");
+            hzbSecondCullGpuRecorder ??= Recorder.Get("Nanite/SecondCull");
+            hzbFormalGpuRecorder ??= Recorder.Get("Nanite/FormalVisibility");
+            Recorder[] recorders =
+            {
+                hzbWriteDepthGpuRecorder,
+                hzbBuildGpuRecorder,
+                hzbSecondCullGpuRecorder,
+                hzbFormalGpuRecorder
+            };
+            for (int i = 0; i < recorders.Length; i++)
+            {
+                Recorder recorder = recorders[i];
+                if (recorder == null || !recorder.isValid)
+                    return false;
+                recorder.enabled = true;
+            }
+            return true;
+        }
+
+        static double RecorderGpuMs(Recorder recorder)
+        {
+            if (recorder == null || !recorder.isValid || recorder.gpuSampleBlockCount <= 0)
+                return -1.0;
+            return recorder.gpuElapsedNanoseconds * 1e-6;
+        }
+
+        bool EnsureHybridCostRecorders()
+        {
+            hybridFormalGpuRecorder ??= Recorder.Get("Nanite/FormalVisibility");
+            hybridShadowCullGpuRecorder ??= Recorder.Get("Nanite Main Light Shadow Cull");
+            hybridShadowDrawGpuRecorder ??= Recorder.Get("Draw Main Light Shadowmap");
+            Recorder[] recorders =
+            {
+                hybridFormalGpuRecorder,
+                hybridShadowCullGpuRecorder,
+                hybridShadowDrawGpuRecorder
+            };
+            for (int i = 0; i < recorders.Length; i++)
+            {
+                if (recorders[i] == null || !recorders[i].isValid)
+                    return false;
+                recorders[i].enabled = true;
+            }
+            return true;
+        }
+
+        static void AdvanceHybridCostProbe(
+            HybridCostAdmissionState state,
+            double gpuMs,
+            string label)
+        {
+            int frame = Time.frameCount;
+            if (state.phaseStartFrame < 0)
+                state.Reset(frame);
+            if (state.steady)
+            {
+                if (frame < state.nextProbeFrame)
+                    return;
+                state.Reset(frame);
+                return;
+            }
+            if (frame - state.phaseStartFrame < kHybridCostWarmupFrames || gpuMs < 0.0)
+                return;
+
+            if (state.testingEnabled)
+                state.enabledTotalMs += gpuMs;
+            else
+                state.disabledTotalMs += gpuMs;
+            state.samples++;
+            if (state.samples < kHybridCostSampleCount)
+                return;
+
+            if (state.testingEnabled)
+            {
+                state.lastEnabledMs = state.enabledTotalMs / state.samples;
+                state.testingEnabled = false;
+                state.samples = 0;
+                state.phaseStartFrame = frame;
+                return;
+            }
+
+            state.lastDisabledMs = state.disabledTotalMs / state.samples;
+            state.allowed = state.lastEnabledMs + kHybridCostDecisionMarginMs < state.lastDisabledMs;
+            state.steady = true;
+            state.nextProbeFrame = frame + kHybridCostReprobeFrames;
+            Debug.Log(
+                $"[Nanite][HybridCostProbe] {label}: hybrid={state.lastEnabledMs:F3} ms, " +
+                $"hardwareOnly={state.lastDisabledMs:F3} ms, " +
+                $"decision={(state.allowed ? "hybrid" : "hardware-only")}; " +
+                "production will reprobe after 600 frames.");
+        }
+
+        void UpdateHybridCostAdmission(Camera camera)
+        {
+            if (camera == null || camera.cameraType != CameraType.Game ||
+                !IsFormalVisibilityEnabled() || !IsHybridConfigured() ||
+                !EnsureHybridCostRecorders() || hybridCostLastUpdateFrame == Time.frameCount)
+                return;
+            bool hzbCostStable = hzbCostProbePhase == HzbCostProbePhase.SteadyEnabled ||
+                                 hzbCostProbePhase == HzbCostProbePhase.SteadyDisabled;
+            if (settings.useHzbCulling && settings.adaptiveHzbCulling && !hzbCostStable)
+                return;
+            hybridCostLastUpdateFrame = Time.frameCount;
+
+            int registryRevision = NaniteRuntimeRegistry.Revision;
+            int geometryGeneration = sceneVisibilityBackend != null
+                ? sceneVisibilityBackend.GeometryGeneration
+                : -1;
+            int cameraId = camera.GetInstanceID();
+            int width = Mathf.Max(1, camera.pixelWidth);
+            int height = Mathf.Max(1, camera.pixelHeight);
+            bool reset = hybridCostCameraId != cameraId ||
+                         hybridCostRegistryRevision != registryRevision ||
+                         hybridCostGeometryGeneration != geometryGeneration ||
+                         hybridCostWidth != width || hybridCostHeight != height;
+            if (reset)
+            {
+                hybridCostCameraId = cameraId;
+                hybridCostRegistryRevision = registryRevision;
+                hybridCostGeometryGeneration = geometryGeneration;
+                hybridCostWidth = width;
+                hybridCostHeight = height;
+                cameraHybridCost.Reset(Time.frameCount);
+                shadowHybridCost.Reset(Time.frameCount);
+            }
+
+            AdvanceHybridCostProbe(
+                cameraHybridCost,
+                RecorderGpuMs(hybridFormalGpuRecorder),
+                "camera");
+            double shadowCullMs = RecorderGpuMs(hybridShadowCullGpuRecorder);
+            double shadowDrawMs = RecorderGpuMs(hybridShadowDrawGpuRecorder);
+            AdvanceHybridCostProbe(
+                shadowHybridCost,
+                shadowCullMs >= 0.0 && shadowDrawMs >= 0.0
+                    ? shadowCullMs + shadowDrawMs
+                    : -1.0,
+                "four-cascade-shadow");
+        }
+
+        void ResetHzbCostProbe()
+        {
+            hzbCostProbePhase = HzbCostProbePhase.MeasureEnabled;
+            hzbCostPhaseStartFrame = Time.frameCount;
+            hzbCostSamples = 0;
+            hzbCostEnabledTotalMs = 0.0;
+            hzbCostEnabledFormalMs = 0.0;
+            hzbCostDisabledFormalMs = 0.0;
+            hzbAdmissionAllowed = true;
+            hzbAdmissionProbeMode = true;
+        }
+
+        void BeginHzbCostPhase(HzbCostProbePhase phase, bool enabled)
+        {
+            hzbCostProbePhase = phase;
+            hzbCostPhaseStartFrame = Time.frameCount;
+            hzbCostSamples = 0;
+            hzbAdmissionAllowed = enabled;
+            hzbAdmissionProbeMode = phase == HzbCostProbePhase.MeasureEnabled ||
+                                    phase == HzbCostProbePhase.MeasureDisabled;
+        }
+
+        bool UpdateHzbCostAdmission()
+        {
+            if (!IsFormalVisibilityEnabled() || !EnsureHzbCostRecorders())
+                return false;
+
+            if (hzbCostPhaseStartFrame < 0)
+                ResetHzbCostProbe();
+
+            if (hzbCostProbePhase == HzbCostProbePhase.SteadyEnabled ||
+                hzbCostProbePhase == HzbCostProbePhase.SteadyDisabled)
+            {
+                bool enabled = hzbCostProbePhase == HzbCostProbePhase.SteadyEnabled;
+                hzbAdmissionAllowed = enabled;
+                hzbAdmissionProbeMode = false;
+                if (Time.frameCount - hzbCostPhaseStartFrame >= kHzbCostReprobeFrames)
+                    ResetHzbCostProbe();
+                return true;
+            }
+
+            bool measuringEnabled = hzbCostProbePhase == HzbCostProbePhase.MeasureEnabled;
+            hzbAdmissionAllowed = measuringEnabled;
+            hzbAdmissionProbeMode = true;
+            // Recorder GPU values arrive three frames late. Waiting eight stable
+            // frames after every mode switch prevents cross-contamination.
+            if (Time.frameCount - hzbCostPhaseStartFrame < kHzbCostWarmupFrames)
+                return true;
+
+            double formalMs = RecorderGpuMs(hzbFormalGpuRecorder);
+            if (formalMs < 0.0)
+                return true;
+
+            if (measuringEnabled)
+            {
+                double writeDepthMs = RecorderGpuMs(hzbWriteDepthGpuRecorder);
+                double buildMs = RecorderGpuMs(hzbBuildGpuRecorder);
+                double secondCullMs = RecorderGpuMs(hzbSecondCullGpuRecorder);
+                if (writeDepthMs < 0.0 || buildMs < 0.0 || secondCullMs < 0.0)
+                    return true;
+                hzbCostEnabledTotalMs += formalMs + writeDepthMs + buildMs + secondCullMs;
+                hzbCostEnabledFormalMs += formalMs;
+            }
+            else
+            {
+                hzbCostDisabledFormalMs += formalMs;
+            }
+
+            hzbCostSamples++;
+            if (hzbCostSamples < kHzbCostSampleCount)
+                return true;
+
+            if (measuringEnabled)
+            {
+                BeginHzbCostPhase(HzbCostProbePhase.MeasureDisabled, false);
+                return true;
+            }
+
+            hzbCostLastEnabledMs = hzbCostEnabledTotalMs / kHzbCostSampleCount;
+            hzbCostLastDisabledMs = hzbCostDisabledFormalMs / kHzbCostSampleCount;
+            bool netWin = hzbCostLastEnabledMs + kHzbCostDecisionMarginMs < hzbCostLastDisabledMs;
+            BeginHzbCostPhase(
+                netWin ? HzbCostProbePhase.SteadyEnabled : HzbCostProbePhase.SteadyDisabled,
+                netWin);
+            Debug.Log(
+                $"[Nanite][HZBCost] enabledTotal={hzbCostLastEnabledMs:0.###}ms " +
+                $"(formal={hzbCostEnabledFormalMs / kHzbCostSampleCount:0.###}ms), " +
+                $"disabledFormal={hzbCostLastDisabledMs:0.###}ms, " +
+                $"decision={(netWin ? "enabled" : "disabled")}. " +
+                "GPU timings are sampled asynchronously; no readback stall is used.");
+            return true;
+        }
+
+        void UpdateHzbBenefitAdmission(Camera camera)
+        {
+            if (camera == null || camera.cameraType != CameraType.Game ||
+                !settings.useHzbCulling || !settings.adaptiveHzbCulling)
+                return;
+
+            int cameraId = camera.GetInstanceID();
+            int registryRevision = NaniteRuntimeRegistry.Revision;
+            int geometryGeneration = sceneVisibilityBackend != null
+                ? sceneVisibilityBackend.GeometryGeneration
+                : -1;
+            int width = Mathf.Max(1, camera.pixelWidth);
+            int height = Mathf.Max(1, camera.pixelHeight);
+            bool resolutionChanged = hzbAdmissionWidth <= 0 || hzbAdmissionHeight <= 0 ||
+                                     Mathf.Abs(width - hzbAdmissionWidth) > Mathf.Max(32, hzbAdmissionWidth / 8) ||
+                                     Mathf.Abs(height - hzbAdmissionHeight) > Mathf.Max(32, hzbAdmissionHeight / 8);
+            bool identityChanged = hzbAdmissionCameraId != cameraId ||
+                                   hzbAdmissionRegistryRevision != registryRevision ||
+                                   hzbAdmissionGeometryGeneration != geometryGeneration ||
+                                   resolutionChanged;
+            if (identityChanged)
+            {
+                hzbAdmissionCameraId = cameraId;
+                hzbAdmissionRegistryRevision = registryRevision;
+                hzbAdmissionGeometryGeneration = geometryGeneration;
+                hzbAdmissionWidth = width;
+                hzbAdmissionHeight = height;
+                hzbAdmissionResetFrame = Time.frameCount;
+                hzbAdmissionLastStatsFrame = batchedCulling != null
+                    ? batchedCulling.LastCullStatsReadbackFrame
+                    : -1;
+                hzbAdmissionNoBenefitCount = 0;
+                hzbAdmissionDisabledUntilFrame = -1;
+                hzbAdmissionAllowed = true;
+                hzbAdmissionProbeMode = true;
+                ResetHzbCostProbe();
+                InvalidateHzbHistory(cameraId);
+                return;
+            }
+
+            // Prefer an actual end-to-end GPU cost comparison over a rejected
+            // cluster count. The latter is only a fallback on platforms where
+            // GPU marker timing is unavailable.
+            if (UpdateHzbCostAdmission())
+                return;
+
+            if (!hzbAdmissionAllowed)
+            {
+                if (Time.frameCount < hzbAdmissionDisabledUntilFrame)
+                    return;
+
+                // Periodically re-enable the full path long enough for fresh asynchronous
+                // Pass2 samples, so entering an occluded view can re-admit HZB.
+                hzbAdmissionAllowed = true;
+                hzbAdmissionProbeMode = true;
+                hzbAdmissionNoBenefitCount = 0;
+                hzbAdmissionResetFrame = Time.frameCount;
+                hzbAdmissionLastStatsFrame = batchedCulling != null
+                    ? batchedCulling.LastCullStatsReadbackFrame
+                    : -1;
+                InvalidateHzbHistory(cameraId);
+                return;
+            }
+
+            if (batchedCulling == null || batchedCulling.LastCullStatsCameraId != cameraId)
+                return;
+
+            int sampleFrame = batchedCulling.LastCullStatsReadbackFrame;
+            if (sampleFrame < hzbAdmissionResetFrame || sampleFrame == hzbAdmissionLastStatsFrame)
+                return;
+            hzbAdmissionLastStatsFrame = sampleFrame;
+
+            int pass1Drawn = Mathf.Max(0, batchedCulling.LastCull1Drawn);
+            int pass2Candidates = Mathf.Max(0, batchedCulling.LastCull2Candidates);
+            int pass2Recovered = Mathf.Max(0, batchedCulling.LastCull2Drawn);
+            int finallyRejected = Mathf.Max(0, pass2Candidates - pass2Recovered);
+            int testedPopulation = Mathf.Max(1, pass1Drawn + pass2Candidates);
+            float rejectRatio = finallyRejected / (float)testedPopulation;
+            bool hasMaterialBenefit = finallyRejected >= kHzbAdmissionMinRejectedClusters &&
+                                      rejectRatio >= kHzbAdmissionMinRejectRatio;
+            if (hasMaterialBenefit)
+            {
+                hzbAdmissionNoBenefitCount = 0;
+                hzbAdmissionProbeMode = false;
+            }
+            else
+            {
+                hzbAdmissionNoBenefitCount++;
+                hzbAdmissionProbeMode = true;
+            }
+
+            if (hzbAdmissionNoBenefitCount < kHzbAdmissionNoBenefitSamples)
+                return;
+
+            hzbAdmissionAllowed = false;
+            hzbAdmissionProbeMode = false;
+            hzbAdmissionDisabledUntilFrame = Time.frameCount + kHzbAdmissionCooldownFrames;
+        }
+
+        void InvalidateHzbHistory(int cameraId)
+        {
+            if (cameraHzb == null || !cameraHzb.TryGetValue(cameraId, out var state) || state == null)
+                return;
+            state.hasPrevious = false;
+            state.builtFrame = -1;
+            state.currentHzbValid = false;
         }
 
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
+            DisableGpuRecorder(ref hzbWriteDepthGpuRecorder);
+            DisableGpuRecorder(ref hzbBuildGpuRecorder);
+            DisableGpuRecorder(ref hzbSecondCullGpuRecorder);
+            DisableGpuRecorder(ref hzbFormalGpuRecorder);
+            DisableGpuRecorder(ref hybridFormalGpuRecorder);
+            DisableGpuRecorder(ref hybridShadowCullGpuRecorder);
+            DisableGpuRecorder(ref hybridShadowDrawGpuRecorder);
             if (externalMainLightShadowProvider != null)
             {
                 ExternalShadowCasterRegistry.UnregisterMainLightProvider(externalMainLightShadowProvider);
@@ -1070,6 +1880,11 @@ namespace Nanite
                 ExternalShadowCasterRegistry.UnregisterMainLightCullBatchProvider(externalMainLightShadowCullBatchProvider);
                 externalMainLightShadowCullBatchProvider = null;
             }
+            if (externalMainLightShadowCullProvider != null)
+            {
+                ExternalShadowCasterRegistry.UnregisterMainLightCullProvider(externalMainLightShadowCullProvider);
+                externalMainLightShadowCullProvider = null;
+            }
             if (cameraHzb != null)
             {
                 foreach (var kv in cameraHzb)
@@ -1081,6 +1896,7 @@ namespace Nanite
             batchedCulling = null;
             sceneVisibilityBackend?.Dispose();
             sceneVisibilityBackend = null;
+            ReleaseHybridBuffers();
             ReleaseFormalBuffers();
             loggedExecutionOnce = false;
             loggedVBufferOnce = false;
@@ -1139,12 +1955,21 @@ namespace Nanite
             return false;
         }
 
+        static void DisableGpuRecorder(ref Recorder recorder)
+        {
+            if (recorder != null && recorder.isValid)
+                recorder.enabled = false;
+            recorder = null;
+        }
+
         void EnsureExternalShadowProviderRegistered()
         {
             externalMainLightShadowProvider ??= HasExternalMainLightShadowCasters;
             ExternalShadowCasterRegistry.RegisterMainLightProvider(externalMainLightShadowProvider);
             externalMainLightShadowCullBatchProvider ??= CullExternalMainLightShadowCastersBatch;
             ExternalShadowCasterRegistry.RegisterMainLightCullBatchProvider(externalMainLightShadowCullBatchProvider);
+            externalMainLightShadowCullProvider ??= BuildExternalMainLightShadowCascade;
+            ExternalShadowCasterRegistry.RegisterMainLightCullProvider(externalMainLightShadowCullProvider);
             externalMainLightShadowDrawProvider ??= DrawExternalMainLightShadowCasters;
             ExternalShadowCasterRegistry.RegisterMainLightDrawProvider(externalMainLightShadowDrawProvider);
         }
@@ -1205,6 +2030,7 @@ namespace Nanite
                 shadowBatchProjectionMatrices[cascadeIndex] = slice.projectionMatrix;
                 shadowBatchResolutions[cascadeIndex] = slice.resolution;
             }
+            Vector3 shadowRayDirection = context.shadowLight.localToWorldMatrix.GetColumn(2);
 
             using (kShadowCullRecordMarker.Auto())
             {
@@ -1214,7 +2040,8 @@ namespace Nanite
                     activeCascadeCount,
                     shadowBatchViewMatrices,
                     shadowBatchProjectionMatrices,
-                    shadowBatchResolutions);
+                    shadowBatchResolutions,
+                    shadowRayDirection);
                 if (!recorded)
                 {
                     recorded = true;
@@ -1226,7 +2053,8 @@ namespace Nanite
                                 cascadeIndex,
                                 shadowBatchViewMatrices[cascadeIndex],
                                 shadowBatchProjectionMatrices[cascadeIndex],
-                                shadowBatchResolutions[cascadeIndex]))
+                                shadowBatchResolutions[cascadeIndex],
+                                shadowRayDirection))
                         {
                             recorded = false;
                             break;
@@ -1255,24 +2083,276 @@ namespace Nanite
                     }
                 }
 
-                if (settings.enableIndexedClusterRaster &&
-                    sceneVisibilityBackend.IndexedDrawAvailable &&
-                    kernelPrepareIndexedDrawQueue >= 0 &&
-                    kernelBuildIndexedDrawQueue >= 0)
-                {
-                    for (int cascadeIndex = 0; cascadeIndex < activeCascadeCount; cascadeIndex++)
-                    {
-                        sceneVisibilityBackend.DispatchIndexedDrawQueue(
-                            context.commandBuffer,
-                            settings.visibleTriangleCompactShader,
-                            kernelPrepareIndexedDrawQueue,
-                            kernelBuildIndexedDrawQueue,
-                            batchedCulling.GetShadowDrawClusterBuffer(cascadeIndex),
-                            batchedCulling.GetShadowDrawCountArgsBuffer(cascadeIndex),
-                            cascadeIndex);
-                    }
-                }
             }
+        }
+
+        bool EnsureHybridShadowResources(int shadowResolution)
+        {
+            if (!IsShadowHybridRequested() || shadowResolution <= 0 ||
+                !EnsureHybridClusterBuffers() ||
+                !EnsureHybridSoftwareTileBuffers(shadowResolution, shadowResolution))
+                return false;
+
+            int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(1, shadowResolution));
+            if (hybridShadowSoftwareDepth != null &&
+                hybridShadowSoftwareDepth.IsCreated() &&
+                hybridShadowWinnerFallback != null &&
+                hybridShadowWinnerFallback.IsCreated() &&
+                hybridShadowTextureSize >= requiredSize)
+                return true;
+
+            ReleaseHybridShadowTextures();
+            hybridShadowTextureSize = requiredSize;
+            hybridShadowSoftwareDepth = new RenderTexture(requiredSize, requiredSize, 0)
+            {
+                name = "_NaniteHybridShadowSoftwareDepth",
+                graphicsFormat = GraphicsFormat.R32_UInt,
+                enableRandomWrite = true,
+                useMipMap = false,
+                autoGenerateMips = false,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            hybridShadowSoftwareDepth.Create();
+            hybridShadowWinnerFallback = new RenderTexture(1, 1, 0)
+            {
+                name = "_NaniteHybridShadowWinnerFallback",
+                graphicsFormat = GraphicsFormat.R32_UInt,
+                enableRandomWrite = true,
+                useMipMap = false,
+                autoGenerateMips = false,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            hybridShadowWinnerFallback.Create();
+            return hybridShadowSoftwareDepth.IsCreated() &&
+                   hybridShadowWinnerFallback.IsCreated();
+        }
+
+        void ReleaseHybridShadowTextures()
+        {
+            if (hybridShadowSoftwareDepth != null)
+            {
+                hybridShadowSoftwareDepth.Release();
+                DestroyObject(hybridShadowSoftwareDepth);
+                hybridShadowSoftwareDepth = null;
+            }
+            if (hybridShadowWinnerFallback != null)
+            {
+                hybridShadowWinnerFallback.Release();
+                DestroyObject(hybridShadowWinnerFallback);
+                hybridShadowWinnerFallback = null;
+            }
+            hybridShadowTextureSize = 0;
+            hybridShadowReadyFrame = -1;
+            hybridShadowReadyCascade = -1;
+        }
+
+        bool DispatchHybridShadowQueue(ExternalMainLightShadowCullContext context)
+        {
+            if (!EnsureHybridShadowResources(context.shadowResolution) ||
+                settings.visibleTriangleCompactShader == null ||
+                hybridHardwareClusterBuffer == null ||
+                hybridSoftwareClusterBuffer == null ||
+                hybridHardwareCountArgsBuffer == null ||
+                hybridSoftwareCountArgsBuffer == null ||
+                hybridClassifyDispatchArgsBuffer == null ||
+                hybridSoftwareDispatchArgsBuffer == null)
+                return false;
+
+            ComputeBuffer inputClusters = batchedCulling.GetShadowDrawClusterBuffer(context.cascadeIndex);
+            ComputeBuffer inputCountArgs = batchedCulling.GetShadowDrawCountArgsBuffer(context.cascadeIndex);
+            if (inputClusters == null || inputCountArgs == null ||
+                !sceneVisibilityBackend.TryGetSceneBuffers(
+                    out var vertexData,
+                    out var indices,
+                    out var triangleCluster,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out var instanceLocalToWorld,
+                    out _,
+                    out _,
+                    out int vertexStride,
+                    out _))
+                return false;
+
+            UnsafeCommandBuffer cmd = context.commandBuffer;
+            ComputeShader cs = settings.visibleTriangleCompactShader;
+            Matrix4x4 worldToClip =
+                GL.GetGPUProjectionMatrix(context.projectionMatrix, true) * context.viewMatrix;
+            int resolution = Mathf.Max(1, context.shadowResolution);
+            int tileCountX = Mathf.Max(1, (resolution + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+            int tileCountY = tileCountX;
+            int tileCount = tileCountX * tileCountY;
+
+            cmd.SetBufferCounterValue(hybridHardwareClusterBuffer, 0u);
+            cmd.SetBufferCounterValue(hybridSoftwareClusterBuffer, 0u);
+            PrepareHybridDispatch(
+                cmd,
+                cs,
+                kernelPrepareHybridDispatch,
+                inputCountArgs,
+                hybridClassifyDispatchArgsBuffer);
+            cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridInputClusters", inputClusters);
+            cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridInputCountArgs", inputCountArgs);
+            cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridHardwareClusters", hybridHardwareClusterBuffer);
+            cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridSoftwareClusters", hybridSoftwareClusterBuffer);
+            BindHybridGeometry(
+                cmd,
+                cs,
+                kernelClassifyHybridClusters,
+                worldToClip,
+                vertexData,
+                indices,
+                instanceLocalToWorld,
+                triangleCluster,
+                sceneVisibilityBackend.GeometryClusterBoundsBuffer,
+                sceneVisibilityBackend.GeometryClusterLongestEdgeBuffer,
+                vertexStride);
+            SetHybridScreenParams(cmd, cs, resolution, resolution);
+            cmd.SetComputeFloatParam(
+                cs,
+                "_HybridSoftwareMaxEdgePixels",
+                Mathf.Max(1f, settings.hybridSoftwareMaxEdgePixels));
+            cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+            cmd.DispatchCompute(cs, kernelClassifyHybridClusters, hybridClassifyDispatchArgsBuffer, 0u);
+            cmd.CopyCounterValue(hybridHardwareClusterBuffer, hybridHardwareCountArgsBuffer, 0u);
+            cmd.CopyCounterValue(hybridSoftwareClusterBuffer, hybridSoftwareCountArgsBuffer, 0u);
+            PrepareHybridDispatch(
+                cmd,
+                cs,
+                kernelPrepareHybridDispatch,
+                hybridSoftwareCountArgsBuffer,
+                hybridSoftwareDispatchArgsBuffer);
+
+            SetHybridTileParams(cmd, cs, tileCountX, tileCountY, tileCount);
+            cmd.SetBufferCounterValue(hybridSoftwareTileListBuffer, 0u);
+            cmd.SetComputeBufferParam(cs, kernelClearHybridTileHeads, "_HybridSoftwareTileHeads", hybridSoftwareTileHeadBuffer);
+            cmd.DispatchCompute(cs, kernelClearHybridTileHeads, Mathf.Max(1, (tileCount + 255) / 256), 1, 1);
+            cmd.SetComputeBufferParam(cs, kernelClearHybridTileWork, "_HybridSoftwareTileNodeCounter", hybridSoftwareTileNodeCounterBuffer);
+            cmd.DispatchCompute(cs, kernelClearHybridTileWork, 1, 1, 1);
+
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareClustersRead", hybridSoftwareClusterBuffer);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareCountArgs", hybridSoftwareCountArgsBuffer);
+            BindHybridGeometry(
+                cmd,
+                cs,
+                kernelBuildHybridTileWork,
+                worldToClip,
+                vertexData,
+                indices,
+                instanceLocalToWorld,
+                triangleCluster,
+                sceneVisibilityBackend.GeometryClusterBoundsBuffer,
+                sceneVisibilityBackend.GeometryClusterLongestEdgeBuffer,
+                vertexStride);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileHeads", hybridSoftwareTileHeadBuffer);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileNodes", hybridSoftwareTileNodeBuffer);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileNodeCounter", hybridSoftwareTileNodeCounterBuffer);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareFallbackFlags", hybridSoftwareFallbackFlagsBuffer);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileList", hybridSoftwareTileListBuffer);
+            cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridHardwareClusters", hybridHardwareClusterBuffer);
+            cmd.SetComputeIntParam(cs, "_HybridTileNodeCapacity", Mathf.Max(1, hybridSoftwareTileNodeCapacity));
+            cmd.SetComputeIntParam(cs, "_HybridDepthOnly", 1);
+            cmd.SetComputeIntParam(cs, "_HybridShadowMode", 1);
+            Vector3 lightDirection = -context.shadowLight.localToWorldMatrix.GetColumn(2);
+            cmd.SetComputeVectorParam(cs, "_HybridShadowLightDirection", new Vector4(
+                lightDirection.x,
+                lightDirection.y,
+                lightDirection.z,
+                0f));
+            cmd.SetComputeVectorParam(cs, "_HybridShadowBias", context.shadowBias);
+            cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+            cmd.DispatchCompute(cs, kernelBuildHybridTileWork, hybridSoftwareDispatchArgsBuffer, 0u);
+
+            cmd.CopyCounterValue(hybridHardwareClusterBuffer, hybridHardwareCountArgsBuffer, 0u);
+            cmd.CopyCounterValue(hybridSoftwareTileListBuffer, hybridSoftwareTileCountArgsBuffer, 0u);
+            cmd.CopyCounterValue(hybridSoftwareTileListBuffer, hybridSoftwareTileDrawArgsBuffer, sizeof(uint));
+            PrepareHybridDispatch(
+                cmd,
+                cs,
+                kernelPrepareHybridDispatch,
+                hybridSoftwareTileCountArgsBuffer,
+                hybridSoftwareTileDispatchArgsBuffer);
+
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareClustersRead", hybridSoftwareClusterBuffer);
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareCountArgs", hybridSoftwareCountArgsBuffer);
+            BindHybridGeometry(
+                cmd,
+                cs,
+                kernelSoftwareRasterTiles,
+                worldToClip,
+                vertexData,
+                indices,
+                instanceLocalToWorld,
+                triangleCluster,
+                sceneVisibilityBackend.GeometryClusterBoundsBuffer,
+                sceneVisibilityBackend.GeometryClusterLongestEdgeBuffer,
+                vertexStride);
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileHeads", hybridSoftwareTileHeadBuffer);
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileNodes", hybridSoftwareTileNodeBuffer);
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareFallbackFlags", hybridSoftwareFallbackFlagsBuffer);
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileListRead", hybridSoftwareTileListBuffer);
+            cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileCountArgs", hybridSoftwareTileCountArgsBuffer);
+            cmd.SetComputeTextureParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareDepth", hybridShadowSoftwareDepth);
+            cmd.SetComputeTextureParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareWinner", hybridShadowWinnerFallback);
+            cmd.SetComputeIntParam(cs, "_HybridDepthOnly", 1);
+            cmd.SetComputeIntParam(cs, "_HybridShadowMode", 1);
+            cmd.SetComputeVectorParam(cs, "_HybridShadowLightDirection", new Vector4(
+                lightDirection.x,
+                lightDirection.y,
+                lightDirection.z,
+                0f));
+            cmd.SetComputeVectorParam(cs, "_HybridShadowBias", context.shadowBias);
+            cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+            cmd.DispatchCompute(cs, kernelSoftwareRasterTiles, hybridSoftwareTileDispatchArgsBuffer, 0u);
+
+            bool indexedBuilt = sceneVisibilityBackend.DispatchIndexedShadowDrawQueueReuse(
+                cmd,
+                cs,
+                kernelPrepareIndexedShadowDrawQueue,
+                kernelBuildIndexedShadowDrawQueue,
+                hybridHardwareClusterBuffer,
+                hybridHardwareCountArgsBuffer,
+                context.cascadeIndex);
+            if (!indexedBuilt)
+                return false;
+
+            hybridShadowReadyFrame = Time.frameCount;
+            hybridShadowReadyCascade = context.cascadeIndex;
+            return true;
+        }
+
+        void BuildExternalMainLightShadowCascade(ExternalMainLightShadowCullContext context)
+        {
+            if (!settings.enable || !settings.enableShadowCasting ||
+                !settings.enableIndexedClusterRaster ||
+                context.commandBuffer == null || context.camera == null ||
+                context.cascadeIndex < 0 || context.cascadeIndex >= Mathf.Clamp(settings.maxNaniteShadowCascades, 1, 4) ||
+                sceneVisibilityBackend == null || !sceneVisibilityBackend.IndexedDrawAvailable ||
+                batchedCulling == null ||
+                !batchedCulling.IsShadowDrawQueueReady(context.camera, context.cascadeIndex))
+                return;
+
+            if (kernelPrepareIndexedShadowDrawQueue < 0 || kernelBuildIndexedShadowDrawQueue < 0)
+                InitCompactKernels();
+            if (settings.visibleTriangleCompactShader == null ||
+                kernelPrepareIndexedShadowDrawQueue < 0 || kernelBuildIndexedShadowDrawQueue < 0)
+                return;
+
+            if (DispatchHybridShadowQueue(context))
+                return;
+
+            sceneVisibilityBackend.DispatchIndexedShadowDrawQueueReuse(
+                context.commandBuffer,
+                settings.visibleTriangleCompactShader,
+                kernelPrepareIndexedShadowDrawQueue,
+                kernelBuildIndexedShadowDrawQueue,
+                batchedCulling.GetShadowDrawClusterBuffer(context.cascadeIndex),
+                batchedCulling.GetShadowDrawCountArgsBuffer(context.cascadeIndex),
+                context.cascadeIndex);
         }
 
         bool HasExternalMainLightShadowCasters(Camera camera, Light light)
@@ -1338,7 +2418,11 @@ namespace Nanite
                     Mathf.Clamp(settings.maxNaniteShadowCascades, 1, 4));
                 string queueName = dedicatedQueue
                     ? (batchedCulling.LastShadowUsedFusedBatch
-                        ? "shadowFrustum/fusedDirect"
+                        ? (batchedCulling.LastShadowUsedHierarchyQueue
+                            ? "shadowFrustum/fusedHierarchyPersistent"
+                            : (batchedCulling.LastShadowUsedSpatialHierarchy
+                                ? "shadowFrustum/fusedSpatialQueue"
+                                : "shadowFrustum/fusedDirect"))
                         : (batchedCulling.LastShadowUsedVisibleInstanceQueue
                         ? "shadowFrustum/instancePartIndirect"
                         : (batchedCulling.LastShadowUsedVisiblePartQueue
@@ -1365,6 +2449,7 @@ namespace Nanite
                 material,
                 context.camera,
                 context.cascadeIndex);
+            DrawHybridSoftwareShadowMerge(context.commandBuffer, material, context);
             context.commandBuffer.DisableScissorRect();
             context.commandBuffer.SetGlobalDepthBias(0.0f, 0.0f);
         }
@@ -1389,11 +2474,43 @@ namespace Nanite
                                   triangleThreshold > 0 &&
                                   triangleCount > 0 &&
                                   triangleCount <= triangleThreshold;
+                bool unsupportedShader = ProxyUsesUnsupportedResolveShader(proxy);
                 bool useRaster = !proxy.forceNaniteRendering &&
-                                 proxy.CanUseRasterFallback &&
-                                 (proxy.NativeRendererRequested || autoRaster);
+                                  proxy.CanUseRasterFallback &&
+                                  (proxy.NativeRendererRequested || autoRaster || unsupportedShader);
                 proxy.SetRasterFallbackActive(useRaster);
+                if (unsupportedShader && !proxy.CanUseRasterFallback &&
+                    warnedUnsupportedMaterialProxies.Add(proxy.GetInstanceID()))
+                {
+                    Debug.LogWarning(
+                        $"[Nanite][Material] '{proxy.name}' uses a shader outside the URP/Lit resolve family " +
+                        "and has no native MeshRenderer fallback. It remains on compatibility resolve; " +
+                        "author a Nanite shader family or provide the source MeshRenderer for exact output.",
+                        proxy);
+                }
             }
+        }
+
+        static bool ProxyUsesUnsupportedResolveShader(NaniteRuntimeProxy proxy)
+        {
+            if (proxy == null)
+                return false;
+            Material[] materials = proxy.resolveMaterials;
+            if (materials == null || materials.Length == 0)
+            {
+                var renderer = proxy.GetComponent<Renderer>();
+                if (renderer == null)
+                    renderer = proxy.GetComponentInChildren<Renderer>();
+                materials = renderer != null ? renderer.sharedMaterials : null;
+            }
+            if (materials == null)
+                return false;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                if (!NaniteSceneVisibilityBufferBackend.SupportsFormalResolveMaterial(materials[i]))
+                    return true;
+            }
+            return false;
         }
 
         void InitCopyDepthKeywords()
@@ -1508,6 +2625,75 @@ namespace Nanite
             internal int screenWidth;
             internal int screenHeight;
             internal int compactSelectionKey;
+            internal int compactClusterOffset;
+            internal bool hybridHardwareQueue;
+            internal bool drawProceduralFallback;
+        }
+
+        class HybridClassifyRgPassData
+        {
+            internal Camera camera;
+            internal ComputeBuffer inputClusters;
+            internal ComputeBuffer inputCountArgs;
+            internal ComputeBuffer hardwareClusters;
+            internal ComputeBuffer softwareClusters;
+            internal ComputeBuffer hardwareCountArgs;
+            internal ComputeBuffer softwareCountArgs;
+            internal ComputeBuffer classifyDispatchArgs;
+            internal ComputeBuffer softwareDispatchArgs;
+            internal ComputeBuffer vertexData;
+            internal ComputeBuffer indices;
+            internal ComputeBuffer instanceLocalToWorld;
+            internal ComputeBuffer triangleCluster;
+            internal ComputeBuffer clusterBounds;
+            internal ComputeBuffer clusterLongestEdge;
+            internal int vertexStride;
+            internal int selectionKey;
+            internal GraphicsBuffer dependencyBuffer;
+        }
+
+        class HybridSoftwareRasterRgPassData
+        {
+            internal TextureHandle softwareDepth;
+            internal TextureHandle softwareWinner;
+            internal ComputeBuffer hardwareClusters;
+            internal ComputeBuffer hardwareCountArgs;
+            internal ComputeBuffer softwareClusters;
+            internal ComputeBuffer softwareCountArgs;
+            internal ComputeBuffer softwareDispatchArgs;
+            internal ComputeBuffer vertexData;
+            internal ComputeBuffer indices;
+            internal ComputeBuffer instanceLocalToWorld;
+            internal Matrix4x4 worldToClip;
+            internal int vertexStride;
+            internal int screenWidth;
+            internal int screenHeight;
+            internal int tileCountX;
+            internal int tileCountY;
+            internal int tileCount;
+            internal GraphicsBuffer tileHeads;
+            internal GraphicsBuffer tileNodes;
+            internal GraphicsBuffer tileNodeCounter;
+            internal GraphicsBuffer fallbackFlags;
+            internal int tileNodeCapacity;
+            internal GraphicsBuffer tileList;
+            internal GraphicsBuffer tileCountArgs;
+            internal GraphicsBuffer tileDispatchArgs;
+            internal GraphicsBuffer tileDrawArgs;
+            internal GraphicsBuffer dependencyBuffer;
+        }
+
+        class HybridMergeRgPassData
+        {
+            internal Material material;
+            internal TextureHandle softwareDepth;
+            internal TextureHandle softwareWinner;
+            internal ComputeBuffer softwareClusters;
+            internal GraphicsBuffer tileList;
+            internal GraphicsBuffer tileDrawArgs;
+            internal int screenWidth;
+            internal int screenHeight;
+            internal int tileCountX;
         }
 
         class CopyClusterMaskRgPassData
@@ -1524,6 +2710,8 @@ namespace Nanite
             internal int screenWidth;
             internal int screenHeight;
             internal BufferHandle tileMaterialMask;
+            internal BufferHandle tileMaterialBinList;
+            internal BufferHandle tileIndirectArgs;
         }
 
         class FormalResolveRgPassData
@@ -1535,6 +2723,7 @@ namespace Nanite
             internal bool useGBufferDepthSlice;
             internal bool useTileMaterialMask;
             internal BufferHandle tileMaterialMask;
+            internal BufferHandle tileMaterialBinList;
             internal BufferHandle tileIndirectArgs;
             internal int screenWidth;
             internal int screenHeight;
@@ -1555,12 +2744,12 @@ namespace Nanite
             string passName,
             ProfilingSampler profilingSampler)
         {
-            if (passKind == PassKind.FirstCull)
-                recordedHzbDepthSource = TextureHandle.nullHandle;
-
             UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
             if (cameraData == null || cameraData.camera == null)
                 return;
+
+            if (passKind == PassKind.FirstCull)
+                recordedHzbDepthSource = TextureHandle.nullHandle;
 
             if (passKind == PassKind.PageRetirementFence)
             {
@@ -1799,6 +2988,19 @@ namespace Nanite
                 builder.AllowPassCulling(false);
                 // Cull 通过 ComputeShader 全局绑定；无法完全去掉。
                 builder.AllowGlobalStateModification(true);
+                // Both cull passes can append to the traversal-produced HW/SW
+                // queues. Track the same dependency through Pass2 so async SW
+                // raster cannot start while the merged cut is still changing.
+                if (IsHybridRasterRequested())
+                {
+                    EnsureHybridTraversalDependency();
+                    if (hybridTraversalDependencyBuffer != null)
+                    {
+                        builder.UseBuffer(
+                            renderGraph.ImportBuffer(hybridTraversalDependencyBuffer),
+                            AccessFlags.Write);
+                    }
+                }
 
                 builder.SetRenderFunc((CullRgPassData data, UnsafeGraphContext context) =>
                 {
@@ -1838,6 +3040,7 @@ namespace Nanite
         void InitFormalKernels()
         {
             kernelMaterialTileClassify = -1;
+            kernelClearMaterialTileBins = -1;
             keywordCompactVBufferClassifyInitialized = false;
             if (settings.materialTileClassifyShader == null)
                 return;
@@ -1845,6 +3048,7 @@ namespace Nanite
             try
             {
                 kernelMaterialTileClassify = settings.materialTileClassifyShader.FindKernel("CSTileClassify");
+                kernelClearMaterialTileBins = settings.materialTileClassifyShader.FindKernel("CSClearTileBins");
                 keywordCompactVBufferClassify = new LocalKeyword(
                     settings.materialTileClassifyShader,
                     kCompactVBufferKeyword);
@@ -1853,6 +3057,7 @@ namespace Nanite
             catch
             {
                 kernelMaterialTileClassify = -1;
+                kernelClearMaterialTileBins = -1;
             }
         }
 
@@ -1948,16 +3153,21 @@ namespace Nanite
                                    IsMaterialTileCullingAdmitted() &&
                                    settings.materialTileClassifyShader != null &&
                                    kernelMaterialTileClassify >= 0 &&
+                                   kernelClearMaterialTileBins >= 0 &&
                                    (!useCompactVBuffer || keywordCompactVBufferClassifyInitialized);
             BufferHandle tileMaterialMaskHandle = default;
+            BufferHandle tileMaterialBinListHandle = default;
             BufferHandle tileIndirectArgsHandle = default;
             if (canTileClassify)
             {
                 EnsureTileBuffers(formalScreenWidth, formalScreenHeight);
-                canTileClassify = tileMaterialMaskBuffer != null && tileIndirectArgsBuffer != null;
+                canTileClassify = tileMaterialMaskBuffer != null &&
+                                  tileMaterialBinListBuffer != null &&
+                                  tileIndirectArgsBuffer != null;
                 if (canTileClassify)
                 {
                     tileMaterialMaskHandle = renderGraph.ImportBuffer(tileMaterialMaskBuffer);
+                    tileMaterialBinListHandle = renderGraph.ImportBuffer(tileMaterialBinListBuffer);
                     tileIndirectArgsHandle = renderGraph.ImportBuffer(tileIndirectArgsBuffer);
                 }
             }
@@ -1983,6 +3193,69 @@ namespace Nanite
                                   sceneVisibilityBackend.Pass1ClusterVisibleBuffer != null &&
                                   sceneVisibilityBackend.Pass2ClusterVisibleBuffer != null &&
                                   batchedCulling != null;
+
+            int formalCompactSelection = ShouldEnqueueSecondCull()
+                ? kCompactSelectionMerged
+                : kCompactSelectionFirst;
+            bool hybridRaster = false;
+            TextureHandle softwareDepth = default;
+            TextureHandle softwareWinner = default;
+            if (!bevyDualRaster && IsHybridRasterRequested() && CanUseCompactFormalVBuffer() &&
+                EnsureHybridSoftwareTileBuffers(formalScreenWidth, formalScreenHeight) &&
+                sceneVisibilityBackend != null &&
+                sceneVisibilityBackend.TryGetSceneBuffers(
+                    out var hybridVertexData,
+                    out var hybridIndices,
+                    out var hybridTriangleCluster,
+                    out _,
+                    out _,
+                    out _,
+                    out _,
+                    out var hybridInstanceLocalToWorld,
+                    out _,
+                    out _,
+                    out int hybridVertexStride,
+                    out _))
+            {
+                var softwareDepthDesc = vbufferDesc;
+                softwareDepthDesc.name = "_NaniteHybridSoftwareDepth";
+                softwareDepthDesc.format = GraphicsFormat.R32_UInt;
+                softwareDepthDesc.enableRandomWrite = true;
+                softwareDepthDesc.clearBuffer = false;
+                softwareDepth = renderGraph.CreateTexture(softwareDepthDesc);
+
+                var softwareWinnerDesc = softwareDepthDesc;
+                softwareWinnerDesc.name = "_NaniteHybridSoftwareWinner";
+                softwareWinner = renderGraph.CreateTexture(softwareWinnerDesc);
+
+                hybridRaster = RecordHybridClassificationPass(
+                    renderGraph,
+                    camera,
+                    formalCompactSelection,
+                    hybridVertexData,
+                    hybridIndices,
+                    hybridInstanceLocalToWorld,
+                    hybridTriangleCluster,
+                    sceneVisibilityBackend.GeometryClusterBoundsBuffer,
+                    sceneVisibilityBackend.GeometryClusterLongestEdgeBuffer,
+                    hybridVertexStride,
+                    profilingSampler);
+                if (hybridRaster)
+                {
+                    RecordHybridSoftwareRasterPass(
+                        renderGraph,
+                        camera,
+                        softwareDepth,
+                        softwareWinner,
+                        hybridVertexData,
+                        hybridIndices,
+                        hybridInstanceLocalToWorld,
+                        hybridVertexStride,
+                        formalScreenWidth,
+                        formalScreenHeight,
+                        profilingSampler);
+                }
+            }
 
             if (bevyDualRaster)
             {
@@ -2034,9 +3307,6 @@ namespace Nanite
             {
                 // With no Cull2, FirstCull's mask is already the final mask. Reuse its
                 // compact list instead of relabelling and dispatching the same compact job twice.
-                int formalCompactSelection = ShouldEnqueueSecondCull()
-                    ? kCompactSelectionMerged
-                    : kCompactSelectionFirst;
                 RecordFormalRasterPass(
                     renderGraph,
                     profilingSampler,
@@ -2048,7 +3318,22 @@ namespace Nanite
                     formalScreenWidth,
                     formalScreenHeight,
                     formalCompactSelection,
-                    clearColorHint: true);
+                    clearColorHint: true,
+                    hybridHardwareQueue: hybridRaster);
+            }
+
+            if (hybridRaster)
+            {
+                RecordHybridMergePass(
+                    renderGraph,
+                    rasterMaterial,
+                    vbuffer,
+                    rasterDepth,
+                    softwareDepth,
+                    softwareWinner,
+                    formalScreenWidth,
+                    formalScreenHeight,
+                    profilingSampler);
             }
 
             if (canTileClassify)
@@ -2060,10 +3345,14 @@ namespace Nanite
                     passData.screenWidth = formalScreenWidth;
                     passData.screenHeight = formalScreenHeight;
                     passData.tileMaterialMask = tileMaterialMaskHandle;
+                    passData.tileMaterialBinList = tileMaterialBinListHandle;
+                    passData.tileIndirectArgs = tileIndirectArgsHandle;
                     builder.AllowPassCulling(false);
                     builder.AllowGlobalStateModification(true);
                     builder.UseTexture(vbuffer, AccessFlags.Read);
                     builder.UseBuffer(passData.tileMaterialMask, AccessFlags.Write);
+                    builder.UseBuffer(passData.tileMaterialBinList, AccessFlags.Write);
+                    builder.UseBuffer(passData.tileIndirectArgs, AccessFlags.Write);
                     builder.SetRenderFunc((FormalTileClassifyRgPassData data, ComputeGraphContext context) =>
                     {
                         ExecuteFormalTileClassify(context.cmd, data.camera, data.vbuffer, data.screenWidth, data.screenHeight);
@@ -2112,6 +3401,7 @@ namespace Nanite
                 // 只能读取本视图、本帧确实执行过 classify 的 mask；仅检查 buffer 是否存在会读到陈旧数据。
                 passData.useTileMaterialMask = canTileClassify;
                 passData.tileMaterialMask = tileMaterialMaskHandle;
+                passData.tileMaterialBinList = tileMaterialBinListHandle;
                 passData.tileIndirectArgs = tileIndirectArgsHandle;
                 passData.screenWidth = fullScreenWidth;
                 passData.screenHeight = fullScreenHeight;
@@ -2123,6 +3413,7 @@ namespace Nanite
                 if (passData.useTileMaterialMask)
                 {
                     builder.UseBuffer(passData.tileMaterialMask, AccessFlags.Read);
+                    builder.UseBuffer(passData.tileMaterialBinList, AccessFlags.Read);
                     builder.UseBuffer(passData.tileIndirectArgs, AccessFlags.Read);
                 }
 
@@ -2283,6 +3574,834 @@ namespace Nanite
             }
         }
 
+        bool IsHybridConfigured()
+        {
+            return (FormalRasterizationMode)Mathf.Clamp(
+                       settings.formalRasterizationMode,
+                       0,
+                       (int)FormalRasterizationMode.HybridSoftwareHardware) ==
+                   FormalRasterizationMode.HybridSoftwareHardware;
+        }
+
+        bool IsHybridRasterRequested() =>
+            IsHybridConfigured() && cameraHybridCost.UseHybrid;
+
+        bool IsShadowHybridRequested() =>
+            IsHybridConfigured() && shadowHybridCost.UseHybrid;
+
+        bool EnsureHybridClusterBuffers()
+        {
+            CollectRetiredHybridBuffers();
+            if (!IsHybridConfigured() ||
+                settings.visibleTriangleCompactShader == null ||
+                batchedCulling == null || sceneVisibilityBackend == null ||
+                kernelClearHybridTileHeads < 0 || kernelClearHybridTileWork < 0 ||
+                kernelBuildHybridTileWork < 0 || kernelSoftwareRasterTiles < 0 ||
+                kernelClassifyHybridClusters < 0 ||
+                kernelPrepareHybridDispatch < 0)
+                return false;
+
+            int requiredCapacity = Mathf.Max(1, batchedCulling.VirtualClusterCount);
+            int geometryGeneration = sceneVisibilityBackend.GeometryGeneration;
+            if (hybridHardwareClusterBuffer != null &&
+                hybridSoftwareClusterBuffer != null &&
+                hybridHardwareCountArgsBuffer != null &&
+                hybridSoftwareCountArgsBuffer != null &&
+                hybridClassifyDispatchArgsBuffer != null &&
+                hybridSoftwareDispatchArgsBuffer != null &&
+                hybridDependencyBuffer != null &&
+                hybridClusterCapacity >= requiredCapacity &&
+                hybridGeometryGeneration == geometryGeneration)
+                return true;
+
+            RetireHybridBuffers();
+            hybridClusterCapacity = requiredCapacity;
+            hybridGeometryGeneration = geometryGeneration;
+            hybridHardwareClusterBuffer = new ComputeBuffer(
+                hybridClusterCapacity,
+                sizeof(uint) * 3,
+                ComputeBufferType.Append);
+            hybridSoftwareClusterBuffer = new ComputeBuffer(
+                hybridClusterCapacity,
+                sizeof(uint) * 3,
+                ComputeBufferType.Append);
+            hybridHardwareCountArgsBuffer = new ComputeBuffer(
+                4,
+                sizeof(uint),
+                ComputeBufferType.IndirectArguments);
+            hybridSoftwareCountArgsBuffer = new ComputeBuffer(
+                4,
+                sizeof(uint),
+                ComputeBufferType.IndirectArguments);
+            hybridClassifyDispatchArgsBuffer = new ComputeBuffer(
+                4,
+                sizeof(uint),
+                ComputeBufferType.IndirectArguments);
+            hybridSoftwareDispatchArgsBuffer = new ComputeBuffer(
+                4,
+                sizeof(uint),
+                ComputeBufferType.IndirectArguments);
+            hybridDependencyBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                1,
+                sizeof(uint));
+            hybridHardwareCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hybridSoftwareCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hybridClassifyDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hybridSoftwareDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            return true;
+        }
+
+        bool EnsureHybridSoftwareTileBuffers(int width, int height)
+        {
+            CollectRetiredHybridBuffers();
+            if (kernelClearHybridTileHeads < 0 || kernelClearHybridTileWork < 0 ||
+                kernelBuildHybridTileWork < 0 || kernelSoftwareRasterTiles < 0)
+                InitCompactKernels();
+            if (kernelClearHybridTileHeads < 0 || kernelClearHybridTileWork < 0 ||
+                kernelBuildHybridTileWork < 0 || kernelSoftwareRasterTiles < 0)
+                return false;
+
+            int tileCountX = Mathf.Max(1, (Mathf.Max(1, width) + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+            int tileCountY = Mathf.Max(1, (Mathf.Max(1, height) + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+            int required = Mathf.Max(1, tileCountX * tileCountY);
+            int requiredFallback = Mathf.Max(1, batchedCulling != null ? batchedCulling.VirtualClusterCount : 1);
+            if (hybridSoftwareTileHeadBuffer != null &&
+                hybridSoftwareTileNodeBuffer != null &&
+                hybridSoftwareTileNodeCounterBuffer != null &&
+                hybridSoftwareFallbackFlagsBuffer != null &&
+                hybridSoftwareTileListBuffer != null &&
+                hybridSoftwareTileCountArgsBuffer != null &&
+                hybridSoftwareTileDispatchArgsBuffer != null &&
+                hybridSoftwareTileDrawArgsBuffer != null &&
+                hybridSoftwareTileCapacity >= required &&
+                hybridSoftwareFallbackCapacity >= requiredFallback)
+                return true;
+
+            RetireHybridSoftwareTileBuffers();
+            // The linked work queue is resolution bounded instead of geometry
+            // bounded. This keeps the production allocation proportional to the
+            // number of pixels while a GPU overflow path returns complete clusters
+            // to the indexed hardware queue without dropping geometry.
+            hybridSoftwareTileCapacity = Mathf.NextPowerOfTwo(required);
+            hybridSoftwareTileNodeCapacity = checked(
+                hybridSoftwareTileCapacity * kHybridSoftwareTileNodesPerTile);
+            hybridSoftwareFallbackCapacity = Mathf.NextPowerOfTwo(requiredFallback);
+            hybridSoftwareTileHeadBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                hybridSoftwareTileCapacity,
+                sizeof(uint));
+            hybridSoftwareTileNodeBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                hybridSoftwareTileNodeCapacity,
+                sizeof(uint) * 2);
+            hybridSoftwareTileNodeCounterBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                4,
+                sizeof(uint));
+            hybridSoftwareFallbackFlagsBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                hybridSoftwareFallbackCapacity,
+                sizeof(uint));
+            hybridSoftwareTileListBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Append,
+                hybridSoftwareTileCapacity,
+                sizeof(uint));
+            GraphicsBuffer.Target argsTarget =
+                GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured;
+            hybridSoftwareTileCountArgsBuffer = new GraphicsBuffer(argsTarget, 4, sizeof(uint));
+            hybridSoftwareTileDispatchArgsBuffer = new GraphicsBuffer(argsTarget, 4, sizeof(uint));
+            hybridSoftwareTileDrawArgsBuffer = new GraphicsBuffer(argsTarget, 4, sizeof(uint));
+            hybridSoftwareTileCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hybridSoftwareTileDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hybridSoftwareTileDrawArgsBuffer.SetData(new uint[] { 6u, 0u, 0u, 0u });
+            hybridSoftwareTileNodeCounterBuffer.SetData(new uint[] { 0u, 0u, 0u, 0u });
+            return true;
+        }
+
+        void RetireHybridSoftwareTileBuffers()
+        {
+            if (hybridSoftwareTileHeadBuffer == null &&
+                hybridSoftwareTileNodeBuffer == null &&
+                hybridSoftwareTileNodeCounterBuffer == null &&
+                hybridSoftwareFallbackFlagsBuffer == null &&
+                hybridSoftwareTileListBuffer == null &&
+                hybridSoftwareTileCountArgsBuffer == null &&
+                hybridSoftwareTileDispatchArgsBuffer == null &&
+                hybridSoftwareTileDrawArgsBuffer == null)
+                return;
+
+            retiredHybridTileBuffers.Add(new RetiredHybridTileBuffers
+            {
+                heads = hybridSoftwareTileHeadBuffer,
+                nodes = hybridSoftwareTileNodeBuffer,
+                nodeCounter = hybridSoftwareTileNodeCounterBuffer,
+                fallbackFlags = hybridSoftwareFallbackFlagsBuffer,
+                list = hybridSoftwareTileListBuffer,
+                countArgs = hybridSoftwareTileCountArgsBuffer,
+                dispatchArgs = hybridSoftwareTileDispatchArgsBuffer,
+                drawArgs = hybridSoftwareTileDrawArgsBuffer,
+                releaseFrame = Time.frameCount + 4
+            });
+            hybridSoftwareTileHeadBuffer = null;
+            hybridSoftwareTileNodeBuffer = null;
+            hybridSoftwareTileNodeCounterBuffer = null;
+            hybridSoftwareFallbackFlagsBuffer = null;
+            hybridSoftwareTileListBuffer = null;
+            hybridSoftwareTileCountArgsBuffer = null;
+            hybridSoftwareTileDispatchArgsBuffer = null;
+            hybridSoftwareTileDrawArgsBuffer = null;
+            hybridSoftwareTileCapacity = 0;
+            hybridSoftwareTileNodeCapacity = 0;
+            hybridSoftwareFallbackCapacity = 0;
+        }
+
+        void RetireHybridBuffers()
+        {
+            if (hybridHardwareClusterBuffer == null &&
+                hybridSoftwareClusterBuffer == null &&
+                hybridHardwareCountArgsBuffer == null &&
+                hybridSoftwareCountArgsBuffer == null &&
+                hybridClassifyDispatchArgsBuffer == null &&
+                hybridSoftwareDispatchArgsBuffer == null &&
+                hybridDependencyBuffer == null)
+                return;
+
+            // RenderGraph executes after recording and Scene/Game cameras may rebuild the
+            // shared geometry generation in the same editor frame. Releasing immediately
+            // invalidated buffers captured by already-recorded hybrid kernels, producing
+            // "Property ... is not set" and partially empty raster queues.
+            retiredHybridBuffers.Add(new RetiredHybridBuffers
+            {
+                hardwareClusters = hybridHardwareClusterBuffer,
+                softwareClusters = hybridSoftwareClusterBuffer,
+                hardwareCountArgs = hybridHardwareCountArgsBuffer,
+                softwareCountArgs = hybridSoftwareCountArgsBuffer,
+                classifyDispatchArgs = hybridClassifyDispatchArgsBuffer,
+                softwareDispatchArgs = hybridSoftwareDispatchArgsBuffer,
+                dependency = hybridDependencyBuffer,
+                releaseFrame = Time.frameCount + 4
+            });
+            ClearHybridBufferReferences();
+        }
+
+        void CollectRetiredHybridBuffers()
+        {
+            int frame = Time.frameCount;
+            for (int i = retiredHybridBuffers.Count - 1; i >= 0; i--)
+            {
+                if (frame < retiredHybridBuffers[i].releaseFrame)
+                    continue;
+                retiredHybridBuffers[i].Release();
+                retiredHybridBuffers.RemoveAt(i);
+            }
+            for (int i = retiredHybridTileBuffers.Count - 1; i >= 0; i--)
+            {
+                if (frame < retiredHybridTileBuffers[i].releaseFrame)
+                    continue;
+                retiredHybridTileBuffers[i].Release();
+                retiredHybridTileBuffers.RemoveAt(i);
+            }
+        }
+
+        void ReleaseHybridBuffers()
+        {
+            ReleaseHybridShadowTextures();
+            hybridHardwareClusterBuffer?.Release();
+            hybridSoftwareClusterBuffer?.Release();
+            hybridHardwareCountArgsBuffer?.Release();
+            hybridSoftwareCountArgsBuffer?.Release();
+            hybridClassifyDispatchArgsBuffer?.Release();
+            hybridSoftwareDispatchArgsBuffer?.Release();
+            hybridDependencyBuffer?.Dispose();
+            hybridTraversalDependencyBuffer?.Dispose();
+            hybridSoftwareTileHeadBuffer?.Dispose();
+            hybridSoftwareTileNodeBuffer?.Dispose();
+            hybridSoftwareTileNodeCounterBuffer?.Dispose();
+            hybridSoftwareFallbackFlagsBuffer?.Dispose();
+            hybridSoftwareTileListBuffer?.Dispose();
+            hybridSoftwareTileCountArgsBuffer?.Dispose();
+            hybridSoftwareTileDispatchArgsBuffer?.Dispose();
+            hybridSoftwareTileDrawArgsBuffer?.Dispose();
+            hybridTraversalDependencyBuffer = null;
+            for (int i = 0; i < retiredHybridBuffers.Count; i++)
+                retiredHybridBuffers[i].Release();
+            retiredHybridBuffers.Clear();
+            for (int i = 0; i < retiredHybridTileBuffers.Count; i++)
+                retiredHybridTileBuffers[i].Release();
+            retiredHybridTileBuffers.Clear();
+            hybridSoftwareTileHeadBuffer = null;
+            hybridSoftwareTileNodeBuffer = null;
+            hybridSoftwareTileNodeCounterBuffer = null;
+            hybridSoftwareFallbackFlagsBuffer = null;
+            hybridSoftwareTileListBuffer = null;
+            hybridSoftwareTileCountArgsBuffer = null;
+            hybridSoftwareTileDispatchArgsBuffer = null;
+            hybridSoftwareTileDrawArgsBuffer = null;
+            hybridSoftwareTileCapacity = 0;
+            hybridSoftwareTileNodeCapacity = 0;
+            hybridSoftwareFallbackCapacity = 0;
+            ClearHybridBufferReferences();
+        }
+
+        void ClearHybridBufferReferences()
+        {
+            hybridHardwareClusterBuffer = null;
+            hybridSoftwareClusterBuffer = null;
+            hybridHardwareCountArgsBuffer = null;
+            hybridSoftwareCountArgsBuffer = null;
+            hybridClassifyDispatchArgsBuffer = null;
+            hybridSoftwareDispatchArgsBuffer = null;
+            hybridDependencyBuffer = null;
+            hybridClusterCapacity = 0;
+            hybridGeometryGeneration = -1;
+            hybridQueueFrame = -1;
+            hybridUsesTraversalBins = false;
+        }
+
+        ComputeBuffer ActiveHybridHardwareClusters => hybridUsesTraversalBins
+            ? batchedCulling?.HardwareRasterClusterBuffer
+            : hybridHardwareClusterBuffer;
+        ComputeBuffer ActiveHybridSoftwareClusters => hybridUsesTraversalBins
+            ? batchedCulling?.SoftwareRasterClusterBuffer
+            : hybridSoftwareClusterBuffer;
+        ComputeBuffer ActiveHybridHardwareCountArgs => hybridUsesTraversalBins
+            ? batchedCulling?.HardwareRasterCountArgsBuffer
+            : hybridHardwareCountArgsBuffer;
+        ComputeBuffer ActiveHybridSoftwareCountArgs => hybridUsesTraversalBins
+            ? batchedCulling?.SoftwareRasterCountArgsBuffer
+            : hybridSoftwareCountArgsBuffer;
+        ComputeBuffer ActiveHybridSoftwareDispatchArgs => hybridUsesTraversalBins
+            ? batchedCulling?.SoftwareRasterDispatchArgsBuffer
+            : hybridSoftwareDispatchArgsBuffer;
+        GraphicsBuffer ActiveHybridDependency => hybridUsesTraversalBins
+            ? hybridTraversalDependencyBuffer
+            : hybridDependencyBuffer;
+
+        void EnsureHybridTraversalDependency()
+        {
+            hybridTraversalDependencyBuffer ??= new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                1,
+                sizeof(uint));
+        }
+
+        bool RecordHybridClassificationPass(
+            RenderGraph renderGraph,
+            Camera camera,
+            int selectionKey,
+            ComputeBuffer vertexData,
+            ComputeBuffer indices,
+            ComputeBuffer instanceLocalToWorld,
+            ComputeBuffer triangleCluster,
+            ComputeBuffer clusterBounds,
+            ComputeBuffer clusterLongestEdge,
+            int vertexStride,
+            ProfilingSampler profilingSampler)
+        {
+            // RenderGraph recording happens before FirstCull executes. Querying
+            // execution-time frame stamps here necessarily selects the fallback
+            // classifier every frame. Admit the recorded producer contract and
+            // let the RG dependency order the actual queue writes before SW/HW
+            // consumers.
+            hybridUsesTraversalBins = batchedCulling != null &&
+                                      batchedCulling.CanRecordTraversalRasterBinQueue;
+            if (hybridUsesTraversalBins)
+            {
+                hybridQueueFrame = Time.frameCount;
+                hybridQueueSelectionKey = selectionKey;
+                return true;
+            }
+
+            if (!EnsureHybridClusterBuffers() || camera == null ||
+                batchedCulling.VisibleDrawClusterBuffer == null ||
+                batchedCulling.VisibleDrawCountArgsBuffer == null ||
+                vertexData == null || indices == null || instanceLocalToWorld == null ||
+                triangleCluster == null || clusterBounds == null || clusterLongestEdge == null)
+                return false;
+
+            using (var builder = renderGraph.AddComputePass<HybridClassifyRgPassData>(
+                       "Nanite/HybridClassifyClusters",
+                       out var passData,
+                       profilingSampler))
+            {
+                passData.camera = camera;
+                passData.inputClusters = batchedCulling.VisibleDrawClusterBuffer;
+                passData.inputCountArgs = batchedCulling.VisibleDrawCountArgsBuffer;
+                passData.hardwareClusters = hybridHardwareClusterBuffer;
+                passData.softwareClusters = hybridSoftwareClusterBuffer;
+                passData.hardwareCountArgs = hybridHardwareCountArgsBuffer;
+                passData.softwareCountArgs = hybridSoftwareCountArgsBuffer;
+                passData.classifyDispatchArgs = hybridClassifyDispatchArgsBuffer;
+                passData.softwareDispatchArgs = hybridSoftwareDispatchArgsBuffer;
+                passData.vertexData = vertexData;
+                passData.indices = indices;
+                passData.instanceLocalToWorld = instanceLocalToWorld;
+                passData.triangleCluster = triangleCluster;
+                passData.clusterBounds = clusterBounds;
+                passData.clusterLongestEdge = clusterLongestEdge;
+                passData.vertexStride = vertexStride;
+                passData.selectionKey = selectionKey;
+                passData.dependencyBuffer = hybridDependencyBuffer;
+                builder.AllowPassCulling(false);
+                builder.AllowGlobalStateModification(true);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.dependencyBuffer), AccessFlags.Write);
+                builder.SetRenderFunc((HybridClassifyRgPassData data, ComputeGraphContext context) =>
+                {
+                    ComputeShader cs = settings.visibleTriangleCompactShader;
+                    context.cmd.SetBufferCounterValue(data.hardwareClusters, 0u);
+                    context.cmd.SetBufferCounterValue(data.softwareClusters, 0u);
+                    PrepareHybridDispatch(
+                        context.cmd,
+                        cs,
+                        kernelPrepareHybridDispatch,
+                        data.inputCountArgs,
+                        data.classifyDispatchArgs);
+                    context.cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridInputClusters", data.inputClusters);
+                    context.cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridInputCountArgs", data.inputCountArgs);
+                    context.cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridHardwareClusters", data.hardwareClusters);
+                    context.cmd.SetComputeBufferParam(cs, kernelClassifyHybridClusters, "_HybridSoftwareClusters", data.softwareClusters);
+                    BindHybridGeometry(
+                        context.cmd,
+                        cs,
+                        kernelClassifyHybridClusters,
+                        data.camera,
+                        data.vertexData,
+                        data.indices,
+                        data.instanceLocalToWorld,
+                        data.triangleCluster,
+                        data.clusterBounds,
+                        data.clusterLongestEdge,
+                        data.vertexStride);
+                    context.cmd.SetComputeFloatParam(
+                        cs,
+                        "_HybridSoftwareMaxEdgePixels",
+                        Mathf.Max(1f, settings.hybridSoftwareMaxEdgePixels));
+                    context.cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+                    context.cmd.DispatchCompute(cs, kernelClassifyHybridClusters, data.classifyDispatchArgs, 0u);
+                    context.cmd.CopyCounterValue(data.hardwareClusters, data.hardwareCountArgs, 0u);
+                    context.cmd.CopyCounterValue(data.softwareClusters, data.softwareCountArgs, 0u);
+                    PrepareHybridDispatch(
+                        context.cmd,
+                        cs,
+                        kernelPrepareHybridDispatch,
+                        data.softwareCountArgs,
+                        data.softwareDispatchArgs);
+                    hybridQueueFrame = Time.frameCount;
+                    hybridQueueSelectionKey = data.selectionKey;
+                });
+            }
+            return true;
+        }
+
+        void RecordHybridSoftwareRasterPass(
+            RenderGraph renderGraph,
+            Camera camera,
+            TextureHandle softwareDepth,
+            TextureHandle softwareWinner,
+            ComputeBuffer vertexData,
+            ComputeBuffer indices,
+            ComputeBuffer instanceLocalToWorld,
+            int vertexStride,
+            int screenWidth,
+            int screenHeight,
+            ProfilingSampler profilingSampler)
+        {
+            using (var builder = renderGraph.AddComputePass<HybridSoftwareRasterRgPassData>(
+                       "Nanite/HybridSoftwareSetup",
+                       out var passData,
+                       profilingSampler))
+            {
+                passData.softwareDepth = softwareDepth;
+                passData.softwareWinner = softwareWinner;
+                passData.hardwareClusters = ActiveHybridHardwareClusters;
+                passData.hardwareCountArgs = ActiveHybridHardwareCountArgs;
+                passData.softwareClusters = ActiveHybridSoftwareClusters;
+                passData.softwareCountArgs = ActiveHybridSoftwareCountArgs;
+                passData.softwareDispatchArgs = ActiveHybridSoftwareDispatchArgs;
+                passData.vertexData = vertexData;
+                passData.indices = indices;
+                passData.instanceLocalToWorld = instanceLocalToWorld;
+                passData.worldToClip = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true) * camera.worldToCameraMatrix;
+                passData.vertexStride = vertexStride;
+                passData.screenWidth = screenWidth;
+                passData.screenHeight = screenHeight;
+                passData.tileCountX = Mathf.Max(1, (screenWidth + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+                passData.tileCountY = Mathf.Max(1, (screenHeight + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+                passData.tileCount = passData.tileCountX * passData.tileCountY;
+                passData.tileHeads = hybridSoftwareTileHeadBuffer;
+                passData.tileNodes = hybridSoftwareTileNodeBuffer;
+                passData.tileNodeCounter = hybridSoftwareTileNodeCounterBuffer;
+                passData.fallbackFlags = hybridSoftwareFallbackFlagsBuffer;
+                passData.tileNodeCapacity = hybridSoftwareTileNodeCapacity;
+                passData.tileList = hybridSoftwareTileListBuffer;
+                passData.tileCountArgs = hybridSoftwareTileCountArgsBuffer;
+                passData.tileDispatchArgs = hybridSoftwareTileDispatchArgsBuffer;
+                passData.tileDrawArgs = hybridSoftwareTileDrawArgsBuffer;
+                passData.dependencyBuffer = ActiveHybridDependency;
+                builder.AllowPassCulling(false);
+                builder.AllowGlobalStateModification(true);
+                builder.EnableAsyncCompute(true);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileHeads), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileNodes), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileNodeCounter), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.fallbackFlags), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileList), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileCountArgs), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileDispatchArgs), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileDrawArgs), AccessFlags.ReadWrite);
+                if (passData.dependencyBuffer != null)
+                    builder.UseBuffer(renderGraph.ImportBuffer(passData.dependencyBuffer), AccessFlags.ReadWrite);
+                builder.SetRenderFunc((HybridSoftwareRasterRgPassData data, ComputeGraphContext context) =>
+                {
+                    ComputeShader cs = settings.visibleTriangleCompactShader;
+                    SetHybridScreenParams(context.cmd, cs, data.screenWidth, data.screenHeight);
+                    SetHybridTileParams(context.cmd, cs, data.tileCountX, data.tileCountY, data.tileCount);
+                    context.cmd.SetBufferCounterValue(data.tileList, 0u);
+                    context.cmd.SetComputeBufferParam(
+                        cs,
+                        kernelClearHybridTileHeads,
+                        "_HybridSoftwareTileHeads",
+                        data.tileHeads);
+                    context.cmd.DispatchCompute(
+                        cs,
+                        kernelClearHybridTileHeads,
+                        Mathf.Max(1, (data.tileCount + 255) / 256),
+                        1,
+                        1);
+
+                    context.cmd.SetComputeBufferParam(
+                        cs,
+                        kernelClearHybridTileWork,
+                        "_HybridSoftwareTileNodeCounter",
+                        data.tileNodeCounter);
+                    context.cmd.DispatchCompute(cs, kernelClearHybridTileWork, 1, 1, 1);
+
+                    BindHybridSoftwareGeometryKernel(context.cmd, cs, kernelBuildHybridTileWork, data);
+                    context.cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileHeads", data.tileHeads);
+                    context.cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileNodes", data.tileNodes);
+                    context.cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileNodeCounter", data.tileNodeCounter);
+                    context.cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareFallbackFlags", data.fallbackFlags);
+                    context.cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridSoftwareTileList", data.tileList);
+                    context.cmd.SetComputeBufferParam(cs, kernelBuildHybridTileWork, "_HybridHardwareClusters", data.hardwareClusters);
+                    context.cmd.SetComputeIntParam(cs, "_HybridTileNodeCapacity", Mathf.Max(1, data.tileNodeCapacity));
+                    context.cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+                    context.cmd.DispatchCompute(cs, kernelBuildHybridTileWork, data.softwareDispatchArgs, 0u);
+
+                    // Overflow is correctness preserving: complete clusters are
+                    // appended back to the HW queue and its indirect count is
+                    // refreshed before the indexed build consumes it.
+                    context.cmd.CopyCounterValue(data.hardwareClusters, data.hardwareCountArgs, 0u);
+                    context.cmd.CopyCounterValue(data.tileList, data.tileCountArgs, 0u);
+                    context.cmd.CopyCounterValue(data.tileList, data.tileDrawArgs, sizeof(uint));
+                    PrepareHybridDispatch(
+                        context.cmd,
+                        cs,
+                        kernelPrepareHybridDispatch,
+                        data.tileCountArgs,
+                        data.tileDispatchArgs);
+                });
+            }
+
+            // Once setup has finalized the overflow-safe HW queue, software
+            // tile resolve and indexed HW build/raster become independent
+            // consumers of the same fence and can overlap on async compute and
+            // graphics queues, matching the production Nanite scheduling model.
+            using (var builder = renderGraph.AddComputePass<HybridSoftwareRasterRgPassData>(
+                       "Nanite/HybridSoftwareRaster",
+                       out var passData,
+                       profilingSampler))
+            {
+                passData.softwareDepth = softwareDepth;
+                passData.softwareWinner = softwareWinner;
+                passData.softwareClusters = ActiveHybridSoftwareClusters;
+                passData.softwareCountArgs = ActiveHybridSoftwareCountArgs;
+                passData.vertexData = vertexData;
+                passData.indices = indices;
+                passData.instanceLocalToWorld = instanceLocalToWorld;
+                passData.worldToClip = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true) * camera.worldToCameraMatrix;
+                passData.vertexStride = vertexStride;
+                passData.screenWidth = screenWidth;
+                passData.screenHeight = screenHeight;
+                passData.tileCountX = Mathf.Max(1, (screenWidth + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+                passData.tileCountY = Mathf.Max(1, (screenHeight + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+                passData.tileCount = passData.tileCountX * passData.tileCountY;
+                passData.tileHeads = hybridSoftwareTileHeadBuffer;
+                passData.tileNodes = hybridSoftwareTileNodeBuffer;
+                passData.fallbackFlags = hybridSoftwareFallbackFlagsBuffer;
+                passData.tileList = hybridSoftwareTileListBuffer;
+                passData.tileCountArgs = hybridSoftwareTileCountArgsBuffer;
+                passData.tileDispatchArgs = hybridSoftwareTileDispatchArgsBuffer;
+                passData.dependencyBuffer = ActiveHybridDependency;
+                builder.AllowPassCulling(false);
+                builder.AllowGlobalStateModification(true);
+                builder.EnableAsyncCompute(true);
+                builder.UseTexture(softwareDepth, AccessFlags.Write);
+                builder.UseTexture(softwareWinner, AccessFlags.Write);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileHeads), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileNodes), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.fallbackFlags), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileList), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileCountArgs), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileDispatchArgs), AccessFlags.Read);
+                if (passData.dependencyBuffer != null)
+                    builder.UseBuffer(renderGraph.ImportBuffer(passData.dependencyBuffer), AccessFlags.Read);
+                builder.SetRenderFunc((HybridSoftwareRasterRgPassData data, ComputeGraphContext context) =>
+                {
+                    ComputeShader cs = settings.visibleTriangleCompactShader;
+                    BindHybridSoftwareRasterKernel(context.cmd, cs, kernelSoftwareRasterTiles, data);
+                    context.cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileHeads", data.tileHeads);
+                    context.cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileNodes", data.tileNodes);
+                    context.cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareFallbackFlags", data.fallbackFlags);
+                    context.cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileListRead", data.tileList);
+                    context.cmd.SetComputeBufferParam(cs, kernelSoftwareRasterTiles, "_HybridSoftwareTileCountArgs", data.tileCountArgs);
+                    context.cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+                    context.cmd.DispatchCompute(cs, kernelSoftwareRasterTiles, data.tileDispatchArgs, 0u);
+                });
+            }
+        }
+
+        static void SetHybridScreenParams(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int screenWidth,
+            int screenHeight)
+        {
+            cmd.SetComputeIntParam(cs, "_HybridScreenWidth", Mathf.Max(1, screenWidth));
+            cmd.SetComputeIntParam(cs, "_HybridScreenHeight", Mathf.Max(1, screenHeight));
+            cmd.SetComputeIntParam(cs, "_HybridReversedZ", SystemInfo.usesReversedZBuffer ? 1 : 0);
+            cmd.SetComputeIntParam(cs, "_HybridDepthOnly", 0);
+            cmd.SetComputeIntParam(cs, "_HybridShadowMode", 0);
+        }
+
+        static void SetHybridTileParams(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int tileCountX,
+            int tileCountY,
+            int tileCount)
+        {
+            cmd.SetComputeIntParam(cs, "_HybridTileCountX", Mathf.Max(1, tileCountX));
+            cmd.SetComputeIntParam(cs, "_HybridTileCountY", Mathf.Max(1, tileCountY));
+            cmd.SetComputeIntParam(cs, "_HybridTileCount", Mathf.Max(1, tileCount));
+            cmd.SetComputeIntParam(cs, "_HybridTileSize", kHybridSoftwareTileSize);
+        }
+
+        static void PrepareHybridDispatch(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel,
+            ComputeBuffer countArgs,
+            ComputeBuffer dispatchArgs)
+        {
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridPrepareCountArgs", countArgs);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridDispatchArgs", dispatchArgs);
+            cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+            cmd.DispatchCompute(cs, kernel, 1, 1, 1);
+        }
+
+        static void PrepareHybridDispatch(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel,
+            GraphicsBuffer countArgs,
+            GraphicsBuffer dispatchArgs)
+        {
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridPrepareCountArgs", countArgs);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridDispatchArgs", dispatchArgs);
+            cmd.SetComputeIntParam(cs, "_HybridDispatchGroupsX", 65535);
+            cmd.DispatchCompute(cs, kernel, 1, 1, 1);
+        }
+
+        void BindHybridGeometry(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel,
+            Camera camera,
+            ComputeBuffer vertexData,
+            ComputeBuffer indices,
+            ComputeBuffer instanceLocalToWorld,
+            ComputeBuffer triangleCluster,
+            ComputeBuffer clusterBounds,
+            ComputeBuffer clusterLongestEdge,
+            int vertexStride)
+        {
+            Matrix4x4 worldToClip = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true) * camera.worldToCameraMatrix;
+            BindHybridGeometry(
+                cmd,
+                cs,
+                kernel,
+                worldToClip,
+                vertexData,
+                indices,
+                instanceLocalToWorld,
+                triangleCluster,
+                clusterBounds,
+                clusterLongestEdge,
+                vertexStride);
+        }
+
+        void BindHybridGeometry(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel,
+            Matrix4x4 worldToClip,
+            ComputeBuffer vertexData,
+            ComputeBuffer indices,
+            ComputeBuffer instanceLocalToWorld,
+            ComputeBuffer triangleCluster,
+            ComputeBuffer clusterBounds,
+            ComputeBuffer clusterLongestEdge,
+            int vertexStride)
+        {
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridVertexData", vertexData);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridIndices", indices);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridInstanceLocalToWorld", instanceLocalToWorld);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridTriangleCluster", triangleCluster);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridClusterBounds", clusterBounds);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridClusterLongestEdge", clusterLongestEdge);
+            cmd.SetComputeMatrixParam(cs, "_HybridWorldToClip", worldToClip);
+            cmd.SetComputeIntParam(cs, "_HybridVertexStride", Mathf.Max(3, vertexStride));
+            BindHybridPackedGeometry(cmd, cs, kernel);
+        }
+
+        void BindHybridSoftwareRasterKernel(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel,
+            HybridSoftwareRasterRgPassData data)
+        {
+            BindHybridSoftwareGeometryKernel(cmd, cs, kernel, data);
+            cmd.SetComputeTextureParam(cs, kernel, "_HybridSoftwareDepth", data.softwareDepth);
+            cmd.SetComputeTextureParam(cs, kernel, "_HybridSoftwareWinner", data.softwareWinner);
+        }
+
+        void BindHybridSoftwareGeometryKernel(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel,
+            HybridSoftwareRasterRgPassData data)
+        {
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridSoftwareClustersRead", data.softwareClusters);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridSoftwareCountArgs", data.softwareCountArgs);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridVertexData", data.vertexData);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridIndices", data.indices);
+            cmd.SetComputeBufferParam(cs, kernel, "_HybridInstanceLocalToWorld", data.instanceLocalToWorld);
+            cmd.SetComputeMatrixParam(cs, "_HybridWorldToClip", data.worldToClip);
+            cmd.SetComputeIntParam(cs, "_HybridVertexStride", Mathf.Max(3, data.vertexStride));
+            BindHybridPackedGeometry(cmd, cs, kernel);
+            SetHybridScreenParams(cmd, cs, data.screenWidth, data.screenHeight);
+            SetHybridTileParams(cmd, cs, data.tileCountX, data.tileCountY, data.tileCount);
+        }
+
+        void BindHybridPackedGeometry(
+            IComputeCommandBuffer cmd,
+            ComputeShader cs,
+            int kernel)
+        {
+            bool usePacked = CanBindPackedPageGeometry();
+            cmd.SetComputeIntParam(cs, "_UsePackedPageGeometry", usePacked ? 1 : 0);
+            cmd.SetComputeBufferParam(
+                cs,
+                kernel,
+                "_TrianglePageRefs",
+                sceneVisibilityBackend.TrianglePageRefBuffer);
+            if (usePacked)
+            {
+                cmd.SetComputeBufferParam(
+                    cs,
+                    kernel,
+                    "_NaniteResidentPageTable",
+                    sceneVisibilityBackend.ResidentPageTableBuffer);
+                cmd.SetComputeBufferParam(
+                    cs,
+                    kernel,
+                    "_NaniteResidentVertices",
+                    sceneVisibilityBackend.ResidentVertexBuffer);
+                cmd.SetComputeBufferParam(
+                    cs,
+                    kernel,
+                    "_NaniteResidentIndices",
+                    sceneVisibilityBackend.ResidentIndexBuffer);
+            }
+            else
+            {
+                // Unity validates every resource referenced by a compute kernel even
+                // when the runtime branch selects compatibility geometry. Keep typed,
+                // one-element fallbacks bound so Hybrid never inherits stale Page SRVs.
+                cmd.SetComputeBufferParam(
+                    cs,
+                    kernel,
+                    "_NaniteResidentPageTable",
+                    sceneVisibilityBackend.FallbackResidentPageTableBuffer);
+                cmd.SetComputeBufferParam(
+                    cs,
+                    kernel,
+                    "_NaniteResidentVertices",
+                    sceneVisibilityBackend.FallbackResidentVertexBuffer);
+                cmd.SetComputeBufferParam(
+                    cs,
+                    kernel,
+                    "_NaniteResidentIndices",
+                    sceneVisibilityBackend.FallbackResidentIndexBuffer);
+            }
+        }
+
+        void RecordHybridMergePass(
+            RenderGraph renderGraph,
+            Material rasterMaterial,
+            TextureHandle vbuffer,
+            TextureHandle rasterDepth,
+            TextureHandle softwareDepth,
+            TextureHandle softwareWinner,
+            int screenWidth,
+            int screenHeight,
+            ProfilingSampler profilingSampler)
+        {
+            using (var builder = renderGraph.AddRasterRenderPass<HybridMergeRgPassData>(
+                       "Nanite/HybridSoftwareMerge",
+                       out var passData,
+                       profilingSampler))
+            {
+                passData.material = rasterMaterial;
+                passData.softwareDepth = softwareDepth;
+                passData.softwareWinner = softwareWinner;
+                passData.softwareClusters = ActiveHybridSoftwareClusters;
+                passData.tileList = hybridSoftwareTileListBuffer;
+                passData.tileDrawArgs = hybridSoftwareTileDrawArgsBuffer;
+                passData.screenWidth = screenWidth;
+                passData.screenHeight = screenHeight;
+                passData.tileCountX = Mathf.Max(1, (screenWidth + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize);
+                builder.AllowPassCulling(false);
+                builder.AllowGlobalStateModification(true);
+                builder.UseTexture(softwareDepth, AccessFlags.Read);
+                builder.UseTexture(softwareWinner, AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileList), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(passData.tileDrawArgs), AccessFlags.Read);
+                builder.SetRenderAttachment(vbuffer, 0, AccessFlags.ReadWrite);
+                if (rasterDepth.IsValid())
+                    builder.SetRenderAttachmentDepth(rasterDepth, AccessFlags.ReadWrite);
+                builder.SetRenderFunc((HybridMergeRgPassData data, RasterGraphContext context) =>
+                {
+                    context.cmd.SetGlobalTexture(ShaderIds.NaniteSoftwareDepth, data.softwareDepth);
+                    context.cmd.SetGlobalTexture(ShaderIds.NaniteSoftwareWinner, data.softwareWinner);
+                    context.cmd.SetGlobalBuffer(ShaderIds.NaniteSoftwareClusters, data.softwareClusters);
+                    context.cmd.SetGlobalBuffer(ShaderIds.NaniteSoftwareTileList, data.tileList);
+                    context.cmd.SetGlobalInt(ShaderIds.NaniteSoftwareScreenWidth, data.screenWidth);
+                    context.cmd.SetGlobalInt(ShaderIds.NaniteSoftwareScreenHeight, data.screenHeight);
+                    context.cmd.SetGlobalInt(ShaderIds.NaniteSoftwareTileCountX, data.tileCountX);
+                    context.cmd.SetGlobalInt(ShaderIds.NaniteSoftwareTileSize, kHybridSoftwareTileSize);
+                    context.cmd.DrawProceduralIndirect(
+                        Matrix4x4.identity,
+                        data.material,
+                        3,
+                        MeshTopology.Triangles,
+                        data.tileDrawArgs,
+                        0);
+                });
+            }
+        }
+
         void RecordFormalRasterPass(
             RenderGraph renderGraph,
             ProfilingSampler profilingSampler,
@@ -2294,36 +4413,67 @@ namespace Nanite
             int formalScreenWidth,
             int formalScreenHeight,
             int compactSelectionKey,
-            bool clearColorHint)
+            bool clearColorHint,
+            bool hybridHardwareQueue = false)
         {
             _ = clearColorHint;
-            RecordIndexedDrawBuildPass(renderGraph, camera, compactSelectionKey, profilingSampler);
-            using (var builder = renderGraph.AddRasterRenderPass<FormalRasterRgPassData>(passName, out var passData, profilingSampler))
+            int capacity = sceneVisibilityBackend != null
+                ? sceneVisibilityBackend.IndexedDrawClusterCapacity
+                : 0;
+            int chunkHint = hybridHardwareQueue
+                ? indexedHybridChunkHint
+                : indexedCameraChunkHint;
+            int chunkCount = settings.enableIndexedClusterRaster && capacity > 0
+                ? Mathf.Clamp(chunkHint, 1, 16)
+                : 1;
+            for (int chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++)
             {
-                passData.material = rasterMaterial;
-                passData.camera = camera;
-                passData.screenWidth = formalScreenWidth;
-                passData.screenHeight = formalScreenHeight;
-                passData.compactSelectionKey = compactSelectionKey;
-                builder.AllowPassCulling(false);
-                // Raster 用 MPB/全局 buffer 绑定；仍需改全局 shader 属性。
-                builder.AllowGlobalStateModification(true);
-                // 禁止 WriteAll：WriteAll = Write|Discard，未覆盖像素不会 Clear，VBuffer 会跨帧残留。
-                // Raster2 追加写时依赖 Load（首用 clearBuffer 清屏）。
-                builder.SetRenderAttachment(vbuffer, 0, AccessFlags.Write);
-                if (rasterDepth.IsValid())
-                    builder.SetRenderAttachmentDepth(rasterDepth, AccessFlags.ReadWrite);
-
-                builder.SetRenderFunc((FormalRasterRgPassData data, RasterGraphContext context) =>
+                int clusterOffset = chunkIndex * capacity;
+                bool finalChunk = chunkIndex == chunkCount - 1;
+                RecordIndexedDrawBuildPass(
+                    renderGraph,
+                    camera,
+                    compactSelectionKey,
+                    profilingSampler,
+                    clusterOffset,
+                    allowProceduralFallback: finalChunk,
+                    drawClusters: hybridHardwareQueue ? ActiveHybridHardwareClusters : null,
+                    drawCountArgs: hybridHardwareQueue ? ActiveHybridHardwareCountArgs : null,
+                    dependencyBuffer: hybridHardwareQueue ? ActiveHybridDependency : null);
+                string chunkPassName = chunkCount > 1 ? $"{passName}/Chunk{chunkIndex}" : passName;
+                using (var builder = renderGraph.AddRasterRenderPass<FormalRasterRgPassData>(chunkPassName, out var passData, profilingSampler))
                 {
-                    ExecuteFormalVisibilityRaster(
-                        context.cmd,
-                        data.material,
-                        data.camera,
-                        data.screenWidth,
-                        data.screenHeight,
-                        data.compactSelectionKey);
-                });
+                    passData.material = rasterMaterial;
+                    passData.camera = camera;
+                    passData.screenWidth = formalScreenWidth;
+                    passData.screenHeight = formalScreenHeight;
+                    passData.compactSelectionKey = compactSelectionKey;
+                    passData.compactClusterOffset = clusterOffset;
+                    passData.hybridHardwareQueue = hybridHardwareQueue;
+                    passData.drawProceduralFallback = finalChunk;
+                    builder.AllowPassCulling(false);
+                    builder.AllowGlobalStateModification(true);
+                    builder.SetRenderAttachment(
+                        vbuffer,
+                        0,
+                        chunkIndex > 0 ? AccessFlags.ReadWrite : AccessFlags.Write);
+                    if (rasterDepth.IsValid())
+                        builder.SetRenderAttachmentDepth(rasterDepth, AccessFlags.ReadWrite);
+
+                    builder.SetRenderFunc((FormalRasterRgPassData data, RasterGraphContext context) =>
+                    {
+                        ExecuteFormalVisibilityRaster(
+                            context.cmd,
+                            data.material,
+                            data.camera,
+                            data.screenWidth,
+                            data.screenHeight,
+                            data.compactSelectionKey,
+                            data.compactClusterOffset,
+                            data.hybridHardwareQueue,
+                            data.drawProceduralFallback);
+                    });
+                }
             }
         }
 
@@ -2382,15 +4532,27 @@ namespace Nanite
             Camera camera,
             int screenWidth,
             int screenHeight,
-            int compactSelectionKey = kCompactSelectionMerged)
+            int compactSelectionKey = kCompactSelectionMerged,
+            int compactClusterOffset = 0,
+            bool hybridHardwareQueue = false,
+            bool drawProceduralFallback = true)
         {
             if (cmd == null || material == null || camera == null)
                 return;
-            var rasterMode = (FormalRasterizationMode)Mathf.Clamp(settings.formalRasterizationMode, 0, (int)FormalRasterizationMode.HybridReserved);
-            if (rasterMode != FormalRasterizationMode.HardwareOnly && !loggedHybridRasterWarning)
+            var rasterMode = (FormalRasterizationMode)Mathf.Clamp(settings.formalRasterizationMode, 0, (int)FormalRasterizationMode.HybridSoftwareHardware);
+            if (rasterMode != FormalRasterizationMode.HardwareOnly &&
+                hybridHardwareQueue &&
+                !loggedHybridRasterWarning)
             {
                 loggedHybridRasterWarning = true;
-                Debug.LogWarning("[Nanite][RF] Hybrid soft/hard 光栅尚未打通，当前回退 HardwareOnly。");
+                string binSource = hybridUsesTraversalBins
+                    ? "traversal-produced raster bins"
+                    : "post-cull compatibility classification";
+                Debug.Log(
+                    $"[Nanite][RF] Hybrid cluster raster active: {binSource} -> " +
+                    "single-setup linked tile queue -> async tile/wave software raster || " +
+                    $"indexed hardware raster -> visibility merge; tileNodes={hybridSoftwareTileNodeCapacity}, " +
+                    "overflow=GPU whole-cluster HW fallback.");
             }
             if (!TryPrepareSceneVisibility(camera))
                 return;
@@ -2428,6 +4590,12 @@ namespace Nanite
                 sceneVisibilityBackend.InstanceCount,
                 sceneVisibilityBackend.MaxSubMeshCount);
             BindCompactDrawState(cmd, compactSelectionKey);
+            if (hybridHardwareQueue &&
+                ActiveHybridHardwareClusters != null)
+            {
+                cmd.SetGlobalFloat(ShaderIds.UseDirectVisibleDrawQueue, 1f);
+                cmd.SetGlobalBuffer(ShaderIds.CompactedDrawClusters, ActiveHybridHardwareClusters);
+            }
             bool useCompactVBuffer = CanUseCompactFormalVBuffer();
             CoreUtils.SetKeyword(material, kCompactVBufferKeyword, useCompactVBuffer);
             const int kFormalRasterPass = 1;
@@ -2438,9 +4606,18 @@ namespace Nanite
                     material,
                     kFormalRasterPass,
                     compactSelectionKey,
-                    indexedMpb))
+                    indexedMpb,
+                    compactClusterOffset,
+                    drawProceduralFallback))
             {
+                // A multi-chunk frame is only valid when every chunk was built.
+                // If indexed submission becomes unavailable unexpectedly, draw
+                // the complete compatibility queue once instead of replaying it
+                // once per recorded chunk.
+                if (compactClusterOffset != 0)
+                    return;
                 indexedMpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+                indexedMpb.SetFloat(ShaderIds.CompactedClusterOffset, 0.0f);
                 cmd.DrawProceduralIndirect(
                     Matrix4x4.identity,
                     material,
@@ -2463,8 +4640,8 @@ namespace Nanite
                     $"submit={(HasValidIndexedDraw(compactSelectionKey) ? "indexedClusterIndirect" : (lastCompactUsedDirectQueue ? "cullQueueIndirect" : "compactIndirect"))}, selection={sel}, " +
                     $"format={(useCompactVBuffer ? "RG32UI" : "RGBA32F")}, " +
                     $"geometrySource={(sceneVisibilityBackend.UsePackedPageRaster ? "residentCache" : "compatDecoded")}, " +
-                    $"residentAddress={(sceneVisibilityBackend.UsePackedPageRaster ? "directAbsoluteIndex" : "n/a")}, " +
-                    $"indexedCapacity=camera:{sceneVisibilityBackend.IndexedDrawClusterCapacity},shadow:{sceneVisibilityBackend.IndexedShadowClusterCapacity}," +
+                    $"residentAddress={(sceneVisibilityBackend.UsePackedPageRaster ? "pageId+localIndex" : "n/a")}, " +
+                    $"indexedCapacity=camera:{sceneVisibilityBackend.IndexedDrawClusterCapacity},shadowReuse:{sceneVisibilityBackend.IndexedShadowSharedClusterCapacity}," +
                     $"bufferMiB:{sceneVisibilityBackend.IndexedDrawBufferBytes / (1024f * 1024f):F1}, " +
                     $"bevyDual={settings.enableBevyFormalDualRaster}, pass=VBufferFormal");
             }
@@ -2498,8 +4675,18 @@ namespace Nanite
                 return;
 
             EnsureTileBuffers(screenWidth, screenHeight);
-            if (tileMaterialMaskBuffer == null || tileCount <= 0)
+            if (tileMaterialMaskBuffer == null ||
+                tileMaterialBinListBuffer == null ||
+                tileIndirectArgsBuffer == null ||
+                tileCount <= 0)
                 return;
+
+            cmd.SetComputeBufferParam(
+                settings.materialTileClassifyShader,
+                kernelClearMaterialTileBins,
+                ShaderIds.TileMaterialBinArgs,
+                tileIndirectArgsBuffer);
+            cmd.DispatchCompute(settings.materialTileClassifyShader, kernelClearMaterialTileBins, 1, 1, 1);
 
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.MaxSubMeshCount, sceneVisibilityBackend.MaxSubMeshCount);
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.TriangleCount, sceneVisibilityBackend.TriangleCount);
@@ -2507,13 +4694,18 @@ namespace Nanite
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.MaterialCount, sceneVisibilityBackend.MaterialCount);
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.TileCountX, tileCountX);
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.TileCountY, tileCountY);
+            cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.TileCount, tileCount);
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.TileSize, Mathf.Max(1, settings.materialTileSize));
             cmd.SetComputeIntParam(settings.materialTileClassifyShader, ShaderIds.UseNormalizedIds, ComputeFormalVBufferIdMode(sceneVisibilityBackend.TriangleCount));
             cmd.SetComputeVectorParam(settings.materialTileClassifyShader, ShaderIds.ScreenSize, new Vector4(screenWidth, screenHeight, 0, 0));
             cmd.SetComputeTextureParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.NaniteVBufferTex, vbuffer);
             cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.TriangleSubMesh, triangleSubMeshBuffer);
             cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.InstanceSubMeshMaterial, instanceSubMeshMaterialBuffer);
+            cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.InstanceMaterialRange, sceneVisibilityBackend.InstanceMaterialRangeBuffer);
+            cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.MaterialData, sceneVisibilityBackend.MaterialDataBuffer);
             cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.TileMaterialMask, tileMaterialMaskBuffer);
+            cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.TileMaterialBinList, tileMaterialBinListBuffer);
+            cmd.SetComputeBufferParam(settings.materialTileClassifyShader, kernelMaterialTileClassify, ShaderIds.TileMaterialBinArgs, tileIndirectArgsBuffer);
             if (keywordCompactVBufferClassifyInitialized)
             {
                 cmd.SetKeyword(
@@ -2540,8 +4732,47 @@ namespace Nanite
             if (sceneVisibilityBackend == null || !sceneVisibilityBackend.IsReady)
                 return false;
 
-            int minMaterials = Mathf.Max(1, settings.materialTileMinMaterialCount);
-            return sceneVisibilityBackend.MaterialCount >= minMaterials;
+            int minBins = Mathf.Max(1, settings.materialTileMinMaterialCount);
+            return ComputeFormalResolveExecutionBinCount() >= minBins;
+        }
+
+        int ComputeFormalResolveExecutionBinCount()
+        {
+            if (sceneVisibilityBackend == null || !sceneVisibilityBackend.IsReady)
+                return 0;
+
+            int familyMask = 0;
+            for (int materialId = 0; materialId < sceneVisibilityBackend.MaterialCount; materialId++)
+            {
+                int family = sceneVisibilityBackend.GetMaterialResolveFamily(materialId);
+                if (family > 0 && family < 31)
+                    familyMask |= 1 << family;
+            }
+
+            int absorbedFamilyMask = 0;
+            int compatibilityBinCount = 0;
+            for (int compatibilityBin = 1;
+                 compatibilityBin <= sceneVisibilityBackend.CompatibilityBinCount;
+                 compatibilityBin++)
+            {
+                if (sceneVisibilityBackend.GetCompatibilityBinRepresentativeMaterialId(compatibilityBin) < 0)
+                    continue;
+                compatibilityBinCount++;
+                int family = sceneVisibilityBackend.GetCompatibilityBinStateFamily(compatibilityBin);
+                if (family > 0 && family < 31 && (familyMask & (1 << family)) != 0)
+                    absorbedFamilyMask |= 1 << family;
+            }
+
+            int familyBinCount = 0;
+            for (int family = 1; family <= 8; family++)
+            {
+                if ((familyMask & (1 << family)) != 0 &&
+                    (absorbedFamilyMask & (1 << family)) == 0)
+                {
+                    familyBinCount++;
+                }
+            }
+            return familyBinCount + compatibilityBinCount;
         }
 
         bool CanUseCompactFormalVBuffer()
@@ -2613,9 +4844,12 @@ namespace Nanite
                 instanceSubMeshMaterialBuffer,
                 sceneVisibilityBackend.InstanceShBuffer,
                 tileMaterialMaskBuffer,
+                tileMaterialBinListBuffer,
                 triangleClusterBuffer,
                 trianglePageBuffer,
                 clusterVisibleBuffer);
+            cmd.SetGlobalBuffer(ShaderIds.InstanceMaterialRange, sceneVisibilityBackend.InstanceMaterialRangeBuffer);
+            cmd.SetGlobalBuffer(ShaderIds.MaterialData, sceneVisibilityBackend.MaterialDataBuffer);
             BindPackedPageGeometry(cmd);
             BindFormalResolveSharedUniforms(cmd, screenWidth, screenHeight, vbufferWidth, vbufferHeight, vertexStride);
             return true;
@@ -2674,19 +4908,43 @@ namespace Nanite
                 settings.enableMaterialTileCulling &&
                 settings.materialTileClassifyShader != null &&
                 tileMaterialMaskBuffer != null &&
+                tileMaterialBinListBuffer != null &&
                 tileIndirectArgsBuffer != null &&
                 tileCount > 0;
             cmd.SetGlobalFloat(ShaderIds.UseTileMaterialMask, useTileMask ? 1f : 0f);
+            cmd.SetGlobalFloat(ShaderIds.UseCompactedTileBins, useTileMask ? 1f : 0f);
+            if (useTileMask)
+                cmd.SetGlobalBuffer(ShaderIds.TileMaterialBinList, tileMaterialBinListBuffer);
 
             int drawCount = 0;
+            int familyDrawCount = 0;
+            int compatibilityDrawCount = 0;
             int resolvePass = GetFormalResolvePassIndex(material, kPassGBufferMerge, kResolvePassGBufferMergeFallback);
+            int familyMask = 0;
             for (int materialId = 0; materialId < sceneVisibilityBackend.MaterialCount; materialId++)
             {
-                if (materialId >= sceneVisibilityBackend.MaxMaterialCount)
-                    break;
+                int family = sceneVisibilityBackend.GetMaterialResolveFamily(materialId);
+                if (family > 0 && family < 31)
+                    familyMask |= 1 << family;
+            }
 
-                var sourceMaterial = sceneVisibilityBackend.GetMaterial(materialId);
-                BindFormalResolveMaterialBatch(cmd, material, sourceMaterial, materialId);
+            int absorbedFamilyMask = 0;
+            for (int compatibilityBin = 1;
+                 compatibilityBin <= sceneVisibilityBackend.CompatibilityBinCount;
+                 compatibilityBin++)
+            {
+                int family = sceneVisibilityBackend.GetCompatibilityBinStateFamily(compatibilityBin);
+                if (family > 0 && family < 31 && (familyMask & (1 << family)) != 0)
+                    absorbedFamilyMask |= 1 << family;
+            }
+
+            for (int family = 1; family <= 8; family++)
+            {
+                if ((familyMask & (1 << family)) == 0 ||
+                    (absorbedFamilyMask & (1 << family)) != 0)
+                    continue;
+                BindFormalResolveFamilyBatch(cmd, material, family);
+                cmd.SetGlobalFloat(ShaderIds.UseTileMaterialMask, useTileMask ? 1f : 0f);
                 if (useTileMask)
                 {
                     cmd.DrawProceduralIndirect(
@@ -2695,7 +4953,7 @@ namespace Nanite
                         resolvePass,
                         MeshTopology.Triangles,
                         tileIndirectArgsBuffer,
-                        0);
+                        family * sizeof(uint) * 4);
                 }
                 else
                 {
@@ -2708,7 +4966,64 @@ namespace Nanite
                         1);
                 }
                 drawCount++;
+                familyDrawCount++;
             }
+
+            int emittedAbsorbedFamilyMask = 0;
+            for (int compatibilityBin = 1;
+                 compatibilityBin <= sceneVisibilityBackend.CompatibilityBinCount;
+                 compatibilityBin++)
+            {
+                int materialId = sceneVisibilityBackend.GetCompatibilityBinRepresentativeMaterialId(compatibilityBin);
+                if (materialId < 0)
+                    continue;
+
+                var sourceMaterial = sceneVisibilityBackend.GetMaterial(materialId);
+                int stateFamily = sceneVisibilityBackend.GetCompatibilityBinStateFamily(compatibilityBin);
+                int absorbedFamily = stateFamily > 0 && stateFamily < 31 &&
+                                     (absorbedFamilyMask & (1 << stateFamily)) != 0 &&
+                                     (emittedAbsorbedFamilyMask & (1 << stateFamily)) == 0
+                    ? stateFamily
+                    : 0;
+                if (absorbedFamily != 0)
+                    emittedAbsorbedFamilyMask |= 1 << absorbedFamily;
+                BindFormalResolveCompatibilityBatch(
+                    cmd,
+                    material,
+                    sourceMaterial,
+                    materialId,
+                    compatibilityBin,
+                    absorbedFamily);
+                // Compatibility bins group all parameter variants sharing shader state and
+                // texture bindings. Bloom collisions only admit extra tiles; pixels still
+                // compare the exact bin stored in GpuMaterialData.
+                cmd.SetGlobalFloat(ShaderIds.UseTileMaterialMask, useTileMask ? 1f : 0f);
+                if (useTileMask)
+                {
+                    cmd.DrawProceduralIndirect(
+                        Matrix4x4.identity,
+                        material,
+                        resolvePass,
+                        MeshTopology.Triangles,
+                        tileIndirectArgsBuffer,
+                        (32 + (compatibilityBin & 31)) * sizeof(uint) * 4);
+                }
+                else
+                {
+                    cmd.DrawProcedural(
+                        Matrix4x4.identity,
+                        material,
+                        resolvePass,
+                        MeshTopology.Triangles,
+                        3,
+                        1);
+                }
+                drawCount++;
+                compatibilityDrawCount++;
+            }
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialMode, 0f);
+            cmd.SetGlobalFloat(ShaderIds.ResolveAbsorbedFamily, 0f);
+            cmd.SetGlobalFloat(ShaderIds.UseCompactedTileBins, 0f);
 
             RecordFormalPerfSample(1, drawCount, sceneVisibilityBackend.MaterialCount, 1f);
 
@@ -2717,12 +5032,13 @@ namespace Nanite
                 loggedFormalOnce = true;
                 Debug.Log(
                     $"[Nanite][RF] Formal Resolve: depthFill={(settings.enableFormalDepthFill ? 1 : 0)} gBufferBatches={drawCount} " +
-                    $"tri={sceneVisibilityBackend.TriangleCount} inst={sceneVisibilityBackend.InstanceCount} " +
+                    $"familyBins={familyDrawCount} compatibilityBins={compatibilityDrawCount} " +
+                    $"uniqueGeometryTriangles={sceneVisibilityBackend.TriangleCount} inst={sceneVisibilityBackend.InstanceCount} " +
                     $"uniqueMeshes={sceneVisibilityBackend.UniqueMeshCount} " +
                     $"sharedVertices={sceneVisibilityBackend.GeometryVertexCount}/{sceneVisibilityBackend.VirtualVertexCount} " +
                     $"sharedTriangles={sceneVisibilityBackend.TriangleCount}/{sceneVisibilityBackend.VirtualTriangleCount} " +
                     $"geometrySource={(sceneVisibilityBackend.UsePackedPageRaster ? "residentCache" : "compatDecoded")} " +
-                    $"residentAddress={(sceneVisibilityBackend.UsePackedPageRaster ? "directAbsoluteIndex" : "n/a")} " +
+                    $"residentAddress={(sceneVisibilityBackend.UsePackedPageRaster ? "pageId+localIndex" : "n/a")} " +
                     $"geometryMiB=compat:{sceneVisibilityBackend.CompatibilityGeometryBytes / (1024f * 1024f):F2}," +
                     $"resident:{sceneVisibilityBackend.ResidentGeometryBytes / (1024f * 1024f):F2}," +
                     $"pool:{sceneVisibilityBackend.PagePoolBytes / (1024f * 1024f):F2}," +
@@ -2784,8 +5100,6 @@ namespace Nanite
             int nextTileX = Mathf.Max(1, (Mathf.Max(1, width) + tileSize - 1) / tileSize);
             int nextTileY = Mathf.Max(1, (Mathf.Max(1, height) + tileSize - 1) / tileSize);
             int nextTileCount = Mathf.Max(1, nextTileX * nextTileY);
-            bool updateIndirectArgs = tileIndirectArgsBuffer == null || tileCount != nextTileCount;
-
             tileCountX = nextTileX;
             tileCountY = nextTileY;
             tileCount = nextTileCount;
@@ -2793,24 +5107,30 @@ namespace Nanite
             if (tileMaterialMaskBuffer == null || tileMaskCapacity < nextTileCount)
             {
                 tileMaterialMaskBuffer?.Release();
+                tileMaterialBinListBuffer?.Release();
                 tileMaskCapacity = Mathf.NextPowerOfTwo(nextTileCount);
                 tileMaterialMaskBuffer = new GraphicsBuffer(
                     GraphicsBuffer.Target.Structured,
                     tileMaskCapacity,
+                    sizeof(uint) * 2);
+                tileMaterialBinListBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    checked(tileMaskCapacity * kMaterialTileBinCount),
+                    sizeof(uint));
+            }
+            else if (tileMaterialBinListBuffer == null)
+            {
+                tileMaterialBinListBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    checked(tileMaskCapacity * kMaterialTileBinCount),
                     sizeof(uint));
             }
 
             if (tileIndirectArgsBuffer == null)
                 tileIndirectArgsBuffer = new GraphicsBuffer(
-                    GraphicsBuffer.Target.IndirectArguments,
-                    4,
+                    GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
+                    kMaterialTileBinCount * 4,
                     sizeof(uint));
-
-            if (updateIndirectArgs)
-            {
-                uint[] drawArgs = { 6u, (uint)nextTileCount, 0u, 0u };
-                tileIndirectArgsBuffer.SetData(drawArgs);
-            }
         }
 
         /// <summary>
@@ -2867,6 +5187,7 @@ namespace Nanite
             ComputeBuffer instanceSubMeshMaterialBuffer,
             ComputeBuffer instanceShBuffer,
             GraphicsBuffer tileMaskBuffer,
+            GraphicsBuffer tileBinListBuffer,
             ComputeBuffer triangleClusterBuffer,
             ComputeBuffer trianglePageBuffer,
             ComputeBuffer clusterVisibleBuffer)
@@ -2879,6 +5200,7 @@ namespace Nanite
             cmd.SetGlobalBuffer(ShaderIds.InstanceSubMeshMaterial, instanceSubMeshMaterialBuffer);
             cmd.SetGlobalBuffer(ShaderIds.InstanceSh, instanceShBuffer);
             cmd.SetGlobalBuffer(ShaderIds.TileMaterialMask, tileMaskBuffer);
+            cmd.SetGlobalBuffer(ShaderIds.TileMaterialBinList, tileBinListBuffer);
             cmd.SetGlobalBuffer(ShaderIds.TriangleCluster, triangleClusterBuffer);
             cmd.SetGlobalBuffer(ShaderIds.TrianglePage, trianglePageBuffer);
             cmd.SetGlobalBuffer(ShaderIds.ClusterVisible, clusterVisibleBuffer);
@@ -2889,6 +5211,7 @@ namespace Nanite
             sceneVisibilityBackend.UsePackedPageRaster &&
             sceneVisibilityBackend.ResidentVertexBuffer != null &&
             sceneVisibilityBackend.ResidentIndexBuffer != null &&
+            sceneVisibilityBackend.ResidentPageTableBuffer != null &&
             sceneVisibilityBackend.TrianglePageRefBuffer != null &&
             (!settings.enablePackedDirectDiagnostic ||
              (sceneVisibilityBackend.PackedPagePoolBuffer != null &&
@@ -2901,6 +5224,7 @@ namespace Nanite
             cmd.SetGlobalFloat(ShaderIds.UsePackedPageGeometry, usePacked ? 1f : 0f);
             if (!usePacked)
                 return;
+            cmd.SetGlobalBuffer(ShaderIds.ResidentPageTable, sceneVisibilityBackend.ResidentPageTableBuffer);
             if (settings.enablePackedDirectDiagnostic)
             {
                 cmd.SetGlobalFloat(ShaderIds.PackedDirectDiagnostic, 1f);
@@ -2919,6 +5243,7 @@ namespace Nanite
             cmd.SetGlobalFloat(ShaderIds.UsePackedPageGeometry, usePacked ? 1f : 0f);
             if (!usePacked)
                 return;
+            cmd.SetGlobalBuffer(ShaderIds.ResidentPageTable, sceneVisibilityBackend.ResidentPageTableBuffer);
             if (settings.enablePackedDirectDiagnostic)
             {
                 cmd.SetGlobalFloat(ShaderIds.PackedDirectDiagnostic, 1f);
@@ -2937,6 +5262,7 @@ namespace Nanite
             properties.SetFloat(ShaderIds.UsePackedPageGeometry, usePacked ? 1f : 0f);
             if (!usePacked)
                 return;
+            properties.SetBuffer(ShaderIds.ResidentPageTable, sceneVisibilityBackend.ResidentPageTableBuffer);
             if (settings.enablePackedDirectDiagnostic)
             {
                 properties.SetFloat(ShaderIds.PackedDirectDiagnostic, 1f);
@@ -2973,11 +5299,21 @@ namespace Nanite
             cmd.SetGlobalFloat(ShaderIds.UseNormalizedIds, ComputeFormalVBufferIdMode(sceneVisibilityBackend.TriangleCount));
             // 具体 pass 是否有同帧有效 mask 由 ExecuteFormalMaterialResolve 显式决定。
             cmd.SetGlobalFloat(ShaderIds.UseTileMaterialMask, 0f);
+            cmd.SetGlobalFloat(ShaderIds.UseCompactedTileBins, 0f);
         }
 
-        void BindFormalResolveMaterialBatch(RasterCommandBuffer cmd, Material resolveMaterial, Material sourceMaterial, int materialId)
+        void BindFormalResolveCompatibilityBatch(
+            RasterCommandBuffer cmd,
+            Material resolveMaterial,
+            Material sourceMaterial,
+            int representativeMaterialId,
+            int compatibilityBin,
+            int absorbedFamily)
         {
-            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialId, materialId);
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialId, representativeMaterialId);
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialMode, 2f);
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialFamily, compatibilityBin);
+            cmd.SetGlobalFloat(ShaderIds.ResolveAbsorbedFamily, absorbedFamily);
 
             var baseMap = ResolveTexture(
                 sourceMaterial,
@@ -2987,32 +5323,6 @@ namespace Nanite
             var metallicGlossMap = ResolveTexture(sourceMaterial, "_MetallicGlossMap", Texture2D.blackTexture);
             var occlusionMap = ResolveTexture(sourceMaterial, "_OcclusionMap", Texture2D.whiteTexture);
             var emissionMap = ResolveTexture(sourceMaterial, "_EmissionMap", Texture2D.blackTexture);
-
-            Color baseColor = ResolveColor(sourceMaterial, "_BaseColor", "_Color", Color.white);
-            Color emissionColor = ResolveColor(sourceMaterial, "_EmissionColor", "_Color", Color.black);
-            float cutoff = ResolveFloat(sourceMaterial, "_Cutoff", 0f);
-            float smoothness = ResolveFloat(sourceMaterial, "_Smoothness", 0.5f);
-            float metallic = ResolveFloat(sourceMaterial, "_Metallic", 0f);
-            float bumpScale = ResolveFloat(sourceMaterial, "_BumpScale", 1f);
-            float occlusionStrength = ResolveFloat(sourceMaterial, "_OcclusionStrength", 1f);
-            float alphaClip = IsMaterialAlphaClipEnabled(sourceMaterial) ? 1f : 0f;
-            float hasBaseMap = (HasMeaningfulTexture(sourceMaterial, "_BaseMap") || HasMeaningfulTexture(sourceMaterial, "_MainTex")) ? 1f : 0f;
-            float hasNormalMap = HasMeaningfulTexture(sourceMaterial, "_BumpMap") ? 1f : 0f;
-            float hasMetallicGlossMap = HasMeaningfulTexture(sourceMaterial, "_MetallicGlossMap") ? 1f : 0f;
-            float hasOcclusionMap = HasMeaningfulTexture(sourceMaterial, "_OcclusionMap") ? 1f : 0f;
-            float hasEmissionMap = HasMeaningfulTexture(sourceMaterial, "_EmissionMap") ? 1f : 0f;
-            float emissionEnabled = IsMaterialEmissionEnabled(sourceMaterial) ? 1f : 0f;
-            float smoothnessFromAlbedoAlpha =
-                sourceMaterial != null &&
-                sourceMaterial.IsKeywordEnabled("_SMOOTHNESS_TEXTURE_ALBEDO_CHANNEL_A")
-                    ? 1f
-                    : 0f;
-            Vector4 baseMapST = ResolveVector(
-                sourceMaterial,
-                "_BaseMap_ST",
-                ResolveVector(sourceMaterial, "_MainTex_ST", new Vector4(1f, 1f, 0f, 0f)));
-            if (emissionEnabled < 0.5f)
-                hasEmissionMap = 0f;
 
             if (resolveMaterial != null)
             {
@@ -3028,55 +5338,26 @@ namespace Nanite
                 resolveMaterial.SetTexture(ShaderIds.MetallicGlossMap, metallicGlossMap);
                 resolveMaterial.SetTexture(ShaderIds.OcclusionMap, occlusionMap);
                 resolveMaterial.SetTexture(ShaderIds.EmissionMap, emissionMap);
-                resolveMaterial.SetColor(ShaderIds.BaseColor, baseColor);
-                resolveMaterial.SetColor(ShaderIds.EmissionColor, emissionColor);
-                resolveMaterial.SetFloat(ShaderIds.Cutoff, cutoff);
-                resolveMaterial.SetFloat(ShaderIds.AlphaClip, alphaClip);
-                resolveMaterial.SetFloat(ShaderIds.Smoothness, smoothness);
-                resolveMaterial.SetFloat(ShaderIds.Metallic, metallic);
-                resolveMaterial.SetFloat(ShaderIds.BumpScale, bumpScale);
-                resolveMaterial.SetFloat(ShaderIds.OcclusionStrength, occlusionStrength);
-                resolveMaterial.SetFloat(ShaderIds.HasBaseMap, hasBaseMap);
-                resolveMaterial.SetFloat(ShaderIds.HasNormalMap, hasNormalMap);
-                resolveMaterial.SetFloat(ShaderIds.HasMetallicGlossMap, hasMetallicGlossMap);
-                resolveMaterial.SetFloat(ShaderIds.HasOcclusionMap, hasOcclusionMap);
-                resolveMaterial.SetFloat(ShaderIds.HasEmissionMap, hasEmissionMap);
-                resolveMaterial.SetFloat(ShaderIds.EmissionEnabled, emissionEnabled);
-                resolveMaterial.SetFloat(ShaderIds.SmoothnessFromAlbedoAlpha, smoothnessFromAlbedoAlpha);
-                resolveMaterial.SetVector(ShaderIds.BaseMapST, baseMapST);
             }
         }
 
-        static Vector4 ResolveVector(Material material, string propertyName, Vector4 fallback)
+        void BindFormalResolveFamilyBatch(RasterCommandBuffer cmd, Material resolveMaterial, int familyId)
         {
-            if (material != null && material.HasProperty(propertyName))
-                return material.GetVector(propertyName);
-            return fallback;
-        }
-
-        static bool IsMaterialEmissionEnabled(Material material)
-        {
-            if (material == null)
-                return false;
-            if (material.IsKeywordEnabled("_EMISSION"))
-                return true;
-            if (material.HasProperty("_EmissionEnabled") && material.GetFloat("_EmissionEnabled") > 0.5f)
-                return true;
-            return false;
-        }
-
-        static bool IsMaterialAlphaClipEnabled(Material material)
-        {
-            if (material == null)
-                return false;
-
-            if (material.IsKeywordEnabled("_ALPHATEST_ON") || material.IsKeywordEnabled("_ALPHACLIP_ON"))
-                return true;
-
-            if (material.HasProperty("_AlphaClip") && material.GetFloat("_AlphaClip") > 0.5f)
-                return true;
-
-            return false;
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialId, -1f);
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialMode, 1f);
+            cmd.SetGlobalFloat(ShaderIds.ResolveMaterialFamily, familyId);
+            cmd.SetGlobalFloat(ShaderIds.ResolveAbsorbedFamily, 0f);
+            int state = Mathf.Max(0, familyId - 1);
+            CoreUtils.SetKeyword(resolveMaterial, "_ENVIRONMENTREFLECTIONS_OFF", (state & 1) != 0);
+            CoreUtils.SetKeyword(resolveMaterial, "_SPECULARHIGHLIGHTS_OFF", (state & 2) != 0);
+            CoreUtils.SetKeyword(resolveMaterial, "_RECEIVE_SHADOWS_OFF", (state & 4) != 0);
+            resolveMaterial.SetTexture(ShaderIds.BaseMap, Texture2D.whiteTexture);
+            resolveMaterial.SetTexture(
+                ShaderIds.BumpMap,
+                Texture2D.normalTexture != null ? Texture2D.normalTexture : Texture2D.whiteTexture);
+            resolveMaterial.SetTexture(ShaderIds.MetallicGlossMap, Texture2D.blackTexture);
+            resolveMaterial.SetTexture(ShaderIds.OcclusionMap, Texture2D.whiteTexture);
+            resolveMaterial.SetTexture(ShaderIds.EmissionMap, Texture2D.blackTexture);
         }
 
         static void ConfigureFormalResolveMaterialKeywords(
@@ -3109,47 +5390,13 @@ namespace Nanite
             return fallback;
         }
 
-        static bool HasMeaningfulTexture(Material material, string propertyName)
-        {
-            if (material == null || !material.HasProperty(propertyName))
-                return false;
-
-            Texture texture = material.GetTexture(propertyName);
-            if (texture == null)
-                return false;
-
-            if (texture == Texture2D.whiteTexture ||
-                texture == Texture2D.blackTexture ||
-                texture == Texture2D.grayTexture ||
-                (Texture2D.normalTexture != null && texture == Texture2D.normalTexture))
-            {
-                return false;
-            }
-
-            return true;
-        }
-
-        static Color ResolveColor(Material material, string propertyA, string propertyB, Color fallback)
-        {
-            if (material != null && material.HasProperty(propertyA))
-                return material.GetColor(propertyA);
-            if (material != null && material.HasProperty(propertyB))
-                return material.GetColor(propertyB);
-            return fallback;
-        }
-
-        static float ResolveFloat(Material material, string propertyName, float fallback)
-        {
-            if (material != null && material.HasProperty(propertyName))
-                return material.GetFloat(propertyName);
-            return fallback;
-        }
 
         void ExecuteFirstCull(Camera camera)
         {
             using var profilerScope = kFirstCullMarker.Auto();
             if (camera == null)
                 return;
+            LogAutomaticWorkloadStats(camera);
             EnsureInternalCollections();
             LogExecutionOnce(camera, "first-cull");
             double startMs = Time.realtimeSinceStartupAsDouble * 1000.0;
@@ -3172,7 +5419,7 @@ namespace Nanite
                 ? NaniteGpuBatchedCullingBackend.CullPassMode.Pass1PrevVisible
                 : NaniteGpuBatchedCullingBackend.CullPassMode.Legacy;
             // Bevy Pass1：不用 HZB（即便 usePreviousHzbOnFirstCull）。
-            bool firstUseHzb = !IsBevyTwoPhaseEnabled() && prevHzb != null;
+            bool firstUseHzb = prevHzb != null;
             bool gpuMask = TryRunBatchedCullGpuMask(
                 camera, prevHzb, prevMipCount, firstUseHzb, clearMask: true, cullMode, out int batchableProxies);
             bool batched = gpuMask;
@@ -3433,7 +5680,9 @@ namespace Nanite
             Material material,
             int shaderPass,
             int selectionKey,
-            MaterialPropertyBlock mpb)
+            MaterialPropertyBlock mpb,
+            int compactClusterOffset = 0,
+            bool drawProceduralFallback = true)
         {
             if (cmd == null || material == null || mpb == null || !HasValidIndexedDraw(selectionKey))
                 return false;
@@ -3444,7 +5693,8 @@ namespace Nanite
                 return false;
 
             mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 1);
-            mpb.SetInt(ShaderIds.GeometryVertexCount, sceneVisibilityBackend.GeometryVertexCount);
+            mpb.SetInt(ShaderIds.GeometryVertexCount, sceneVisibilityBackend.IndexedVertexDomainCount);
+            mpb.SetFloat(ShaderIds.CompactedClusterOffset, Mathf.Max(0, compactClusterOffset));
             cmd.DrawProceduralIndirect(
                 indices,
                 Matrix4x4.identity,
@@ -3454,7 +5704,15 @@ namespace Nanite
                 indexedArgs,
                 0,
                 mpb);
+            if (!drawProceduralFallback)
+            {
+                mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+                return true;
+            }
             mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+            mpb.SetFloat(
+                ShaderIds.CompactedClusterOffset,
+                Mathf.Max(0, compactClusterOffset) + sceneVisibilityBackend.IndexedDrawClusterCapacity);
             cmd.DrawProceduralIndirect(
                 Matrix4x4.identity,
                 material,
@@ -3474,7 +5732,8 @@ namespace Nanite
             MaterialPropertyBlock mpb)
         {
             if (!settings.enableIndexedClusterRaster || cmd == null || material == null || mpb == null ||
-                sceneVisibilityBackend == null || !sceneVisibilityBackend.IndexedDrawAvailable)
+                sceneVisibilityBackend == null || !sceneVisibilityBackend.IndexedDrawAvailable ||
+                !sceneVisibilityBackend.IsIndexedShadowCascadeReady(cascadeIndex))
                 return false;
             GraphicsBuffer indices = sceneVisibilityBackend.IndexedDrawIndexBuffer;
             GraphicsBuffer indexedArgs = sceneVisibilityBackend.GetIndexedShadowDrawArgsBuffer(cascadeIndex);
@@ -3482,8 +5741,14 @@ namespace Nanite
             if (indices == null || indexedArgs == null || fallbackArgs == null)
                 return false;
 
+            mpb.SetBuffer(
+                ShaderIds.IndexedShadowSliceData,
+                sceneVisibilityBackend.IndexedShadowSliceDataBuffer);
+            mpb.SetInt(ShaderIds.IndexedShadowCascadeIndex, cascadeIndex);
+            mpb.SetInt(ShaderIds.UseIndexedShadowDynamicSlice, 0);
             mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 1);
-            mpb.SetInt(ShaderIds.GeometryVertexCount, sceneVisibilityBackend.GeometryVertexCount);
+            mpb.SetInt(ShaderIds.GeometryVertexCount, sceneVisibilityBackend.IndexedVertexDomainCount);
+            mpb.SetFloat(ShaderIds.CompactedClusterOffset, 0.0f);
             cmd.DrawProceduralIndirect(
                 indices,
                 Matrix4x4.identity,
@@ -3494,6 +5759,12 @@ namespace Nanite
                 0,
                 mpb);
             mpb.SetInt(ShaderIds.UseIndexedClusterRaster, 0);
+            // The GPU allocates four cascade slices from one shared scratch
+            // buffer using their actual queue counts. The procedural tail begins
+            // after this cascade's admitted slice; the shadow shader reads that
+            // offset without a CPU count readback.
+            mpb.SetInt(ShaderIds.UseIndexedShadowDynamicSlice, 1);
+            mpb.SetFloat(ShaderIds.CompactedClusterOffset, 0.0f);
             cmd.DrawProceduralIndirect(
                 Matrix4x4.identity,
                 material,
@@ -3502,6 +5773,7 @@ namespace Nanite
                 fallbackArgs,
                 0,
                 mpb);
+            mpb.SetInt(ShaderIds.UseIndexedShadowDynamicSlice, 0);
             return true;
         }
 
@@ -3543,7 +5815,18 @@ namespace Nanite
             mpb.SetInt(ShaderIds.HasTriangleSubMesh, 1);
             mpb.SetInt(ShaderIds.InstanceId, 0);
             mpb.SetMatrix(ShaderIds.LocalToWorld, Matrix4x4.identity);
+            mpb.SetInt(ShaderIds.UseIndexedShadowDynamicSlice, 0);
+            if (sceneVisibilityBackend.IndexedShadowSliceDataBuffer != null)
+            {
+                mpb.SetBuffer(
+                    ShaderIds.IndexedShadowSliceData,
+                    sceneVisibilityBackend.IndexedShadowSliceDataBuffer);
+            }
             GraphicsBuffer activeDrawArgs = drawArgsBuffer;
+            bool hybridShadowActive =
+                hybridShadowReadyFrame == Time.frameCount &&
+                hybridShadowReadyCascade == cascadeIndex &&
+                hybridHardwareClusterBuffer != null;
             bool useShadowQueue =
                 batchedCulling != null &&
                 batchedCulling.IsShadowDrawQueueReady(camera, cascadeIndex) &&
@@ -3555,7 +5838,9 @@ namespace Nanite
                 mpb.SetFloat(ShaderIds.UseDirectVisibleDrawQueue, 1f);
                 mpb.SetBuffer(
                     ShaderIds.CompactedDrawClusters,
-                    batchedCulling.GetShadowDrawClusterBuffer(cascadeIndex));
+                    hybridShadowActive
+                        ? hybridHardwareClusterBuffer
+                        : batchedCulling.GetShadowDrawClusterBuffer(cascadeIndex));
                 mpb.SetBuffer(ShaderIds.CompactedTriIds, sceneVisibilityBackend.CompactedTriIdsBuffer);
                 mpb.SetBuffer(
                     ShaderIds.CompactedTriInstances,
@@ -3585,6 +5870,43 @@ namespace Nanite
                     0,
                     mpb);
             }
+        }
+
+        void DrawHybridSoftwareShadowMerge(
+            RasterCommandBuffer cmd,
+            Material material,
+            ExternalMainLightShadowDrawContext context)
+        {
+            if (cmd == null || material == null ||
+                hybridShadowReadyFrame != Time.frameCount ||
+                hybridShadowReadyCascade != context.cascadeIndex ||
+                hybridShadowSoftwareDepth == null ||
+                hybridSoftwareTileListBuffer == null ||
+                hybridSoftwareTileDrawArgsBuffer == null)
+                return;
+
+            int resolution = Mathf.Max(1, Mathf.RoundToInt(context.viewport.width));
+            var mpb = GetOrCreateVBufferPropertyBlock();
+            mpb.Clear();
+            mpb.SetTexture(ShaderIds.NaniteSoftwareDepth, hybridShadowSoftwareDepth);
+            mpb.SetBuffer(ShaderIds.NaniteSoftwareTileList, hybridSoftwareTileListBuffer);
+            mpb.SetInt(ShaderIds.NaniteSoftwareScreenWidth, resolution);
+            mpb.SetInt(ShaderIds.NaniteSoftwareScreenHeight, resolution);
+            mpb.SetInt(
+                ShaderIds.NaniteSoftwareTileCountX,
+                Mathf.Max(1, (resolution + kHybridSoftwareTileSize - 1) / kHybridSoftwareTileSize));
+            mpb.SetInt(ShaderIds.NaniteSoftwareTileSize, kHybridSoftwareTileSize);
+            mpb.SetVector(
+                ShaderIds.NaniteSoftwareViewportOrigin,
+                new Vector4(context.viewport.x, context.viewport.y, 0f, 0f));
+            cmd.DrawProceduralIndirect(
+                Matrix4x4.identity,
+                material,
+                1,
+                MeshTopology.Triangles,
+                hybridSoftwareTileDrawArgsBuffer,
+                0,
+                mpb);
         }
 
         int DrawDepthFromFirstSelection(CommandBuffer cmd, Material material, Camera camera)
@@ -3902,19 +6224,8 @@ namespace Nanite
                 {
                     LogBatchedDispatchStatsOnce(batchableProxies, "second-cull-gpuMask", secondUseHzb);
                     LogBevyCullStatsIfNeeded("cull2");
-                    if (IsBevyTwoPhaseEnabled() &&
-                        sceneVisibilityBackend.Pass1ClusterVisibleBuffer != null &&
-                        sceneVisibilityBackend.Pass2ClusterVisibleBuffer != null)
-                    {
-                        // 合并 Pass1∪Pass2 → clusterVisible（Pass2 已 OR 进 visible；再 OR 确保与 pass1 备份一致）。
-                        batchedCulling.DispatchOrMasksToVisible(
-                            sceneVisibilityBackend.Pass1ClusterVisibleBuffer,
-                            sceneVisibilityBackend.Pass2ClusterVisibleBuffer,
-                            sceneVisibilityBackend.ClusterVisibleBuffer,
-                            sceneVisibilityBackend.ClusterCount);
-                    }
-
-                    SwapPrevVisibleAfterFrame();
+                    // Pass2 appends recovered clusters directly into ClusterVisible and
+                    // the HW/SW queues; a full-scene mask merge/copy is redundant.
                 }
                 else if (settings.logStats)
                     Debug.LogWarning("[Nanite][RF] SecondCull GPU mask 失败，本帧保持 FirstCull mask（跳过 CPU readback 回退）。");
@@ -4047,7 +6358,16 @@ namespace Nanite
                                    settings.enablePrevVisiblePass1Filter &&
                                    IsHzbActiveForScene() &&
                                    sceneVisibilityBackend.HasPrevVisible;
-            bool enableStats = settings.logStats && (Time.frameCount % 30 == 0);
+            int telemetryInterval = settings.adaptiveHzbCulling
+                ? (hzbAdmissionProbeMode
+                    ? kHzbAdmissionProbeInterval
+                    : kHzbAdmissionSteadyInterval)
+                : 120;
+            bool automaticTelemetryFrame = camera.cameraType == CameraType.Game &&
+                                           Time.frameCount > 0 &&
+                                           Time.frameCount % telemetryInterval == 0;
+            bool enableStats = (settings.logStats && (Time.frameCount % 30 == 0)) ||
+                               automaticTelemetryFrame;
             bool ok = batchedCulling.RunWriteClusterVisible(
                 camera,
                 hzbTexture,
@@ -4066,6 +6386,7 @@ namespace Nanite
             {
                 sceneVisibilityBackend.MarkGpuVisibleMaskReady();
                 if (cullPassMode == NaniteGpuBatchedCullingBackend.CullPassMode.Pass1PrevVisible &&
+                    IsBevyFormalDualRasterActive() &&
                     sceneVisibilityBackend.Pass1ClusterVisibleBuffer != null)
                 {
                     batchedCulling.DispatchCopyUintBuffer(
@@ -4170,7 +6491,18 @@ namespace Nanite
             batchedCulling.InstanceQueueMinInstances = Mathf.Max(1, settings.gpuInstanceQueueMinInstances);
             batchedCulling.ShadowPartQueueMinVirtualParts = Mathf.Max(1, settings.shadowPartQueueMinVirtualParts);
             batchedCulling.ShadowInstanceQueueMinInstances = Mathf.Max(1, settings.shadowInstanceQueueMinInstances);
+            batchedCulling.EnableTraversalRasterBins =
+                IsHybridRasterRequested() &&
+                !IsBevyFormalDualRasterActive() &&
+                CanUseCompactFormalVBuffer();
+            batchedCulling.SoftwareRasterThresholdPixels = Mathf.Max(1f, settings.hybridSoftwareMaxEdgePixels);
         }
+
+        bool IsBevyFormalDualRasterActive() =>
+            settings.enableBevyFormalDualRaster &&
+            IsBevyTwoPhaseEnabled() &&
+            IsHzbActiveForScene() &&
+            settings.enablePrevVisiblePass1Filter;
 
         static void EnsureSelectionOutputs(IReadOnlyList<NaniteRuntimeProxy> proxies, Dictionary<int, NaniteRuntimeSelection> outputsByProxyId)
         {
@@ -4224,18 +6556,28 @@ namespace Nanite
             bool gpuMask = stage != null && stage.IndexOf("gpuMask", StringComparison.Ordinal) >= 0;
             int candidates = batchedCulling != null ? batchedCulling.LastClusterCandidateCount : -1;
             int clusters = batchedCulling != null ? batchedCulling.LastClusterCount : -1;
-            string candidateWork = batchedCulling != null && batchedCulling.LastUsedVisiblePartQueue
-                ? "GPU-queued"
-                : candidates.ToString();
+            string candidateWork = batchedCulling != null && batchedCulling.LastUsedHierarchyQueue
+                ? "GPU-selected-cut"
+                : (batchedCulling != null && batchedCulling.LastUsedSpatialHierarchy
+                    ? "GPU-spatial-cut"
+                : (batchedCulling != null && batchedCulling.LastUsedVisiblePartQueue
+                    ? "GPU-queued"
+                    : candidates.ToString()));
             string hierarchy = batchedCulling != null && batchedCulling.LastUsedCpuCandidates
                 ? "CPU-BVH"
-                : (batchedCulling != null && batchedCulling.LastUsedPartDrivenClusterCull
+                : (batchedCulling != null && batchedCulling.LastUsedHierarchyQueue
+                    ? (batchedCulling.HierarchyTraversalPassCount == 1
+                        ? "GPU-RootGroup-PersistentQueue-DrawIndirect"
+                        : "GPU-RootGroup-RefineQueue-DrawIndirect")
+                    : (batchedCulling != null && batchedCulling.LastUsedSpatialHierarchy
+                        ? "GPU-InstanceQueue-SpatialNode-PartQueue-ClusterIndirect"
+                    : (batchedCulling != null && batchedCulling.LastUsedPartDrivenClusterCull
                     ? (batchedCulling.LastUsedVisibleInstanceQueue
                         ? "GPU-InstanceQueue-PartQueue-ClusterIndirect"
                         : (batchedCulling.LastUsedVisiblePartQueue
                             ? "GPU-Instance-PartQueue-ClusterIndirect"
                             : "GPU-Instance-Part-Cluster"))
-                    : "GPU-FullCluster");
+                    : "GPU-FullCluster")));
             Debug.Log(
                 $"[Nanite][RF] Batched GPU culling ({stage}): proxies={batchableProxies}, " +
                 $"candidates={candidateWork} / clusters={clusters}, hierarchy={hierarchy}, " +
@@ -4244,12 +6586,21 @@ namespace Nanite
                 $"{(batchedCulling != null ? batchedCulling.VirtualPartCount : 0)}," +
                 $"cluster:{(batchedCulling != null ? batchedCulling.GeometryClusterCount : 0)}/" +
                 $"{(batchedCulling != null ? batchedCulling.VirtualClusterCount : 0)}, " +
+                $"dag:{(batchedCulling != null ? batchedCulling.HierarchyGroupCount : 0)}/" +
+                $"{(batchedCulling != null ? batchedCulling.HierarchyRefCount : 0)} " +
+                $"passes={(batchedCulling != null ? batchedCulling.HierarchyTraversalPassCount : 0)}, " +
+                $"spatial:{(batchedCulling != null ? batchedCulling.SpatialNodeCount : 0)} " +
+                $"passes={(batchedCulling != null ? batchedCulling.SpatialTraversalPassCount : 0)}, " +
                 $"pagePool={(sceneVisibilityBackend != null && sceneVisibilityBackend.IsPagePoolReady ? "ready" : "compat")}:" +
                 $"{(sceneVisibilityBackend != null ? sceneVisibilityBackend.ResidentPageCount : 0)}/" +
                 $"{(sceneVisibilityBackend != null ? sceneVisibilityBackend.GlobalPageCount : 0)} " +
                 $"pinned={(sceneVisibilityBackend != null ? sceneVisibilityBackend.PinnedPageCount : 0)}, " +
+                $"requests={(sceneVisibilityBackend != null ? sceneVisibilityBackend.LastRequestedPageCount : 0)}/" +
+                $"{(sceneVisibilityBackend != null ? sceneVisibilityBackend.LastQueuedPageCount : 0)} " +
+                $"priority={(sceneVisibilityBackend != null ? sceneVisibilityBackend.LastMaxPageRequestPriority : 0)}, " +
                 $"bevyTwoPhase={IsBevyTwoPhaseEnabled()}, " +
-                $"readback={(gpuMask ? 0 : 1)}, hzbActive={hzbActive}.");
+                $"readback={(gpuMask ? 0 : 1)}, hzbConfigured={IsHzbActiveForScene()}, " +
+                $"previousHzbThisDispatch={hzbActive}.");
         }
 
         void LogBevyCullStatsIfNeeded(string stage)
@@ -4274,6 +6625,25 @@ namespace Nanite
                 $"candidates={batchedCulling.LastClusterCandidateCount}/{batchedCulling.LastClusterCount} " +
                 $"lodOverride={settings.overrideLodErrorPixels} " +
                 $"useHzb={IsHzbActiveForScene()} useBvh={settings.useBvhCandidates}");
+        }
+
+        void LogAutomaticWorkloadStats(Camera camera)
+        {
+            if (camera == null || camera.cameraType != CameraType.Game || batchedCulling == null)
+                return;
+            int sampleFrame = batchedCulling.LastCullStatsReadbackFrame;
+            if (sampleFrame < 0 || sampleFrame == lastAutomaticCullStatsFrame)
+                return;
+            lastAutomaticCullStatsFrame = sampleFrame;
+
+            int mainClusters = Mathf.Max(0, batchedCulling.LastCull1Drawn);
+            int hzbRejected = Mathf.Max(0, batchedCulling.LastCull2Candidates);
+            int postRecovered = Mathf.Max(0, batchedCulling.LastCull2Drawn);
+            Debug.Log(
+                $"[Nanite][Workload] frame={sampleFrame} " +
+                $"cameraMainClusters={mainClusters}, hzbRejected={hzbRejected}, " +
+                $"postRecovered={postRecovered}, finalClusters={mainClusters + postRecovered}, " +
+                $"hzbAdmission={(hzbAdmissionAllowed ? "active" : "cooldown")}.");
         }
 
         void RecordPerfSample(double cpuMs, bool isFirstCull, bool batched, int proxyCount)
@@ -5005,6 +7375,13 @@ namespace Nanite
             cmd.DispatchCompute(cs, kernel, gx, gy, 1);
         }
 
+        static void Dispatch2D(ComputeCommandBuffer cmd, ComputeShader cs, int kernel, int width, int height, int tx, int ty)
+        {
+            int gx = Mathf.Max(1, (width + tx - 1) / tx);
+            int gy = Mathf.Max(1, (height + ty - 1) / ty);
+            cmd.DispatchCompute(cs, kernel, gx, gy, 1);
+        }
+
         void LogExecutionOnce(Camera camera, string stage)
         {
             if (loggedExecutionOnce)
@@ -5245,8 +7622,10 @@ namespace Nanite
         void ReleaseFormalBuffers()
         {
             tileMaterialMaskBuffer?.Release();
+            tileMaterialBinListBuffer?.Release();
             tileIndirectArgsBuffer?.Release();
             tileMaterialMaskBuffer = null;
+            tileMaterialBinListBuffer = null;
             tileIndirectArgsBuffer = null;
             tileMaskCapacity = 0;
             tileCountX = 0;

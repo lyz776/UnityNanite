@@ -20,11 +20,13 @@ namespace Nanite
             public int clusterStart;
             public int clusterCount;
             public int instanceIndex;
+            public uint lodFlags;
         }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct GpuClusterData
         {
+            public Vector4 geometrySphere;
             public Vector4 selfSphere;
             public Vector4 parentSphere;
             public float selfError;
@@ -33,7 +35,15 @@ namespace Nanite
             public int pageIndex;
             public int clusterIndex;
             public int instanceIndex;
+            public uint lodFlags;
+            // Global hierarchy group that refines this cluster. Used by the fast
+            // spatial cut to keep a resident coarse ancestor during Page misses.
+            public uint refinementGroupIndex;
+            public uint packedCone;
+            public float longestEdge;
         }
+
+        public const uint TerminalDisappearLodFlag = 1u << 0;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct GpuInstanceData
@@ -44,6 +54,21 @@ namespace Nanite
             public float lodErrorPixels;
             public uint partOffset;
             public uint partCount;
+            // Batched GPU Scene hierarchy addressing. The legacy single-instance backend
+            // leaves these at zero and continues to use the Part/Cluster path.
+            public uint clusterOffset;
+            public uint hierarchyRootOffset;
+            public uint hierarchyRootCount;
+            public uint hierarchyFlags;
+            public uint hierarchyGroupOffset;
+            public uint hierarchyGroupCount;
+            public uint hierarchyResidencyOffset;
+            // Unique-mesh spatial hierarchy. Instances only carry an address into the
+            // immutable node table; no node/Part metadata is duplicated per instance.
+            public uint spatialRootOffset;
+            public uint spatialRootCount;
+            public uint spatialFlags;
+            public uint spatialReserved;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -335,6 +360,7 @@ namespace Nanite
 
         void BindInstanceBuffers(int kernel)
         {
+            EnsureFallbackUintBuffers();
             shader.SetInt("_InstanceCount", 1);
             shader.SetBuffer(kernel, "_Instances", instanceDataBuffer);
             shader.SetBuffer(kernel, "_InstanceVisible", instanceVisibleBuffer);
@@ -360,6 +386,8 @@ namespace Nanite
         {
             shader.SetVector("_CameraPos", new Vector4(cameraPos.x, cameraPos.y, cameraPos.z, 0f));
             shader.SetFloat("_ProjectionScale", projectionScale);
+            shader.SetFloat("_OrthographicLodScale", 0f);
+            shader.SetInt("_UseOrthographicLod", 0);
             shader.SetFloat("_ZNear", zNear);
             shader.SetMatrix("_WorldToClip", worldToClip);
             shader.SetVector("_ScreenSize", new Vector4(Mathf.Max(1, screenWidth), Mathf.Max(1, screenHeight), 1f / Mathf.Max(1, screenWidth), 1f / Mathf.Max(1, screenHeight)));
@@ -570,6 +598,8 @@ namespace Nanite
             clusters = new List<GpuClusterData>(16384);
             outPagePartBase = new int[mesh.pageArray.Length];
             outPagePartCount = new int[mesh.pageArray.Length];
+            bool[] terminalDisappearClusters = BuildTerminalDisappearClusterMask(mesh);
+            int geometryClusterCursor = 0;
             for (int i = 0; i < outPagePartBase.Length; i++)
             {
                 outPagePartBase[i] = -1;
@@ -588,6 +618,7 @@ namespace Nanite
                 outPagePartCount[pageIndex] = page.parts.Length;
 
                 int[] clusterToPart = new int[page.clusterArray.Length];
+                bool[] terminalPart = new bool[page.parts.Length];
                 for (int i = 0; i < clusterToPart.Length; i++)
                     clusterToPart[i] = -1;
 
@@ -599,7 +630,13 @@ namespace Nanite
                     if (start >= 0 && end <= clusterToPart.Length)
                     {
                         for (int ci = start; ci < end; ci++)
+                        {
                             clusterToPart[ci] = pi;
+                            int geometryClusterIndex = geometryClusterCursor + ci;
+                            if ((uint)geometryClusterIndex < (uint)terminalDisappearClusters.Length &&
+                                terminalDisappearClusters[geometryClusterIndex])
+                                terminalPart[pi] = true;
+                        }
                     }
 
                     parts.Add(new GpuPartData
@@ -609,7 +646,8 @@ namespace Nanite
                         maxParentError = part.maxParentLodError,
                         clusterStart = clusterBase + part.clusterStart,
                         clusterCount = part.clusterCount,
-                        instanceIndex = 0
+                        instanceIndex = 0,
+                        lodFlags = terminalPart[pi] ? TerminalDisappearLodFlag : 0u
                     });
                 }
 
@@ -623,6 +661,7 @@ namespace Nanite
                     int globalPart = (localPart >= 0) ? (partBase + localPart) : -1;
                     clusters.Add(new GpuClusterData
                     {
+                        geometrySphere = c.geometrySphere.w > 0f ? c.geometrySphere : c.selfSphere,
                         selfSphere = c.selfSphere,
                         parentSphere = c.parentSphere.w > 0f ? c.parentSphere : c.selfSphere,
                         selfError = c.selfError,
@@ -630,9 +669,20 @@ namespace Nanite
                         partIndex = globalPart,
                         pageIndex = pageIndex,
                         clusterIndex = ci,
-                        instanceIndex = 0
+                        instanceIndex = 0,
+                        lodFlags = (uint)(geometryClusterCursor + ci) < (uint)terminalDisappearClusters.Length &&
+                                   terminalDisappearClusters[geometryClusterCursor + ci]
+                            ? TerminalDisappearLodFlag
+                            : 0u,
+                        refinementGroupIndex = uint.MaxValue,
+                        packedCone = c.packedCone,
+                        longestEdge = c.longestEdge > 0f
+                            ? c.longestEdge
+                            : 2f * Mathf.Max(0f, (c.geometrySphere.w > 0f ? c.geometrySphere : c.selfSphere).w)
                     });
                 }
+
+                geometryClusterCursor += page.clusterArray.Length;
             }
         }
 
@@ -677,6 +727,8 @@ namespace Nanite
         {
             outPagePartBase = new int[mesh.pageArray.Length];
             outPagePartCount = new int[mesh.pageArray.Length];
+            bool[] terminalDisappearClusters = BuildTerminalDisappearClusterMask(mesh);
+            int geometryClusterCursor = 0;
             for (int i = 0; i < outPagePartBase.Length; i++)
             {
                 outPagePartBase[i] = -1;
@@ -695,6 +747,7 @@ namespace Nanite
                 outPagePartCount[pageIndex] = page.parts.Length;
 
                 int[] clusterToPart = new int[page.clusterArray.Length];
+                bool[] terminalPart = new bool[page.parts.Length];
                 for (int i = 0; i < clusterToPart.Length; i++)
                     clusterToPart[i] = -1;
 
@@ -706,7 +759,13 @@ namespace Nanite
                     if (start >= 0 && end <= clusterToPart.Length)
                     {
                         for (int ci = start; ci < end; ci++)
+                        {
                             clusterToPart[ci] = pi;
+                            int geometryClusterIndex = geometryClusterCursor + ci;
+                            if ((uint)geometryClusterIndex < (uint)terminalDisappearClusters.Length &&
+                                terminalDisappearClusters[geometryClusterIndex])
+                                terminalPart[pi] = true;
+                        }
                     }
 
                     parts.Add(new GpuPartData
@@ -716,7 +775,8 @@ namespace Nanite
                         maxParentError = part.maxParentLodError,
                         clusterStart = clusterBase + part.clusterStart,
                         clusterCount = part.clusterCount,
-                        instanceIndex = instanceIndex
+                        instanceIndex = instanceIndex,
+                        lodFlags = terminalPart[pi] ? TerminalDisappearLodFlag : 0u
                     });
                 }
 
@@ -730,6 +790,7 @@ namespace Nanite
                     int globalPart = (localPart >= 0) ? (partBase + localPart) : -1;
                     clusters.Add(new GpuClusterData
                     {
+                        geometrySphere = c.geometrySphere.w > 0f ? c.geometrySphere : c.selfSphere,
                         selfSphere = c.selfSphere,
                         parentSphere = c.parentSphere.w > 0f ? c.parentSphere : c.selfSphere,
                         selfError = c.selfError,
@@ -737,10 +798,60 @@ namespace Nanite
                         partIndex = globalPart,
                         pageIndex = pageIndex,
                         clusterIndex = ci,
-                        instanceIndex = instanceIndex
+                        instanceIndex = instanceIndex,
+                        lodFlags = (uint)(geometryClusterCursor + ci) < (uint)terminalDisappearClusters.Length &&
+                                   terminalDisappearClusters[geometryClusterCursor + ci]
+                            ? TerminalDisappearLodFlag
+                            : 0u,
+                        refinementGroupIndex = uint.MaxValue,
+                        packedCone = c.packedCone,
+                        longestEdge = c.longestEdge > 0f
+                            ? c.longestEdge
+                            : 2f * Mathf.Max(0f, (c.geometrySphere.w > 0f ? c.geometrySphere : c.selfSphere).w)
                     });
                 }
+
+                geometryClusterCursor += page.clusterArray.Length;
             }
+        }
+
+        static bool[] BuildTerminalDisappearClusterMask(NaniteMesh mesh)
+        {
+            int clusterCount = 0;
+            if (mesh?.pageArray != null)
+            {
+                for (int pageIndex = 0; pageIndex < mesh.pageArray.Length; pageIndex++)
+                    clusterCount += mesh.pageArray[pageIndex]?.clusterArray?.Length ?? 0;
+            }
+
+            var result = new bool[clusterCount];
+            if (mesh?.hierarchyGroups == null || mesh.hierarchyClusterRefs == null)
+                return result;
+
+            for (int groupIndex = 0; groupIndex < mesh.hierarchyGroups.Length; groupIndex++)
+            {
+                NaniteHierarchyGroup group = mesh.hierarchyGroups[groupIndex];
+                // Root groups have no coarser replacement, regardless of whether their
+                // parent error is finite (legacy disappearing branch) or MaxValue. They
+                // must not be culled one Cluster at a time by the sub-pixel fast path.
+                bool isTerminalDisappear = group.IsRootSet &&
+                                           group.coarseClusterCount == 0;
+                if (!isTerminalDisappear)
+                    continue;
+
+                int start = Mathf.Max(0, group.fineClusterStart);
+                int end = Mathf.Min(
+                    mesh.hierarchyClusterRefs.Length,
+                    start + Mathf.Max(0, group.fineClusterCount));
+                for (int refIndex = start; refIndex < end; refIndex++)
+                {
+                    int geometryClusterIndex = mesh.hierarchyClusterRefs[refIndex].geometryClusterIndex;
+                    if ((uint)geometryClusterIndex < (uint)result.Length)
+                        result[geometryClusterIndex] = true;
+                }
+            }
+
+            return result;
         }
 
         void BindBevyCompatBuffers(int kernel)

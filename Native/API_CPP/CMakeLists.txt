@@ -1,7 +1,7 @@
 # 可选：用 CMake + MSVC 生成 API_CPP.dll
 # 在「本目录」打开终端执行（把路径改成你解压的 meshoptimizer 里 src 文件夹）：
 #
-#   cmake -B build -A x64 -DMESHOPT_SRC_DIR="C:/Users/你的用户名/Downloads/meshoptimizer-master/meshoptimizer-master/src"
+#   cmake -B build -A x64 -DMESHOPT_SRC_DIR="../meshoptimizer/src"
 #   cmake --build build --config Release
 #
 # 输出一般在 build/Release/API_CPP.dll，复制到 Unity Assets/Plugins/x86_64/

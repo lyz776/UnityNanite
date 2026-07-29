@@ -11,8 +11,13 @@ namespace Nanite
         public int indiceCount;
         public float selfError;
         public float parentError;
+        // Tight meshlet bounds used for visibility. selfSphere/parentSphere below
+        // are group-level LOD error spheres and are deliberately not interchangeable.
+        public Vector4 geometrySphere;
+        public float longestEdge;
         public Vector4 selfSphere;
         public Vector4 parentSphere;
+        public uint packedCone;
         public int subMeshId;
         public int partIndex; // Page 内 local part 索引（运行时 GPU culling 用）
         public int vertexOffset;

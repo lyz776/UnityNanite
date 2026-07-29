@@ -52,6 +52,9 @@ Shader "Nanite/VBufferLitResolve"
 
             CBUFFER_START(NaniteResolveUniforms)
             float _ResolveMaterialId;
+            float _ResolveMaterialMode;
+            float _ResolveMaterialFamily;
+            float _ResolveAbsorbedFamily;
             float _VertexStride;
             float _MaxSubMeshCount;
             float _TriangleCount;
@@ -75,6 +78,7 @@ Shader "Nanite/VBufferLitResolve"
             StructuredBuffer<int> _TriangleSubMesh;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<int> _InstanceSubMeshMaterial;
+            StructuredBuffer<uint2> _InstanceMaterialRange;
             #include "NanitePackedPage.hlsl"
 
             struct Attributes { uint vertexID : SV_VertexID; };
@@ -242,6 +246,9 @@ Shader "Nanite/VBufferLitResolve"
 
             CBUFFER_START(NaniteResolveUniforms)
             float _ResolveMaterialId;
+            float _ResolveMaterialMode;
+            float _ResolveMaterialFamily;
+            float _ResolveAbsorbedFamily;
             float _VertexStride;
             float _MaxSubMeshCount;
             float _TriangleCount;
@@ -251,6 +258,7 @@ Shader "Nanite/VBufferLitResolve"
             float _TileCount;
             float _UseNormalizedIds;
             float _UseTileMaterialMask;
+            float _UseCompactedTileBins;
             float2 _NaniteViewInvSize;
             float4 _NaniteVBufferSize; // xy=size, zw=invSize
             CBUFFER_END
@@ -277,6 +285,18 @@ Shader "Nanite/VBufferLitResolve"
             StructuredBuffer<int> _TriangleSubMesh;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<int> _InstanceSubMeshMaterial;
+            StructuredBuffer<uint2> _InstanceMaterialRange;
+            struct NaniteMaterialData
+            {
+                float4 baseColor;
+                float4 emissionColor;
+                float4 baseMapST;
+                float4 surface0;
+                float4 surface1;
+                float4 surface2;
+                float4 feature0;
+            };
+            StructuredBuffer<NaniteMaterialData> _NaniteMaterialData;
             struct NaniteInstanceSH
             {
                 float4 shAr;
@@ -288,7 +308,8 @@ Shader "Nanite/VBufferLitResolve"
                 float4 shC;
             };
             StructuredBuffer<NaniteInstanceSH> _InstanceSH;
-            StructuredBuffer<uint> _TileMaterialMask;
+            StructuredBuffer<uint2> _TileMaterialMask;
+            StructuredBuffer<uint> _TileMaterialBinList;
             #include "NanitePackedPage.hlsl"
 
             struct Attributes
@@ -432,14 +453,33 @@ Shader "Nanite/VBufferLitResolve"
 
                 if (_UseTileMaterialMask > 0.5)
                 {
-                    uint tileIndex = input.instanceID;
                     uint tileCount = (uint)max(0, (int)_TileCount);
                     int resolveMaterialId = ResolveMaterialIdInt();
-                    bool tileContainsMaterial =
-                        tileIndex < tileCount &&
-                        resolveMaterialId >= 0 &&
-                        resolveMaterialId < 32 &&
-                        (_TileMaterialMask[tileIndex] & (1u << resolveMaterialId)) != 0u;
+                    bool compatibilityMode = _ResolveMaterialMode > 1.5;
+                    bool familyMode = _ResolveMaterialMode > 0.5 && !compatibilityMode;
+                    int resolveBinId = familyMode || compatibilityMode
+                        ? (int)_ResolveMaterialFamily
+                        : (resolveMaterialId >= 0
+                            ? (int)round(_NaniteMaterialData[resolveMaterialId].feature0.w)
+                            : 0);
+                    uint binIndex = familyMode
+                        ? (uint)max(0, resolveBinId)
+                        : 32u + ((uint)max(0, resolveBinId) & 31u);
+                    uint tileIndex = input.instanceID;
+                    if (_UseCompactedTileBins > 0.5 && input.instanceID < tileCount)
+                        tileIndex = _TileMaterialBinList[binIndex * tileCount + input.instanceID];
+                    uint2 tileMask = tileIndex < tileCount
+                        ? _TileMaterialMask[tileIndex]
+                        : 0u.xx;
+                    bool compatibilityContainsAbsorbedFamily = compatibilityMode &&
+                        _ResolveAbsorbedFamily > 0.5 && _ResolveAbsorbedFamily < 32.0 &&
+                        (tileMask.x & (1u << (uint)_ResolveAbsorbedFamily)) != 0u;
+                    bool tileContainsMaterial = familyMode
+                        ? (resolveBinId > 0 && resolveBinId < 32 &&
+                           (tileMask.x & (1u << resolveBinId)) != 0u)
+                        : ((resolveBinId >= 0 &&
+                            (tileMask.y & (1u << ((uint)resolveBinId & 31u))) != 0u) ||
+                           compatibilityContainsAbsorbedFamily);
 
                     if (!tileContainsMaterial)
                     {
@@ -506,13 +546,30 @@ Shader "Nanite/VBufferLitResolve"
 
                 int instanceId = decoded.instanceId;
                 int triangleId = decoded.triangleId;
-                int maxSubMeshCount = MaxSubMeshCountInt();
+                uint2 materialRange = _InstanceMaterialRange[instanceId];
 
                 int subMeshId = _TriangleSubMesh[triangleId];
-                subMeshId = clamp(subMeshId, 0, max(0, maxSubMeshCount - 1));
-                int materialId = _InstanceSubMeshMaterial[instanceId * maxSubMeshCount + subMeshId];
-                if (materialId != resolveMaterialId)
+                subMeshId = clamp(subMeshId, 0, max(0, (int)materialRange.y - 1));
+                int materialId = _InstanceSubMeshMaterial[materialRange.x + (uint)subMeshId];
+                NaniteMaterialData materialData = _NaniteMaterialData[materialId];
+                if (_ResolveMaterialMode > 1.5)
+                {
+                    bool exactCompatibility =
+                        (int)round(materialData.feature0.w) == (int)_ResolveMaterialFamily;
+                    bool absorbedTexturelessFamily = _ResolveAbsorbedFamily > 0.5 &&
+                        (int)round(materialData.feature0.z) == (int)_ResolveAbsorbedFamily;
+                    if (!exactCompatibility && !absorbedTexturelessFamily)
+                        discard;
+                }
+                else if (_ResolveMaterialMode > 0.5)
+                {
+                    if ((int)round(materialData.feature0.z) != (int)_ResolveMaterialFamily)
+                        discard;
+                }
+                else if (materialId != resolveMaterialId)
+                {
                     discard;
+                }
 
                 float3 p0OS;
                 float3 p1OS;
@@ -588,11 +645,11 @@ Shader "Nanite/VBufferLitResolve"
                 float2 meshUvDx;
                 float2 meshUvDy;
                 float2 meshUv = NaniteBarycentricLerp(uv0, uv1, uv2, bary, meshUvDx, meshUvDy);
-                float2 surfaceUv = meshUv * _BaseMap_ST.xy + _BaseMap_ST.zw;
+                float2 surfaceUv = meshUv * materialData.baseMapST.xy + materialData.baseMapST.zw;
                 // 全屏 resolve 的邻像素常属不同三角形，ddx/ddy(uv) 会跨三角爆炸 → 远处 mip 拉满看起来“没贴图”。
                 // 必须始终使用同一三角形的解析重心导数。
-                float2 uvDx = meshUvDx * _BaseMap_ST.xy;
-                float2 uvDy = meshUvDy * _BaseMap_ST.xy;
+                float2 uvDx = meshUvDx * materialData.baseMapST.xy;
+                float2 uvDy = meshUvDy * materialData.baseMapST.xy;
                 float maxGrad2 = max(dot(uvDx, uvDx), dot(uvDy, uvDy));
                 // 亚像素三角数值尖峰时钳制梯度，避免 SampleGrad 选到无效高 mip。
                 const float kMaxUvGrad = 1.0;
@@ -612,10 +669,10 @@ Shader "Nanite/VBufferLitResolve"
                 #endif
 
                 float4 baseTex = float4(1.0, 1.0, 1.0, 1.0);
-                if (_HasBaseMap > 0.5)
+                if (materialData.surface1.z > 0.5)
                     baseTex = SAMPLE_TEXTURE2D_GRAD(_BaseMap, sampler_BaseMap, surfaceUv, uvDx, uvDy);
-                float alpha = baseTex.a * _BaseColor.a;
-                if (_AlphaClip > 0.5 && alpha < _Cutoff)
+                float alpha = baseTex.a * materialData.baseColor.a;
+                if (materialData.surface1.y > 0.5 && alpha < materialData.surface0.x)
                     discard;
 
                 float3 edge1 = p1WS - p0WS;
@@ -665,39 +722,39 @@ Shader "Nanite/VBufferLitResolve"
                 tangentVertexWS = normalize(tangentVertexWS);
 
                 float3 normalTS = float3(0.0, 0.0, 1.0);
-                if (_HasNormalMap > 0.5)
+                if (materialData.surface1.w > 0.5)
                 {
                     float4 normalPacked = SAMPLE_TEXTURE2D_GRAD(_BumpMap, sampler_BumpMap, surfaceUv, uvDx, uvDy);
-                    normalTS = UnpackNormalScale(normalPacked, _BumpScale);
+                    normalTS = UnpackNormalScale(normalPacked, materialData.surface0.w);
                 }
                 float3 normalWS = NormalizeNormalPerPixel(NaniteBuildNormalWS(normalTS, normalVertexWS, tangentVertexWS, tangentSignWS));
 
-                float4 metallicGloss = float4(_Metallic, 0.0, 0.0, _Smoothness);
-                if (_HasMetallicGlossMap > 0.5)
+                float4 metallicGloss = float4(materialData.surface0.z, 0.0, 0.0, materialData.surface0.y);
+                if (materialData.surface2.x > 0.5)
                 {
                     metallicGloss = SAMPLE_TEXTURE2D_GRAD(_MetallicGlossMap, sampler_MetallicGlossMap, surfaceUv, uvDx, uvDy);
-                    if (_SmoothnessFromAlbedoAlpha > 0.5)
-                        metallicGloss.a = baseTex.a * _Smoothness;
+                    if (materialData.feature0.x > 0.5)
+                        metallicGloss.a = baseTex.a * materialData.surface0.y;
                     else
-                        metallicGloss.a *= _Smoothness;
+                        metallicGloss.a *= materialData.surface0.y;
                 }
                 float metallic = metallicGloss.r;
                 float smoothness = metallicGloss.a;
 
                 float occTex = SAMPLE_TEXTURE2D_GRAD(_OcclusionMap, sampler_OcclusionMap, surfaceUv, uvDx, uvDy).g;
                 float occlusion = 1.0;
-                if (_HasOcclusionMap > 0.5)
-                    occlusion = LerpWhiteTo(occTex, _OcclusionStrength);
+                if (materialData.surface2.y > 0.5)
+                    occlusion = LerpWhiteTo(occTex, materialData.surface1.x);
 
                 float3 emission = float3(0.0, 0.0, 0.0);
-                if (_EmissionEnabled > 0.5)
+                if (materialData.surface2.w > 0.5)
                 {
                     float3 emissionTex = SAMPLE_TEXTURE2D_GRAD(_EmissionMap, sampler_EmissionMap, surfaceUv, uvDx, uvDy).rgb;
-                    emission = _EmissionColor.rgb * lerp(float3(1.0, 1.0, 1.0), emissionTex, saturate(_HasEmissionMap));
+                    emission = materialData.emissionColor.rgb * lerp(float3(1.0, 1.0, 1.0), emissionTex, saturate(materialData.surface2.z));
                 }
 
                 SurfaceData surfaceData = (SurfaceData)0;
-                surfaceData.albedo = baseTex.rgb * _BaseColor.rgb;
+                surfaceData.albedo = baseTex.rgb * materialData.baseColor.rgb;
                 surfaceData.specular = float3(0.0, 0.0, 0.0);
                 surfaceData.metallic = saturate(metallic);
                 surfaceData.smoothness = saturate(smoothness);

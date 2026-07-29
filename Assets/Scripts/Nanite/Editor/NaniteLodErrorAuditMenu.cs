@@ -1,4 +1,5 @@
 #if UNITY_EDITOR
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using UnityEditor;
@@ -12,6 +13,17 @@ namespace Nanite.Editor
     public static class NaniteLodErrorAuditMenu
     {
         const float kMaxValueThreshold = 1e20f;
+
+        sealed class MipStats
+        {
+            public int clusters;
+            public long triangles;
+            public int parentMax;
+            public long parentMaxTriangles;
+            public long residentRootTriangles;
+            public readonly List<float> selfFinite = new List<float>();
+            public readonly List<float> parentFinite = new List<float>();
+        }
 
         [MenuItem("Nanite/Audit LOD Errors (Selected NaniteMesh)")]
         static void AuditSelected()
@@ -59,6 +71,9 @@ namespace Nanite.Editor
             int partsMaxParent = 0;
             int bvhNodes = 0;
             int pagesWithBvh = 0;
+            long parentMaxTriangles = 0;
+            long residentRootTriangles = 0;
+            var mipStats = new SortedDictionary<int, MipStats>();
 
             if (mesh.pageArray == null)
             {
@@ -77,6 +92,9 @@ namespace Nanite.Editor
 
                 int pageParentMax = 0;
                 int pageClusters = page.clusterArray != null ? page.clusterArray.Length : 0;
+                bool pageIsRoot = mesh.pageStreamingInfo != null &&
+                                  (uint)p < (uint)mesh.pageStreamingInfo.Length &&
+                                  mesh.pageStreamingInfo[p].IsRootPage;
                 if (page.bvhNodes != null && page.bvhNodes.Length > 0 && page.bvhRoot >= 0)
                 {
                     pagesWithBvh++;
@@ -102,7 +120,12 @@ namespace Nanite.Editor
                     totalClusters++;
                     bool pMax = cl.parentError >= kMaxValueThreshold || float.IsInfinity(cl.parentError);
                     bool sMax = cl.selfError >= kMaxValueThreshold || float.IsInfinity(cl.selfError);
-                    if (pMax) { parentMax++; pageParentMax++; }
+                    if (pMax)
+                    {
+                        parentMax++;
+                        pageParentMax++;
+                        parentMaxTriangles += cl.indiceCount / 3;
+                    }
                     if (sMax) selfMax++;
                     if (!pMax && !sMax) bothFinite++;
                     if (cl.selfError <= 1e-12f) leafSelfZero++;
@@ -119,6 +142,28 @@ namespace Nanite.Editor
                         minSelf = Mathf.Min(minSelf, cl.selfError);
                         maxSelfFinite = Mathf.Max(maxSelfFinite, cl.selfError);
                     }
+
+                    int mip = ResolveClusterMip(page, c, cl.partIndex);
+                    if (!mipStats.TryGetValue(mip, out MipStats mipStat))
+                    {
+                        mipStat = new MipStats();
+                        mipStats.Add(mip, mipStat);
+                    }
+                    mipStat.clusters++;
+                    mipStat.triangles += cl.indiceCount / 3;
+                    if (pageIsRoot)
+                    {
+                        long triangles = cl.indiceCount / 3;
+                        residentRootTriangles += triangles;
+                        mipStat.residentRootTriangles += triangles;
+                    }
+                    if (pMax)
+                    {
+                        mipStat.parentMax++;
+                        mipStat.parentMaxTriangles += cl.indiceCount / 3;
+                    }
+                    else mipStat.parentFinite.Add(cl.parentError);
+                    if (!sMax) mipStat.selfFinite.Add(cl.selfError);
                 }
 
                 sb.AppendLine(
@@ -130,6 +175,8 @@ namespace Nanite.Editor
             sb.AppendLine("--- totals ---");
             sb.AppendLine($"clusters={totalClusters}");
             sb.AppendLine($"parentError=MaxValue: {parentMax} ({Pct(parentMax, totalClusters)})  ← bake 卡住简化/根节点会写这个");
+            sb.AppendLine($"resident root-set triangles: {residentRootTriangles}");
+            sb.AppendLine($"never-disappearing parent=MaxValue triangles: {parentMaxTriangles}");
             sb.AppendLine($"selfError=MaxValue: {selfMax} ({Pct(selfMax, totalClusters)})");
             sb.AppendLine($"selfError≈0 (leaf): {leafSelfZero} ({Pct(leafSelfZero, totalClusters)})");
             sb.AppendLine($"parent=MaxValue & self=0: {parentMaxSelfZero} ({Pct(parentMaxSelfZero, totalClusters)})  ← 永不因 parent 阈值被切掉");
@@ -139,14 +186,49 @@ namespace Nanite.Editor
                 $"finite selfError range: [{F(minSelf)}, {F(maxSelfFinite)}]");
             sb.AppendLine($"parts={partsTotal}, parts.maxParentLodError=MaxValue: {partsMaxParent} ({Pct(partsMaxParent, partsTotal)})");
             sb.AppendLine($"pagesWithBvh={pagesWithBvh}/{mesh.pageArray.Length}, bvhNodes={bvhNodes}");
+            sb.AppendLine("--- per mip ---");
+            sb.AppendLine("mip clusters triangles | self[min/median/max] | parent[min/median/max] | parentMaxTriangles/residentRootTriangles");
+            foreach (KeyValuePair<int, MipStats> pair in mipStats)
+            {
+                MipStats stat = pair.Value;
+                sb.AppendLine(
+                    $"{pair.Key,3} {stat.clusters,8} {stat.triangles,9} | " +
+                    $"{Range(stat.selfFinite),30} | {Range(stat.parentFinite),30} | " +
+                    $"{stat.parentMax,5} ({Pct(stat.parentMax, stat.clusters)}) / " +
+                    $"{stat.parentMaxTriangles}/{stat.residentRootTriangles}");
+            }
+
+            float modelRadius = Mathf.Max(1e-6f, mesh.boundingSphere.w);
+            sb.AppendLine(
+                $"max finite self/model radius={maxSelfFinite / modelRadius:0.###}x, " +
+                $"parent/model radius={maxParentFinite / modelRadius:0.###}x (radius={modelRadius:G6})");
             sb.AppendLine();
             sb.AppendLine("解读:");
             sb.AppendLine("- 互斥 LOD：同一处只应选一层。宽重叠带会双选父子→浮动碎块（已禁用）。");
             sb.AppendLine("- parentError=MaxValue：无法退化；比例过高则远处一直密。");
-            sb.AppendLine("- parentError 过小：近处也会切到粗层（「不够精细」）。Bake 现用半径×2% 作下限，改完需重 Bake。");
+            sb.AppendLine("- 误差应为对象空间绝对值并随 mip 单调增加；若远大于模型半径，通常是累计公式或单位错误。");
             sb.AppendLine("- lodErrorPixels：1~2 看质量；8 只适合压测掉 cluster，近处变糙是正常的。");
             sb.AppendLine("- Feature 驱动看 lastGpuVisibleApprox。");
             return sb.ToString();
+        }
+
+        static int ResolveClusterMip(NaniteMeshPage page, int clusterIndex, int partIndex)
+        {
+            if (page.clusterMip != null && (uint)clusterIndex < (uint)page.clusterMip.Length)
+                return page.clusterMip[clusterIndex];
+            if (page.parts != null && (uint)partIndex < (uint)page.parts.Length)
+                return page.parts[partIndex].mipLevel;
+            return -1;
+        }
+
+        static string Range(List<float> values)
+        {
+            if (values == null || values.Count == 0)
+                return "n/a";
+
+            values.Sort();
+            float median = values[(values.Count - 1) / 2];
+            return $"[{F(values[0])}/{F(median)}/{F(values[values.Count - 1])}]";
         }
 
         static string Pct(int n, int total)
