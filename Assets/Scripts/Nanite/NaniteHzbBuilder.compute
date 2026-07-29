@@ -1,3 +1,4 @@
+#pragma only_renderers d3d11
 #pragma kernel CSCopyDepth
 #pragma kernel CSCopyDepthHalf
 #pragma kernel CSDownsample

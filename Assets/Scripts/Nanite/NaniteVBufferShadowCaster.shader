@@ -15,7 +15,10 @@ Shader "Nanite/VBufferShadowCaster"
             Name "NaniteShadowCaster"
             Tags { "LightMode" = "ShadowCaster" }
 
-            Cull Back
+            // This is a procedural draw, so Unity cannot apply the automatic
+            // winding correction used by MeshRenderer shadow casters. Match the
+            // Formal VBuffer path and keep Page geometry two-sided.
+            Cull Off
             ZWrite On
             ZTest LEqual
             ColorMask 0

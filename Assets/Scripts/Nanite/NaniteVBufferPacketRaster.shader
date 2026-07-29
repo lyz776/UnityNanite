@@ -140,7 +140,11 @@ Shader "Nanite/VBufferPacketRaster"
         Pass
         {
             Name "VBufferFormal"
-            Cull Back
+            // Procedural draws do not receive MeshRenderer's automatic winding
+            // correction. Imported/baked Pages may therefore arrive with the
+            // opposite front-face convention on D3D12. Keep the visibility pass
+            // two-sided; depth competition still selects the nearest surface.
+            Cull Off
             ZTest LEqual
             ZWrite On
             Blend Off

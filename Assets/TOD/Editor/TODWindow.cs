@@ -153,7 +153,7 @@ namespace UnityNanite.TOD.Editor
                     EditorGUI.BeginChangeCheck();
                     float hour = EditorGUILayout.Slider(previewController.CurrentTime, 0f, 24f, GUILayout.MinWidth(260f));
                     if (EditorGUI.EndChangeCheck())
-                        SetPreviewTime(hour, "调整 TOD 时间", true);
+                        SetPreviewTime(hour, null, false);
                     GUILayout.Label(FormatTime(previewController.CurrentTime), EditorStyles.boldLabel, GUILayout.Width(62f));
                 }
             }
@@ -225,8 +225,14 @@ namespace UnityNanite.TOD.Editor
 
             Undo.RecordObject(previewController, "加载 TOD Profile");
             previewController.Profile = profile;
+            PrefabUtility.RecordPrefabInstancePropertyModifications(previewController);
             EditorUtility.SetDirty(previewController);
             Selection.activeGameObject = previewController.gameObject;
+            EditorApplication.delayCall += () =>
+            {
+                ActiveEditorTracker.sharedTracker.ForceRebuild();
+                RepaintEverything();
+            };
             RepaintEverything();
         }
 
@@ -348,7 +354,7 @@ namespace UnityNanite.TOD.Editor
 
             DrawSelectedCurveKeyEditor(parameter, descriptor);
             EditorGUILayout.HelpBox(
-                "双击节点：跳转到节点时间；拖动节点：同时改时间和值；按 Shift 后拖动：锁定水平或垂直方向；Esc：取消本次拖动。",
+                "双击节点：跳转到节点时间；拖动节点：只改节点时间和值，预览时间保持固定；按 Shift 后拖动：锁定水平或垂直方向；Esc：取消本次拖动。跳时不进入 Undo。",
                 MessageType.Info);
 
             if (EditorGUI.EndChangeCheck())
@@ -434,7 +440,7 @@ namespace UnityNanite.TOD.Editor
                 selectedGradientKey = -1;
                 if (current.clickCount == 2)
                 {
-                    SetPreviewTime(keys[nearest].time, "跳转到曲线节点", true);
+                    SetPreviewTime(keys[nearest].time, null, false);
                     current.Use();
                     return;
                 }
@@ -479,7 +485,6 @@ namespace UnityNanite.TOD.Editor
                 moved[draggingKey] = key;
                 parameter.curve.keys = moved;
                 selectedCurveKey = FindClosestTime(parameter.curve.keys, time);
-                SetPreviewTime(time, null, false);
                 CommitProfileEdit();
                 current.Use();
             }
@@ -510,7 +515,6 @@ namespace UnityNanite.TOD.Editor
                 keys[selectedCurveKey] = key;
                 parameter.curve.keys = keys;
                 selectedCurveKey = FindClosestTime(parameter.curve.keys, time);
-                SetPreviewTime(time, null, false);
                 CommitProfileEdit();
             }
             EditorGUILayout.EndVertical();
@@ -551,7 +555,7 @@ namespace UnityNanite.TOD.Editor
             EditorGUILayout.EndHorizontal();
 
             DrawSelectedGradientKeyEditor(parameter, descriptor);
-            EditorGUILayout.HelpBox("双击颜色节点可跳转时间；拖动节点可修改时间；Esc 取消拖动。颜色与 Alpha 仍可点击上方 Gradient 使用 Unity 原生编辑器调整。", MessageType.Info);
+            EditorGUILayout.HelpBox("双击颜色节点可跳转时间；拖动节点只修改节点时间，预览时间保持固定；Esc 取消拖动。跳时不进入 Undo；颜色与 Alpha 仍可点击上方 Gradient 使用 Unity 原生编辑器调整。", MessageType.Info);
 
             if (EditorGUI.EndChangeCheck())
                 CommitProfileEdit();
@@ -615,7 +619,7 @@ namespace UnityNanite.TOD.Editor
                 selectedCurveKey = -1;
                 if (current.clickCount == 2)
                 {
-                    SetPreviewTime(keys[nearest].time * 24f, "跳转到 Gradient 节点", true);
+                    SetPreviewTime(keys[nearest].time * 24f, null, false);
                     current.Use();
                     return;
                 }
@@ -637,7 +641,6 @@ namespace UnityNanite.TOD.Editor
                 moved[draggingKey].time = time01;
                 parameter.gradient.SetKeys(moved, gradientDragAlphas);
                 selectedGradientKey = FindClosestGradientTime(parameter.gradient.colorKeys, time01);
-                SetPreviewTime(time01 * 24f, null, false);
                 CommitProfileEdit();
                 current.Use();
             }
@@ -666,7 +669,6 @@ namespace UnityNanite.TOD.Editor
                 keys[selectedGradientKey] = new GradientColorKey(color, hour / 24f);
                 parameter.gradient.SetKeys(keys, parameter.gradient.alphaKeys);
                 selectedGradientKey = FindClosestGradientTime(parameter.gradient.colorKeys, hour / 24f);
-                SetPreviewTime(hour, null, false);
                 CommitProfileEdit();
             }
             EditorGUILayout.EndVertical();
@@ -693,8 +695,6 @@ namespace UnityNanite.TOD.Editor
             if ((current.type == EventType.MouseDown || current.type == EventType.MouseDrag) &&
                 current.button == 0 && rect.Contains(current.mousePosition))
             {
-                if (current.type == EventType.MouseDown)
-                    Undo.RecordObject(previewController, "拖动 TOD 时间线");
                 float hour = Mathf.Clamp01((current.mousePosition.x - rect.x) / rect.width) * 24f;
                 SetPreviewTime(hour, null, false);
                 current.Use();

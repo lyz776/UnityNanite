@@ -1,3 +1,4 @@
+#pragma only_renderers d3d11
 #pragma kernel CSPartCull
 #pragma kernel CSClusterCull
 #pragma kernel CSClusterCullByPart

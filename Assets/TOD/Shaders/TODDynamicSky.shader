@@ -45,12 +45,18 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float3 _TODSunScatterColor;
             float _TODSunScatterIntensity;
             float _TODSunScatterPower;
+            float _TODMieAnisotropy;
+            float _TODMieOpticalDepth;
+            float _TODMieHorizonBoost;
+            float _TODMieMoonAmount;
 
             float _TODStarsEnabled;
             float3 _TODStarsColor;
             float _TODStarsIntensity;
             float _TODStarsDensity;
             float _TODStarsSize;
+            float _TODStarsSizeVariation;
+            float _TODStarsBrightnessVariation;
             float _TODStarsTwinkle;
             float _TODStarsTwinkleSpeed;
             float _TODStarsHorizonFade;
@@ -62,10 +68,30 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float _TODCloudOpacity;
             float _TODCloudCoverage;
             float _TODCloudScale;
+            float _TODCloudDetailScale;
             float _TODCloudSoftness;
+            float _TODCloudErosion;
+            float _TODCloudDistortion;
             float2 _TODCloudSpeed;
             float _TODCloudHorizonFade;
+            float _TODCloudAltitude;
+            float _TODCloudThickness;
+            float _TODCloudDensityMultiplier;
+            float _TODCloudHorizonDensity;
+            float _TODCloudZenithDensity;
+            float _TODCloudLatitudePosition;
+            float _TODCloudLatitudeWidth;
+            float3 _TODCloudScatteringCoeff;
+            float3 _TODCloudAbsorptionCoeff;
+            float _TODCloudPhaseForward;
+            float _TODCloudPhaseBackward;
+            float _TODCloudPhaseBlend;
             float _TODCloudSunLighting;
+            float _TODCloudMoonLighting;
+            float3 _TODCloudAmbientColor;
+            float _TODCloudAmbientIntensity;
+            float _TODCloudMultipleScattering;
+            float _TODCloudAerialPerspective;
 
             float3 _TODSunDir;
             float3 _TODSunColor;
@@ -85,6 +111,12 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float _TODMoonHaloSize;
             float _TODMoonHaloIntensity;
             float _TODMoonPhase;
+            float _TODMoonPhaseSoftness;
+            float _TODMoonPhaseRotation;
+            float _TODMoonEarthshine;
+            float _TODMoonSurfaceDetail;
+            float _TODMoonSurfaceScale;
+            float _TODMoonAtmosphereBlend;
 
             Varyings Vert(Attributes input)
             {
@@ -97,23 +129,59 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
 
             float SoftDisk(float directionDot, float size, float softness)
             {
-                float angularDistance = 1.0 - saturate(directionDot);
+                // Chord distance closely follows angular radius for small sky discs.
+                float angularDistance = sqrt(max(0.0, 2.0 * (1.0 - saturate(directionDot))));
                 return 1.0 - smoothstep(size, size + softness, angularDistance);
             }
 
             float SoftHalo(float directionDot, float size)
             {
-                float angularDistance = max(0.0, 1.0 - directionDot);
+                float angularDistance = sqrt(max(0.0, 2.0 * (1.0 - saturate(directionDot))));
                 return exp(-angularDistance / max(0.0001, size));
+            }
+
+            float HenyeyGreenstein(float cosineTheta, float anisotropy)
+            {
+                float g = clamp(anisotropy, -0.95, 0.95);
+                float denominator = max(
+                    0.001,
+                    pow(1.0 + g * g - 2.0 * g * cosineTheta, 1.5));
+                return (1.0 - g * g) / denominator;
+            }
+
+            float2 MoonDiscCoordinates(float3 viewDirection, float3 moonDirection)
+            {
+                float3 referenceAxis = abs(moonDirection.y) > 0.98 ? float3(1, 0, 0) : float3(0, 1, 0);
+                float3 tangent = normalize(cross(referenceAxis, moonDirection));
+                float3 bitangent = normalize(cross(moonDirection, tangent));
+                float radius = max(0.0001, _TODMoonSize);
+                float2 discPosition = float2(
+                    dot(viewDirection, tangent),
+                    dot(viewDirection, bitangent)) / radius;
+                float angle = radians(_TODMoonPhaseRotation);
+                float sineValue;
+                float cosineValue;
+                sincos(angle, sineValue, cosineValue);
+                return float2(
+                    discPosition.x * cosineValue - discPosition.y * sineValue,
+                    discPosition.x * sineValue + discPosition.y * cosineValue);
             }
 
             float MoonPhaseMask(float3 viewDirection, float3 moonDirection, float phase)
             {
-                float3 referenceAxis = abs(moonDirection.y) > 0.98 ? float3(1, 0, 0) : float3(0, 1, 0);
-                float3 tangent = normalize(cross(referenceAxis, moonDirection));
-                float side = dot(viewDirection, tangent) / max(0.0001, sqrt(_TODMoonSize));
-                float terminator = lerp(1.1, -1.1, phase);
-                return smoothstep(terminator - 0.08, terminator + 0.08, side);
+                float2 discPosition = MoonDiscCoordinates(viewDirection, moonDirection);
+                float surfaceDepth = sqrt(saturate(1.0 - dot(discPosition, discPosition)));
+
+                // phase: 0=new moon, 0.5=half moon, 1=full moon.
+                float phaseAngle = (1.0 - phase) * PI;
+                float sineValue;
+                float cosineValue;
+                sincos(phaseAngle, sineValue, cosineValue);
+                float lightDot = dot(
+                    float3(discPosition.x, discPosition.y, surfaceDepth),
+                    float3(sineValue, 0.0, cosineValue));
+                float terminatorSoftness = max(0.002, _TODMoonPhaseSoftness);
+                return smoothstep(-terminatorSoftness, terminatorSoftness, lightDot);
             }
 
             float Hash21(float2 value)
@@ -171,31 +239,70 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 float2 cell = floor(gridUV);
                 float2 local = frac(gridUV) - 0.5;
                 float randomValue = Hash21(cell);
+                float sizeRandom = Hash21(cell + float2(19.7, 73.1));
+                float brightnessRandom = Hash21(cell + float2(91.3, 7.9));
                 float starCell = step(_TODStarsDensity, randomValue);
+                float rareLargeStar = smoothstep(0.985, 1.0, sizeRandom);
+                float variedSize = lerp(
+                    1.0,
+                    lerp(0.32, 1.65, pow(sizeRandom, 2.4)) + rareLargeStar * 0.85,
+                    _TODStarsSizeVariation);
+                float starRadius = _TODStarsSize * variedSize;
                 float star = 1.0 - smoothstep(
-                    _TODStarsSize * 0.35,
-                    _TODStarsSize,
+                    starRadius * 0.32,
+                    starRadius,
                     length(local));
+                float variedBrightness = lerp(
+                    1.0,
+                    lerp(0.35, 1.35, brightnessRandom),
+                    _TODStarsBrightnessVariation);
                 float twinkle = lerp(
                     1.0,
                     0.55 + 0.45 * sin(_Time.y * _TODStarsTwinkleSpeed + randomValue * 31.4),
                     _TODStarsTwinkle);
                 float horizonFade = smoothstep(0.0, _TODStarsHorizonFade, viewDirection.y);
-                return star * starCell * twinkle * horizonFade;
+                return star * starCell * variedBrightness * twinkle * horizonFade;
             }
 
-            float ProceduralClouds(float3 viewDirection)
+            float3 ProceduralClouds(float3 viewDirection)
             {
-                float projectionHeight = max(0.08, viewDirection.y + 0.28);
-                float2 cloudUV = viewDirection.xz / projectionHeight;
-                cloudUV = cloudUV * (_TODCloudScale * 0.18) + _Time.y * _TODCloudSpeed;
-                float cloudNoise = Fbm(cloudUV);
-                float threshold = lerp(0.78, 0.28, _TODCloudCoverage);
-                float cloud = smoothstep(
-                    threshold - _TODCloudSoftness,
-                    threshold + _TODCloudSoftness,
-                    cloudNoise);
-                return cloud * smoothstep(-0.02, _TODCloudHorizonFade, viewDirection.y);
+                // Intersect the view ray with a stylized high-altitude layer.
+                // Altitude changes parallax/feature scale instead of merely
+                // translating a screen-space noise pattern.
+                float rayHeight = max(0.035, viewDirection.y + 0.06);
+                float layerDistance = _TODCloudAltitude / rayHeight;
+                float2 wind = _Time.y * _TODCloudSpeed;
+                float2 cloudUV =
+                    viewDirection.xz * layerDistance * (_TODCloudScale * 0.018) + wind;
+
+                float2 warp = float2(
+                    Fbm(cloudUV * 0.52 + 7.13),
+                    Fbm(cloudUV * 0.52 + float2(31.7, 19.2))) - 0.5;
+                float broadShape = Fbm(cloudUV + warp * _TODCloudDistortion);
+                float fineShape = Fbm(
+                    cloudUV * _TODCloudDetailScale - warp * 0.75 + float2(12.4, -8.1));
+                float erodedDetail = lerp(0.5, fineShape, _TODCloudErosion);
+                float density = broadShape - (1.0 - erodedDetail) * _TODCloudErosion * 0.42;
+                float threshold = lerp(0.64, 0.30, _TODCloudCoverage);
+                float edge = max(0.012, _TODCloudSoftness * 0.38);
+                float cloud = smoothstep(threshold - edge, threshold + edge, density);
+                cloud *= lerp(0.72, 1.0, smoothstep(0.22, 0.82, fineShape));
+
+                float latitude = saturate(viewDirection.y);
+                float latitudeBlend = smoothstep(
+                    _TODCloudLatitudePosition - _TODCloudLatitudeWidth,
+                    _TODCloudLatitudePosition + _TODCloudLatitudeWidth,
+                    latitude);
+                float distribution = lerp(
+                    _TODCloudHorizonDensity,
+                    _TODCloudZenithDensity,
+                    latitudeBlend);
+                cloud *= distribution * _TODCloudDensityMultiplier;
+                cloud *= smoothstep(-0.015, _TODCloudHorizonFade, viewDirection.y);
+                return float3(
+                    saturate(cloud),
+                    saturate(density),
+                    saturate(layerDistance / max(1.0, _TODCloudAltitude * 24.0)));
             }
 
             half4 Frag(Varyings input) : SV_Target
@@ -210,45 +317,214 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 float3 upperSky = lerp(_TODLightBottom, _TODLightMiddle, lowerBlend);
                 upperSky = lerp(upperSky, _TODLightTop, upperBlend);
 
-                float groundBlend = smoothstep(-0.15, 0.015, height);
+                float horizonWidth = max(0.0001, _TODHorizonWidth);
+                float groundBlend = smoothstep(-horizonWidth, horizonWidth, height);
                 float3 sky = lerp(_TODGroundColor, upperSky, groundBlend);
 
-                float horizon = exp(-abs(height) / max(0.0001, _TODHorizonWidth));
-                sky += _TODHorizonColor * horizon * _TODHorizonIntensity;
+                // Width expands around y=0 in both directions instead of only
+                // appearing to push the lower gradient downwards.
+                float horizon = 1.0 - smoothstep(0.0, horizonWidth, abs(height));
+                float horizonBlend = saturate(horizon * min(_TODHorizonIntensity, 1.0));
+                sky = lerp(sky, _TODHorizonColor, horizonBlend);
+                sky += _TODHorizonColor * horizon * max(0.0, _TODHorizonIntensity - 1.0);
 
-                float sunDot = dot(viewDirection, normalize(_TODSunDir));
-                float sunScatter = pow(saturate(sunDot), _TODSunScatterPower);
-                sky += _TODSunScatterColor * sunScatter * _TODSunScatterIntensity;
+                float3 sunDirection = normalize(_TODSunDir);
+                float3 moonDirection = normalize(_TODMoonDir);
+                float sunDot = dot(viewDirection, sunDirection);
+                float moonDot = dot(viewDirection, moonDirection);
+
+                // Art-directable Mie scattering retaining its defining forward
+                // lobe and the longer optical path near the horizon.
+                float airMass = lerp(
+                    1.0,
+                    max(1.0, _TODMieHorizonBoost),
+                    pow(1.0 - saturate(abs(height)), 2.0));
+                float mieOpticalDepth = max(0.0, _TODMieOpticalDepth) * airMass;
+                float mieTransmittance = exp(-mieOpticalDepth * 0.18);
+                float mieSunPhase = min(
+                    12.0,
+                    HenyeyGreenstein(sunDot, _TODMieAnisotropy));
+                float mieSunCore = pow(saturate(sunDot), _TODSunScatterPower);
+                float mieSun = (mieSunPhase * 0.18 + mieSunCore) *
+                    (1.0 - mieTransmittance) * _TODSunScatterIntensity;
+                float mieMoonPhase = min(
+                    8.0,
+                    HenyeyGreenstein(moonDot, min(_TODMieAnisotropy, 0.82)));
+                float mieMoon = mieMoonPhase * (1.0 - mieTransmittance) *
+                    _TODMieMoonAmount * _TODMoonIntensity * 0.12;
+                sky += _TODSunScatterColor *
+                    (mieSun * max(0.0, _TODSunIntensity) + mieMoon) *
+                    smoothstep(-0.08, 0.06, height);
                 float2 viewHorizontal = viewDirection.xz;
                 float2 sunHorizontal = _TODSunDir.xz;
                 viewHorizontal /= max(length(viewHorizontal), 0.0001);
-                sunHorizontal /= max(length(sunHorizontal), 0.0001);
-                float horizonFacingSun = pow(
+                float sunHorizontalLength = length(sunHorizontal);
+                sunHorizontal /= max(sunHorizontalLength, 0.0001);
+
+                // The old version only focused the XZ azimuth, while its vertical
+                // extent still came from the full horizon band. At high focus this
+                // collapsed into a visible vertical pillar. Keep the azimuth lobe
+                // deliberately wide and give it an independent, narrow vertical
+                // falloff so the result reads as a horizontal horizon glow.
+                float horizontalSunGlow = pow(
                     saturate(dot(viewHorizontal, sunHorizontal)),
-                    _TODHorizonSunGlowPower);
-                sky += _TODHorizonColor * horizon * horizonFacingSun * _TODHorizonSunGlow;
+                    max(0.1, _TODHorizonSunGlowPower * 0.35));
+                float verticalGlowWidth = max(
+                    0.003,
+                    min(horizonWidth * 0.28, 0.045));
+                float verticalSunGlow = exp(
+                    -pow(abs(height) / verticalGlowWidth, 2.0));
+                float horizonSunSpot =
+                    horizontalSunGlow * verticalSunGlow * saturate(sunHorizontalLength * 8.0);
+                sky += _TODHorizonColor * horizonSunSpot * _TODHorizonSunGlow;
 
-                float sunDisk = SoftDisk(sunDot, _TODSunSize, _TODSunSoftness);
-                float sunHalo = SoftHalo(sunDot, _TODSunHaloSize);
-                sky += _TODSunHaloColor * sunHalo * _TODSunHaloIntensity * _TODSunIntensity;
-                sky = lerp(sky, _TODSunColor * _TODSunIntensity, sunDisk);
-
-                float moonDot = dot(viewDirection, normalize(_TODMoonDir));
-                float moonDisk = SoftDisk(moonDot, _TODMoonSize, _TODMoonSoftness);
-                float moonHalo = SoftHalo(moonDot, _TODMoonHaloSize);
-                float phaseMask = MoonPhaseMask(viewDirection, normalize(_TODMoonDir), saturate(_TODMoonPhase));
-                sky += _TODMoonHaloColor * moonHalo * _TODMoonHaloIntensity * _TODMoonIntensity;
-                sky = lerp(sky, _TODMoonColor * _TODMoonIntensity, moonDisk * phaseMask);
+                // Keep the atmospheric background separate from discrete celestial
+                // objects. Thin clouds may transmit the broad Mie/horizon glow, but
+                // their optical depth must suppress stars and the hard sun/moon discs
+                // much more strongly or those objects read as being pasted in front.
+                float3 atmosphereSky = sky;
 
                 if (_TODStarsEnabled > 0.5)
                     sky += _TODStarsColor * ProceduralStars(viewDirection) * _TODStarsIntensity;
 
+                float sunDisk = SoftDisk(sunDot, _TODSunSize, _TODSunSoftness);
+                float sunHalo = SoftHalo(sunDot, _TODSunHaloSize);
+                sky += _TODSunHaloColor * sunHalo * _TODSunHaloIntensity * _TODSunIntensity;
+                float sunVisibility = saturate(_TODSunIntensity * 4.0);
+                float sunAngularDistance = sqrt(max(0.0, 2.0 * (1.0 - saturate(sunDot))));
+                float sunCenter = saturate(1.0 - sunAngularDistance / max(0.0001, _TODSunSize));
+                float3 hotSunCore = max(_TODSunColor, float3(1.16, 1.03, 0.82));
+                float3 sunSurface = lerp(
+                    _TODSunColor,
+                    hotSunCore,
+                    pow(sunCenter, 0.38)) * (0.78 + _TODSunIntensity * 0.82);
+                sky = lerp(sky, max(sky, sunSurface), sunDisk * sunVisibility);
+
+                float moonDisk = SoftDisk(moonDot, _TODMoonSize, _TODMoonSoftness);
+                float moonHalo = SoftHalo(moonDot, _TODMoonHaloSize);
+                float phaseMask = MoonPhaseMask(viewDirection, moonDirection, saturate(_TODMoonPhase));
+                sky += _TODMoonHaloColor * moonHalo * _TODMoonHaloIntensity * _TODMoonIntensity;
+                float moonAltitudeFade = lerp(
+                    1.0,
+                    smoothstep(-0.06, 0.14, moonDirection.y),
+                    _TODMoonAtmosphereBlend);
+                float moonVisibility = saturate(_TODMoonIntensity * 4.0) * moonAltitudeFade;
+                float moonAngularDistance = sqrt(max(0.0, 2.0 * (1.0 - saturate(moonDot))));
+                float moonLimb = sqrt(saturate(
+                    1.0 - pow(moonAngularDistance / max(0.0001, _TODMoonSize), 2.0)));
+                float2 moonUV = MoonDiscCoordinates(viewDirection, moonDirection);
+                float moonLargeDetail = Fbm(moonUV * _TODMoonSurfaceScale + 37.2);
+                float moonFineDetail = ValueNoise(
+                    moonUV * (_TODMoonSurfaceScale * 3.7) - 11.8);
+                float moonDetail = lerp(
+                    1.0,
+                    lerp(0.68, 1.12, moonLargeDetail) *
+                        lerp(0.86, 1.06, moonFineDetail),
+                    _TODMoonSurfaceDetail);
+                float3 moonDarkSurface = lerp(
+                    sky,
+                    _TODMoonColor * _TODMoonEarthshine * moonDetail,
+                    0.30 + _TODMoonEarthshine * 0.28);
+                float3 moonLitSurface = _TODMoonColor *
+                    (0.68 + _TODMoonIntensity * 1.35) *
+                    lerp(0.78, 1.04, moonLimb) * moonDetail;
+                float moonHorizonBlend = _TODMoonAtmosphereBlend *
+                    (1.0 - smoothstep(0.0, 0.22, moonDirection.y));
+                moonLitSurface = lerp(
+                    moonLitSurface,
+                    moonLitSurface * 0.55 + _TODHorizonColor * 0.45,
+                    moonHorizonBlend);
+                float3 moonSurface = lerp(moonDarkSurface, moonLitSurface, phaseMask);
+                sky = lerp(sky, moonSurface, moonDisk * moonVisibility);
+
                 if (_TODCloudsEnabled > 0.5)
                 {
-                    float cloud = ProceduralClouds(viewDirection) * _TODCloudOpacity;
-                    float cloudSun = pow(saturate(sunDot * 0.5 + 0.5), 4.0) * _TODCloudSunLighting;
-                    float3 cloudColor = lerp(_TODCloudShadowColor, _TODCloudColor, saturate(0.35 + cloudSun));
-                    sky = lerp(sky, cloudColor, saturate(cloud));
+                    float3 cloudData = ProceduralClouds(viewDirection);
+                    float cloudDensity = cloudData.x;
+
+                    // Frostbite-inspired single-segment participating media:
+                    // Beer-Lambert transmittance plus the analytical integral
+                    // S * (1 - exp(-sigmaE * d)) / sigmaE. This remains a cheap
+                    // 2D high-cloud layer, not a volumetric ray marcher.
+                    float3 sigmaS = max(0.0, _TODCloudScatteringCoeff) * cloudDensity;
+                    float3 sigmaA = max(0.0, _TODCloudAbsorptionCoeff) * cloudDensity;
+                    float3 sigmaE = sigmaS + sigmaA + 0.0001;
+                    float grazingPath = _TODCloudThickness /
+                        max(0.16, viewDirection.y + 0.22);
+                    float3 transmittance = exp(-sigmaE * grazingPath);
+                    transmittance = lerp(1.0.xxx, transmittance, _TODCloudOpacity);
+
+                    float sunPhase = lerp(
+                        HenyeyGreenstein(sunDot, _TODCloudPhaseBackward),
+                        HenyeyGreenstein(sunDot, _TODCloudPhaseForward),
+                        _TODCloudPhaseBlend);
+                    float moonPhase = lerp(
+                        HenyeyGreenstein(moonDot, _TODCloudPhaseBackward),
+                        HenyeyGreenstein(moonDot, _TODCloudPhaseForward),
+                        _TODCloudPhaseBlend);
+                    sunPhase = min(sunPhase, 10.0);
+                    moonPhase = min(moonPhase, 8.0);
+
+                    float3 sunIlluminance = _TODSunColor *
+                        _TODSunIntensity * _TODCloudSunLighting * sunPhase;
+                    float3 moonIlluminance = _TODMoonColor *
+                        _TODMoonIntensity * _TODCloudMoonLighting * moonPhase;
+                    float3 source = (sunIlluminance + moonIlluminance) * sigmaS;
+                    float3 directLuminance =
+                        (source - source * transmittance) / sigmaE;
+
+                    float3 singleScatteringAlbedo = sigmaS / sigmaE;
+                    float3 lostLight = 1.0 - transmittance;
+                    float3 ambientLuminance = _TODCloudAmbientColor *
+                        _TODCloudAmbientIntensity * lostLight * singleScatteringAlbedo;
+                    float3 multipleLuminance = _TODCloudColor *
+                        _TODCloudMultipleScattering * lostLight *
+                        (0.18 + 0.32 * singleScatteringAlbedo);
+
+                    float lightFacing = saturate(
+                        sunPhase * _TODSunIntensity * 0.09 +
+                        moonPhase * _TODMoonIntensity * 0.06);
+                    float3 artisticCloudTint = lerp(
+                        _TODCloudShadowColor,
+                        _TODCloudColor,
+                        lightFacing);
+                    float3 cloudLuminance =
+                        (directLuminance + ambientLuminance + multipleLuminance) *
+                        artisticCloudTint * _TODCloudOpacity;
+
+                    float meanTransmittance = dot(
+                        transmittance,
+                        float3(0.333333, 0.333333, 0.333333));
+                    float cloudOpacity = saturate((1.0 - meanTransmittance) * 1.35);
+
+                    // The sun, moon and stars are effectively at infinity and sit
+                    // behind the complete cloud layer. Re-apply the celestial delta
+                    // over the atmosphere with a longer optical path so cloud bodies
+                    // can genuinely cover their discs while thin edges still glow.
+                    float3 celestialContribution = sky - atmosphereSky;
+                    float celestialOpticalTransmission = pow(
+                        saturate(meanTransmittance),
+                        lerp(3.0, 8.0, _TODCloudOpacity));
+                    float celestialCoverage = smoothstep(
+                        0.015,
+                        0.35,
+                        cloudDensity);
+                    float celestialCoverageTransmission =
+                        1.0 - celestialCoverage *
+                        saturate(_TODCloudOpacity * 2.0);
+                    float celestialTransmission = min(
+                        celestialOpticalTransmission,
+                        celestialCoverageTransmission);
+                    sky = atmosphereSky +
+                        celestialContribution * celestialTransmission;
+
+                    float aerialAmount = _TODCloudAerialPerspective *
+                        cloudOpacity * pow(1.0 - saturate(viewDirection.y), 2.0);
+                    cloudLuminance = lerp(
+                        cloudLuminance,
+                        cloudLuminance * 0.62 + _TODHorizonColor * cloudOpacity * 0.38,
+                        aerialAmount);
+                    sky = sky * transmittance + cloudLuminance;
                 }
 
                 float luminance = dot(sky, float3(0.2126, 0.7152, 0.0722));

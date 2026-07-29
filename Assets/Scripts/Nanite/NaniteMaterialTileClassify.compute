@@ -1,3 +1,4 @@
+#pragma only_renderers d3d11
 #pragma kernel CSTileClassify
 #pragma kernel CSClearTileBins
 #pragma multi_compile _ NANITE_COMPACT_VBUFFER

@@ -1,6 +1,5 @@
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Rendering;
 
 namespace UnityNanite.TOD
 {
@@ -158,12 +157,18 @@ namespace UnityNanite.TOD
             SetColor("_TODSunScatterColor", value.sky.sunScatterColor.Evaluate(hour));
             Shader.SetGlobalFloat("_TODSunScatterIntensity", Mathf.Max(0f, value.sky.sunScatterIntensity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODSunScatterPower", Mathf.Max(0.01f, value.sky.sunScatterPower.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMieAnisotropy", Mathf.Clamp(value.sky.mieAnisotropy.Evaluate(hour), 0f, 0.95f));
+            Shader.SetGlobalFloat("_TODMieOpticalDepth", Mathf.Max(0f, value.sky.mieOpticalDepth.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMieHorizonBoost", Mathf.Max(0f, value.sky.mieHorizonBoost.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMieMoonAmount", Mathf.Max(0f, value.sky.mieMoonAmount.Evaluate(hour)));
 
             Shader.SetGlobalFloat("_TODStarsEnabled", value.stars.enabled ? 1f : 0f);
             SetColor("_TODStarsColor", value.stars.color.Evaluate(hour));
             Shader.SetGlobalFloat("_TODStarsIntensity", Mathf.Max(0f, value.stars.intensity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODStarsDensity", Mathf.Clamp01(value.stars.density.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODStarsSize", Mathf.Max(0.001f, value.stars.size.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODStarsSizeVariation", Mathf.Clamp01(value.stars.sizeVariation.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODStarsBrightnessVariation", Mathf.Clamp01(value.stars.brightnessVariation.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODStarsTwinkle", Mathf.Clamp01(value.stars.twinkle.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODStarsTwinkleSpeed", Mathf.Max(0f, value.stars.twinkleSpeed.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODStarsHorizonFade", Mathf.Max(0.001f, value.stars.horizonFade.Evaluate(hour)));
@@ -175,11 +180,31 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODCloudOpacity", Mathf.Clamp01(value.clouds.opacity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudCoverage", Mathf.Clamp01(value.clouds.coverage.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudScale", Mathf.Max(0.01f, value.clouds.scale.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudDetailScale", Mathf.Max(0.1f, value.clouds.detailScale.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudSoftness", Mathf.Max(0.001f, value.clouds.softness.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudErosion", Mathf.Clamp01(value.clouds.erosion.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudDistortion", Mathf.Max(0f, value.clouds.distortion.Evaluate(hour)));
             Shader.SetGlobalVector("_TODCloudSpeed", new Vector4(
                 value.clouds.speedX.Evaluate(hour), value.clouds.speedY.Evaluate(hour), 0f, 0f));
             Shader.SetGlobalFloat("_TODCloudHorizonFade", Mathf.Max(0.001f, value.clouds.horizonFade.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudAltitude", Mathf.Max(0.1f, value.clouds.altitude.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudThickness", Mathf.Max(0.001f, value.clouds.thickness.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudDensityMultiplier", Mathf.Max(0f, value.clouds.densityMultiplier.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudHorizonDensity", Mathf.Max(0f, value.clouds.horizonDensity.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudZenithDensity", Mathf.Max(0f, value.clouds.zenithDensity.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudLatitudePosition", Mathf.Clamp01(value.clouds.latitudePosition.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudLatitudeWidth", Mathf.Max(0.001f, value.clouds.latitudeWidth.Evaluate(hour)));
+            SetColor("_TODCloudScatteringCoeff", value.clouds.scatteringCoefficient.Evaluate(hour));
+            SetColor("_TODCloudAbsorptionCoeff", value.clouds.absorptionCoefficient.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODCloudPhaseForward", Mathf.Clamp(value.clouds.phaseForward.Evaluate(hour), 0f, 0.95f));
+            Shader.SetGlobalFloat("_TODCloudPhaseBackward", Mathf.Clamp(value.clouds.phaseBackward.Evaluate(hour), -0.9f, 0f));
+            Shader.SetGlobalFloat("_TODCloudPhaseBlend", Mathf.Clamp01(value.clouds.phaseBlend.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudSunLighting", Mathf.Max(0f, value.clouds.sunLighting.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudMoonLighting", Mathf.Max(0f, value.clouds.moonLighting.Evaluate(hour)));
+            SetColor("_TODCloudAmbientColor", value.clouds.ambientColor.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODCloudAmbientIntensity", Mathf.Max(0f, value.clouds.ambientIntensity.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudMultipleScattering", Mathf.Max(0f, value.clouds.multipleScattering.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudAerialPerspective", Mathf.Clamp01(value.clouds.aerialPerspective.Evaluate(hour)));
 
             SetColor("_TODSunColor", value.sun.color.Evaluate(hour));
             Shader.SetGlobalFloat("_TODSunIntensity", Mathf.Max(0f, value.sun.intensity.Evaluate(hour)));
@@ -197,6 +222,12 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODMoonHaloSize", Mathf.Max(0.001f, value.moon.haloSize.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODMoonHaloIntensity", Mathf.Max(0f, value.moon.haloIntensity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODMoonPhase", Mathf.Clamp01(value.moon.phase.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMoonPhaseSoftness", Mathf.Max(0.001f, value.moon.phaseSoftness.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMoonPhaseRotation", value.moon.phaseRotation.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODMoonEarthshine", Mathf.Clamp01(value.moon.earthshine.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMoonSurfaceDetail", Mathf.Clamp01(value.moon.surfaceDetail.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMoonSurfaceScale", Mathf.Max(0.1f, value.moon.surfaceScale.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODMoonAtmosphereBlend", Mathf.Clamp01(value.moon.atmosphereBlend.Evaluate(hour)));
         }
 
         private static void ApplyFogGlobals(TODProfile value, float hour)
@@ -221,12 +252,6 @@ namespace UnityNanite.TOD
 
         private static void ApplyEnvironment(TODProfile value, float hour)
         {
-            RenderSettings.ambientMode = AmbientMode.Trilight;
-            RenderSettings.ambientSkyColor = value.lighting.ambientSky.Evaluate(hour);
-            RenderSettings.ambientEquatorColor = value.lighting.ambientEquator.Evaluate(hour);
-            RenderSettings.ambientGroundColor = value.lighting.ambientGround.Evaluate(hour);
-            RenderSettings.ambientIntensity = Mathf.Max(0f, value.lighting.ambientIntensity.Evaluate(hour));
-
             // The renderer feature owns opaque fog composition. Keeping Unity's
             // material fog disabled prevents standard URP shaders being fogged twice.
             RenderSettings.fog = false;

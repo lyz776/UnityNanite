@@ -5,6 +5,7 @@ using System.Linq;
 using UnityEditor;
 using UnityEditor.Build.Reporting;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Nanite.Editor
 {
@@ -48,6 +49,7 @@ namespace Nanite.Editor
                 return;
             }
 
+            EnsureStandaloneD3D12Only();
             Directory.CreateDirectory(outputDirectory);
             BuildPlayerOptions options = new BuildPlayerOptions
             {
@@ -150,6 +152,19 @@ namespace Nanite.Editor
             }
 
             return true;
+        }
+
+        static void EnsureStandaloneD3D12Only()
+        {
+            var apis = PlayerSettings.GetGraphicsAPIs(BuildTarget.StandaloneWindows64);
+            if (apis.Length == 1 && apis[0] == GraphicsDeviceType.Direct3D12)
+                return;
+
+            PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.StandaloneWindows64, false);
+            PlayerSettings.SetGraphicsAPIs(
+                BuildTarget.StandaloneWindows64,
+                new[] { GraphicsDeviceType.Direct3D12 });
+            Debug.Log("[Nanite][ProfileBuild] Standalone Windows Graphics API forced to Direct3D12 for Nanite GPU paths.");
         }
     }
 }

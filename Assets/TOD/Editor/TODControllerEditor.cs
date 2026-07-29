@@ -34,6 +34,11 @@ namespace UnityNanite.TOD.Editor
         public override void OnInspectorGUI()
         {
             serializedObject.Update();
+            if (profileObject == null ||
+                profileObject.targetObject != profile.objectReferenceValue)
+            {
+                RebuildProfileObject();
+            }
 
             EditorGUILayout.Space(4f);
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);

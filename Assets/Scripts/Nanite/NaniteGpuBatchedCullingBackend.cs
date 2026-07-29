@@ -240,6 +240,7 @@ namespace Nanite
         RenderTexture fallbackHzbTexture;
         bool cullStatsReadbackPending;
         int cullStatsReadbackEpoch;
+        bool loggedCameraCullDiagnostics;
 
         readonly List<BatchSlot> slots = new List<BatchSlot>(32);
         readonly List<GeometrySlot> geometrySlots = new List<GeometrySlot>(16);
@@ -1111,6 +1112,24 @@ namespace Nanite
             LastUsedVisibleInstanceQueue = useVisibleInstanceQueue;
             LastUsedHierarchyQueue = useHierarchyQueue;
             LastUsedSpatialHierarchy = useSpatialQueue;
+            if (!loggedCameraCullDiagnostics &&
+                camera.cameraType == CameraType.Game &&
+                sceneAllPagesResident &&
+                enableVisibleDrawQueue &&
+                enableClusterVisibleWrite &&
+                clearMask &&
+                cullPassMode == CullPassMode.Pass1PrevVisible)
+            {
+                LogCameraCullDiagnosticsOnce(
+                    visibleTarget,
+                    visibleCountParam,
+                    hasCpuCandidates,
+                    usePartDriven,
+                    useVisibleInstanceQueue,
+                    useVisiblePartQueue,
+                    useHierarchyQueue,
+                    useSpatialQueue);
+            }
             bool producedTraversalRasterBins =
                 enableVisibleDrawQueue &&
                 EnableTraversalRasterBins &&
@@ -1127,6 +1146,71 @@ namespace Nanite
             }
 
             return true;
+        }
+
+        void LogCameraCullDiagnosticsOnce(
+            ComputeBuffer clusterVisible,
+            int clusterVisibleCount,
+            bool usedCpuCandidates,
+            bool usedPartDriven,
+            bool usedVisibleInstanceQueue,
+            bool usedVisiblePartQueue,
+            bool usedHierarchyQueue,
+            bool usedSpatialQueue)
+        {
+            // Deliberately synchronous and one-shot: this is a diagnosis breadcrumb,
+            // not a recurring profiler readback. Waiting until all pages are resident
+            // keeps the result from describing only the initial streaming frame.
+            loggedCameraCullDiagnostics = true;
+            try
+            {
+                int instanceReadCount = Mathf.Min(instanceCount, instanceVisibleBuffer.count);
+                var instanceVisible = new uint[instanceReadCount];
+                if (instanceReadCount > 0)
+                    instanceVisibleBuffer.GetData(instanceVisible, 0, 0, instanceReadCount);
+
+                int partReadCount = Mathf.Min(partCount, partVisibleBuffer.count);
+                var partVisible = new uint[partReadCount];
+                if (partReadCount > 0)
+                    partVisibleBuffer.GetData(partVisible, 0, 0, partReadCount);
+
+                int clusterReadCount = Mathf.Min(clusterVisibleCount, clusterVisible.count);
+                var clusterMask = new uint[clusterReadCount];
+                if (clusterReadCount > 0)
+                    clusterVisible.GetData(clusterMask, 0, 0, clusterReadCount);
+
+                var drawCountArgs = new uint[4];
+                visibleDrawCountArgsBuffer.GetData(drawCountArgs);
+
+                Debug.Log(
+                    "[Nanite][CullDiag] settled camera cull: " +
+                    $"instanceVisible={CountNonZero(instanceVisible)}/{instanceReadCount}, " +
+                    $"partVisible={CountNonZero(partVisible)}/{partReadCount}, " +
+                    $"clusterVisible={CountNonZero(clusterMask)}/{clusterReadCount}, " +
+                    $"drawQueue={drawCountArgs[0]}, " +
+                    $"cpuCandidates={usedCpuCandidates}:{clusterCandidateCount}, " +
+                    $"partDriven={usedPartDriven}, " +
+                    $"instanceQueue={usedVisibleInstanceQueue}, " +
+                    $"partQueue={usedVisiblePartQueue}, " +
+                    $"hierarchyQueue={usedHierarchyQueue}, " +
+                    $"spatialQueue={usedSpatialQueue}.");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    $"[Nanite][CullDiag] one-shot GPU count readback failed: {exception.Message}");
+            }
+        }
+
+        static int CountNonZero(uint[] values)
+        {
+            int count = 0;
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (values[i] != 0u)
+                    count++;
+            }
+            return count;
         }
 
         void BindRasterBinOutputs(int kernel)
@@ -3554,6 +3638,7 @@ namespace Nanite
             scenePageCount = 0;
             sceneTrackPageUsage = false;
             sceneAllPagesResident = true;
+            loggedCameraCullDiagnostics = false;
             instanceDataBuffer = null;
             instanceVisibleBuffer = null;
             fallbackClusterVisibleBuffer = null;

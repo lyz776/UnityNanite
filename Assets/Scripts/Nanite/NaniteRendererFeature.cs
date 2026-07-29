@@ -71,8 +71,8 @@ namespace Nanite
             public bool usePreviousHzbOnFirstCull = false;
             [Tooltip("调试/兼容回退：允许 CPU BVH 生成 cluster 候选。正式 GPU-driven 配置应关闭。")]
             public bool useBvhCandidates = true;
-            [Tooltip("CPU BVH 允许的最大实例数。0 表示始终使用 GPU Instance -> Part -> Cluster；正式配置默认 0。")]
-            [Min(0)] public int cpuBvhMaxInstances = 0;
+            [Tooltip("CPU BVH 允许的最大实例数。小场景只由 CPU 生成保守候选，Cluster 剔除与绘制仍在 GPU；0 表示始终使用 GPU Instance -> Part -> Cluster。")]
+            [Min(0)] public int cpuBvhMaxInstances = 8;
             [Tooltip("虚拟 Part 达到该数量后，使用可见 Part append + 间接 Cluster 派发，避免再次扫描被 Instance/Part 剔除的工作。")]
             [Min(1)] public int gpuPartQueueMinVirtualParts = 4096;
             [Tooltip("实例达到该数量后，InstanceCull 将可见实例写入队列，每个可见实例由一个 64-lane group 间接展开其 Part。小场景保留直接 PartCull。")]
@@ -114,8 +114,8 @@ namespace Nanite
             public bool enableFormalVisibilityBuffer = false;
             [Tooltip("实验总开关：避免意外开启导致性能骤降。")]
             public bool enableFormalVisibilityBufferExperimentalGate = false;
-            [Tooltip("Formal VBuffer 使用 R32G32_UINT 保存完整 instance/triangle ID，带宽为旧 RGBA32F 的一半；不支持整数 RT 的平台自动回退。")]
-            public bool enableCompactFormalVBuffer = true;
+            [Tooltip("Formal VBuffer 使用 R32G32_UINT 保存完整 instance/triangle ID，带宽为 RGBA32F 的一半；当前仍为实验路径，默认使用兼容性更稳的 RGBA32F。")]
+            public bool enableCompactFormalVBuffer = false;
             [Tooltip("Tile 分类 early-out（需配合 resolve 使用）。未修好前默认关闭，避免纯浪费 ~0.7ms。")]
             public bool enableMaterialTileCulling = false;
             [Tooltip("Only register the tile classify pass when enough distinct materials can amortize its fixed dispatch cost.")]
@@ -149,7 +149,7 @@ namespace Nanite
             [Tooltip("全屏 DepthFill。全分辨率时 Raster 已写深度且 Merge 写 Stencil，默认关闭以省一次全屏 Pass。")]
             public bool enableFormalDepthFill = false;
             [Tooltip("软/硬光栅统一入口。当前仅硬光栅可用，Hybrid 为预留。")]
-            public int formalRasterizationMode = (int)FormalRasterizationMode.HybridSoftwareHardware;
+            public int formalRasterizationMode = (int)FormalRasterizationMode.HardwareOnly;
             [Tooltip("Upper diameter guard for the HW/SW cost model. Software raster also requires conservative projected coverage <= one pixel per triangle; this Unity two-pass compatibility backend has a lower crossover than UE's native 64-bit atomic path.")]
             [Range(4f, 64f)] public float hybridSoftwareMaxEdgePixels = 16f;
             public ComputeShader hzbBuilderShader;
@@ -169,7 +169,7 @@ namespace Nanite
             public bool enableVisibleTriangleCompact = true;
             public ComputeShader visibleTriangleCompactShader;
             [Tooltip("把 visible-cluster queue 展开为临时硬件索引缓冲，利用 post-transform vertex cache。超出预算的视图在 GPU 上自动回退 procedural。")]
-            public bool enableIndexedClusterRaster = true;
+            public bool enableIndexedClusterRaster = false;
             [Tooltip("主视图复用全部预算；四级阴影各使用四分之一预算。默认 128 MiB 可覆盖当前 12 车基准。")]
             [Range(16, 512)] public int indexedClusterBufferMaxMiB = 128;
             public Material vbufferPreviewMaterial;
@@ -421,6 +421,7 @@ namespace Nanite
         bool loggedExecutionOnce;
         bool loggedVBufferOnce;
         bool loggedDebugVizOnce;
+        bool loggedFormalRasterDiagnostics;
         Material runtimeVBufferPreviewMaterial;
         Material runtimeVBufferDecodeMaterial;
         Material runtimeDepthWriteMaterial;
@@ -429,6 +430,21 @@ namespace Nanite
         Material runtimeCopyDepthMaterial;
         bool loggedFormalRasterStats;
         TextureHandle recordedHzbDepthSource;
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct RasterDiagDrawCluster
+        {
+            public uint firstTriangle;
+            public uint triangleCount;
+            public uint instanceIndex;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct RasterDiagTrianglePageRef
+        {
+            public uint localIndexOffset;
+            public uint pageId;
+        }
         bool loggedPassOrderWarning;
         bool loggedFormalOrderWarning;
         bool loggedDispatchStats;
@@ -439,6 +455,7 @@ namespace Nanite
         bool loggedFormalGateWarning;
         bool loggedFormalSkipReason;
         bool loggedFormalRecordSuccess;
+        bool loggedUnsupportedGraphicsApi;
         NaniteGpuBatchedCullingBackend batchedCulling;
         NaniteSceneVisibilityBufferBackend sceneVisibilityBackend;
         MaterialPropertyBlock vbufferMpb;
@@ -1908,6 +1925,7 @@ namespace Nanite
             loggedFormalSkipReason = false;
             loggedFormalRecordSuccess = false;
             loggedFormalRasterStats = false;
+            loggedFormalRasterDiagnostics = false;
             loggedExternalShadowSchedulingOnce = false;
             loggedShadowExecutionOnce = false;
             lastGpuScenePrepareFrame = -1;
@@ -1932,6 +1950,8 @@ namespace Nanite
         bool CanRunForCamera(ref RenderingData renderingData)
         {
             if (!settings.enable || settings.hzbBuilderShader == null)
+                return false;
+            if (!IsRequiredGraphicsApiActive())
                 return false;
             if (UniversalNaniteCullingBridge.enableCoreTimingHook)
                 return false;
@@ -1977,6 +1997,8 @@ namespace Nanite
         void CullExternalMainLightShadowCastersBatch(ExternalMainLightShadowCullBatchContext context)
         {
             if (!settings.enable || !settings.enableShadowCasting || settings.gpuCullingShader == null)
+                return;
+            if (!IsRequiredGraphicsApiActive())
                 return;
             if (UniversalNaniteCullingBridge.enableCoreTimingHook)
                 return;
@@ -2084,6 +2106,22 @@ namespace Nanite
                 }
 
             }
+        }
+
+        bool IsRequiredGraphicsApiActive()
+        {
+            if (SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12)
+                return true;
+
+            if (!loggedUnsupportedGraphicsApi)
+            {
+                loggedUnsupportedGraphicsApi = true;
+                Debug.LogWarning(
+                    $"[Nanite][RF] 当前 Graphics API 为 {SystemInfo.graphicsDeviceType}，Nanite GPU 路径需要 Direct3D12。" +
+                    "请在 Player Settings > Other Settings > Graphics APIs for Windows 关闭 Auto Graphics API 并只保留 Direct3D12，然后重启 Unity 重新导入 compute shader。");
+            }
+
+            return false;
         }
 
         bool EnsureHybridShadowResources(int shadowResolution)
@@ -4596,6 +4634,12 @@ namespace Nanite
                 cmd.SetGlobalFloat(ShaderIds.UseDirectVisibleDrawQueue, 1f);
                 cmd.SetGlobalBuffer(ShaderIds.CompactedDrawClusters, ActiveHybridHardwareClusters);
             }
+            if (!loggedFormalRasterDiagnostics &&
+                lastCompactUsedDirectQueue &&
+                sceneVisibilityBackend.AllPagesResident)
+            {
+                LogFormalRasterDiagnosticsOnce(drawArgsBuffer);
+            }
             bool useCompactVBuffer = CanUseCompactFormalVBuffer();
             CoreUtils.SetKeyword(material, kCompactVBufferKeyword, useCompactVBuffer);
             const int kFormalRasterPass = 1;
@@ -4645,6 +4689,104 @@ namespace Nanite
                     $"bufferMiB:{sceneVisibilityBackend.IndexedDrawBufferBytes / (1024f * 1024f):F1}, " +
                     $"bevyDual={settings.enableBevyFormalDualRaster}, pass=VBufferFormal");
             }
+        }
+
+        void LogFormalRasterDiagnosticsOnce(GraphicsBuffer drawArgsBuffer)
+        {
+            loggedFormalRasterDiagnostics = true;
+            try
+            {
+                var args = new uint[4];
+                drawArgsBuffer.GetData(args);
+
+                int queueCount = batchedCulling != null &&
+                                 batchedCulling.VisibleDrawCountArgsBuffer != null
+                    ? ReadFirstUint(batchedCulling.VisibleDrawCountArgsBuffer)
+                    : 0;
+                int queueReadCount = Mathf.Min(
+                    Mathf.Max(0, queueCount),
+                    batchedCulling.VisibleDrawClusterBuffer.count);
+                var draws = new RasterDiagDrawCluster[queueReadCount];
+                if (queueReadCount > 0)
+                    batchedCulling.VisibleDrawClusterBuffer.GetData(draws, 0, 0, queueReadCount);
+
+                ComputeBuffer triangleRefBuffer = sceneVisibilityBackend.TrianglePageRefBuffer;
+                var triangleRefs = new RasterDiagTrianglePageRef[triangleRefBuffer.count];
+                triangleRefBuffer.GetData(triangleRefs);
+
+                ComputeBuffer pageTableBuffer = sceneVisibilityBackend.ResidentPageTableBuffer;
+                var pageTable = new NaniteGpuPagePool.GpuResidentPageEntry[pageTableBuffer.count];
+                pageTableBuffer.GetData(pageTable);
+
+                int referencedTriangles = 0;
+                int validTriangles = 0;
+                int invalidTriangleRange = 0;
+                int invalidPageId = 0;
+                int nonResidentPage = 0;
+                int invalidLocalIndex = 0;
+                for (int drawIndex = 0; drawIndex < draws.Length; drawIndex++)
+                {
+                    RasterDiagDrawCluster draw = draws[drawIndex];
+                    ulong triangleEnd = (ulong)draw.firstTriangle + draw.triangleCount;
+                    if (draw.firstTriangle >= (uint)triangleRefs.Length ||
+                        triangleEnd > (ulong)triangleRefs.Length)
+                    {
+                        invalidTriangleRange += checked((int)draw.triangleCount);
+                        continue;
+                    }
+
+                    for (uint triangleOffset = 0; triangleOffset < draw.triangleCount; triangleOffset++)
+                    {
+                        referencedTriangles++;
+                        RasterDiagTrianglePageRef triangleRef =
+                            triangleRefs[draw.firstTriangle + triangleOffset];
+                        if (triangleRef.pageId >= (uint)pageTable.Length)
+                        {
+                            invalidPageId++;
+                            continue;
+                        }
+
+                        NaniteGpuPagePool.GpuResidentPageEntry page = pageTable[triangleRef.pageId];
+                        if ((page.flags & 1u) == 0u ||
+                            page.indexBase == NaniteGpuPagePool.InvalidSlot)
+                        {
+                            nonResidentPage++;
+                            continue;
+                        }
+                        if (page.indexCount < 3u ||
+                            triangleRef.localIndexOffset > page.indexCount - 3u)
+                        {
+                            invalidLocalIndex++;
+                            continue;
+                        }
+                        validTriangles++;
+                    }
+                }
+
+                uint expectedVertices = checked(
+                    (uint)queueReadCount *
+                    (uint)Mathf.Max(1, sceneVisibilityBackend.CompactedClusterTriangleSlots) *
+                    3u);
+                Debug.Log(
+                    "[Nanite][RasterDiag] settled direct raster input: " +
+                    $"argsVertices={args[0]}, expectedVertices={expectedVertices}, " +
+                    $"drawInstances={args[1]}, queuedClusters={queueCount}/{queueReadCount}, " +
+                    $"triangleRefsValid={validTriangles}/{referencedTriangles}, " +
+                    $"invalidTriangleRange={invalidTriangleRange}, invalidPageId={invalidPageId}, " +
+                    $"nonResidentPage={nonResidentPage}, invalidLocalIndex={invalidLocalIndex}.");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning(
+                    $"[Nanite][RasterDiag] one-shot draw/address readback failed: {exception.Message}");
+            }
+        }
+
+        static int ReadFirstUint(ComputeBuffer buffer)
+        {
+            var value = new uint[1];
+            buffer.GetData(value, 0, 0, 1);
+            return checked((int)value[0]);
         }
 
         void ExecuteFormalTileClassify(ComputeCommandBuffer cmd, Camera camera, TextureHandle vbuffer, int screenWidth, int screenHeight)
@@ -4717,6 +4859,11 @@ namespace Nanite
         }
 
         const string kCompactVBufferKeyword = "NANITE_COMPACT_VBUFFER";
+        // Quarantined after DX12 produced valid procedural depth but zero/invalid
+        // integer visibility IDs on an otherwise fully valid draw queue. Keep the
+        // serialized switch for future validation, but production currently uses
+        // the RGBA32F ABI on every device.
+        const bool kCompactFormalVBufferValidated = false;
         const string kPassDepthFill = "NaniteDepthFill";
         const string kPassGBufferMerge = "NaniteGBufferMerge";
 
@@ -4777,7 +4924,8 @@ namespace Nanite
 
         bool CanUseCompactFormalVBuffer()
         {
-            if (!settings.enableCompactFormalVBuffer)
+            if (!settings.enableCompactFormalVBuffer ||
+                !kCompactFormalVBufferValidated)
                 return false;
 
             const GraphicsFormat format = GraphicsFormat.R32G32_UInt;
