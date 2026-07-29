@@ -11,9 +11,11 @@ int2 _SourceSize;
 float ReduceDepth(float a, float b, float c, float d)
 {
 #if defined(UNITY_REVERSED_Z)
-    return max(max(a, b), max(c, d));
-#else
+    // Conservative occlusion needs the farthest depth in the complete tile.
+    // Reversed-Z stores farther samples as smaller values.
     return min(min(a, b), min(c, d));
+#else
+    return max(max(a, b), max(c, d));
 #endif
 }
 

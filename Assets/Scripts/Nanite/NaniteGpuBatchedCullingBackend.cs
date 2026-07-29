@@ -37,6 +37,64 @@ namespace Nanite
             public int[] pagePartBase;
             public int[] pagePartCount;
             public Vector4 bounds;
+            public int hierarchyRootOffset;
+            public int hierarchyRootCount;
+            public int hierarchyMaxMip;
+            public bool hasGpuHierarchy;
+            public int hierarchyGroupOffset;
+            public int hierarchyGroupCount;
+            public int spatialRootOffset;
+            public int spatialRootCount;
+            public int spatialMaxDepth;
+            public bool hasSpatialHierarchy;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GpuSpatialNode
+        {
+            public Vector4 boundingSphere;
+            public Vector4 lodSphere;
+            public float maxParentError;
+            public uint childStart;
+            public uint childCount;
+            public uint partRefStart;
+            public uint partRefCount;
+            public uint flags;
+        }
+
+        const uint kSpatialNodeLeaf = 1u << 0;
+        const uint kSpatialNodeHasTerminal = 1u << 1;
+        const int kSpatialLeafPartCount = 8;
+        const int kSpatialBranchFactor = 8;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GpuHierarchyGroup
+        {
+            public Vector4 boundingSphere;
+            public float minLodError;
+            public float maxParentLodError;
+            public uint fineClusterStart;
+            public uint fineClusterCount;
+            public uint coarseClusterStart;
+            public uint coarseClusterCount;
+            public uint mipLevel;
+            public uint flags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GpuHierarchyClusterRef
+        {
+            public uint geometryClusterIndex;
+            public uint pageIndex;
+            public uint pageClusterIndex;
+            public uint refinementGroupIndex;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct GpuHierarchyResidencyRef
+        {
+            public uint instanceIndex;
+            public uint groupIndex;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -67,7 +125,15 @@ namespace Nanite
 
         const int kThreadGroupSize = 64;
         const int kMaxShadowCascades = 4;
-        const int kGpuLayoutVersion = 6;
+        const int kGpuLayoutVersion = 15;
+        // The scalar persistent protocol is quarantined after two runtime failures
+        // (wave deadlock and early-worker exit). Re-admission requires a cooperative
+        // group/wave scheduler, not a user-facing toggle.
+        const bool kEnableUnsafePersistentTraversal = false;
+        // Atomic producer-group replacement is incompatible with the regrouped DAG used
+        // by meshoptimizer/NVIDIA continuous LOD. Production uses the independent
+        // generating/self-group cut until the per-level spatial hierarchy lands.
+        const bool kEnableAtomicHierarchyTraversal = false;
         static readonly int[] kShadowVisibleDrawCountArgsIds =
         {
             Shader.PropertyToID("_VisibleDrawCountArgs0"),
@@ -100,12 +166,26 @@ namespace Nanite
         int kernelClusterCullVisibleParts = -1;
         int kernelInstanceCull = -1;
         int kernelPartCullVisibleInstances = -1;
+        int kernelSeedSpatialRoots = -1;
+        int kernelTraverseSpatialNodes = -1;
+        int kernelUpdateHierarchyGroupResidency = -1;
+        int kernelSeedHierarchyRoots = -1;
+        int kernelFinalizeHierarchyDispatch = -1;
+        int kernelTraverseHierarchy = -1;
+        int kernelClearHierarchyPersistent = -1;
+        int kernelSeedHierarchyPersistent = -1;
+        int kernelTraverseHierarchyPersistent = -1;
+        int kernelSeedShadowHierarchyPersistent = -1;
+        int kernelTraverseShadowHierarchyPersistent = -1;
         int kernelShadowCullMultiCascadeByPart = -1;
+        int kernelSeedShadowSpatialRoots = -1;
+        int kernelTraverseShadowSpatialNodes = -1;
         int kernelClearClusterVisible = -1;
         int kernelClearSecondPassCandidates = -1;
         int kernelCopyUintBuffer = -1;
         int kernelClearCullStats = -1;
         int kernelOrMasksToVisible = -1;
+        int kernelFinalizeRasterBinArgs = -1;
 
         ComputeBuffer partsBuffer;
         ComputeBuffer clustersBuffer;
@@ -115,8 +195,26 @@ namespace Nanite
         ComputeBuffer visiblePartDispatchArgsBuffer;
         ComputeBuffer visibleInstanceAppendBuffer;
         ComputeBuffer visibleInstancePartDispatchArgsBuffer;
+        ComputeBuffer spatialNodesBuffer;
+        ComputeBuffer spatialPartRefsBuffer;
         ComputeBuffer visibleDrawClusterAppendBuffer;
         ComputeBuffer visibleDrawCountArgsBuffer;
+        ComputeBuffer hardwareRasterClusterAppendBuffer;
+        ComputeBuffer softwareRasterClusterAppendBuffer;
+        ComputeBuffer hardwareRasterCountArgsBuffer;
+        ComputeBuffer softwareRasterCountArgsBuffer;
+        ComputeBuffer softwareRasterDispatchArgsBuffer;
+        ComputeBuffer hierarchyGroupsBuffer;
+        ComputeBuffer hierarchyClusterRefsBuffer;
+        ComputeBuffer hierarchyGroupResidencyBuffer;
+        ComputeBuffer hierarchyResidencyRefsBuffer;
+        ComputeBuffer hierarchyRootGroupsBuffer;
+        readonly ComputeBuffer[] hierarchyQueues = new ComputeBuffer[2];
+        readonly ComputeBuffer[] hierarchyDispatchArgs = new ComputeBuffer[2];
+        readonly ComputeBuffer[] shadowSpatialQueues = new ComputeBuffer[2];
+        readonly ComputeBuffer[] shadowSpatialDispatchArgs = new ComputeBuffer[2];
+        ComputeBuffer hierarchyPersistentWorkBuffer;
+        ComputeBuffer shadowHierarchyPersistentWorkBuffer;
         readonly ComputeBuffer[] shadowDrawClusterAppendBuffers = new ComputeBuffer[kMaxShadowCascades];
         readonly ComputeBuffer[] shadowDrawCountArgsBuffers = new ComputeBuffer[kMaxShadowCascades];
         readonly GraphicsBuffer[] shadowDrawArgsBuffers = new GraphicsBuffer[kMaxShadowCascades];
@@ -131,6 +229,7 @@ namespace Nanite
         ComputeBuffer scenePageRequestBuffer;
         int scenePageCount;
         bool sceneTrackPageUsage;
+        bool sceneAllPagesResident = true;
         ComputeBuffer instanceDataBuffer;
         ComputeBuffer instanceVisibleBuffer;
         ComputeBuffer fallbackClusterVisibleBuffer;
@@ -139,7 +238,8 @@ namespace Nanite
         ComputeBuffer fallbackPass2DrawnBuffer;
         ComputeBuffer cullStatsBuffer;
         RenderTexture fallbackHzbTexture;
-        readonly uint[] cullStatsCpu = new uint[3];
+        bool cullStatsReadbackPending;
+        int cullStatsReadbackEpoch;
 
         readonly List<BatchSlot> slots = new List<BatchSlot>(32);
         readonly List<GeometrySlot> geometrySlots = new List<GeometrySlot>(16);
@@ -148,7 +248,14 @@ namespace Nanite
         readonly List<NaniteGpuCullingBackend.GpuClusterData> mergedClusters = new List<NaniteGpuCullingBackend.GpuClusterData>(65536);
         readonly List<GpuVirtualPartRef> virtualParts = new List<GpuVirtualPartRef>(8192);
         readonly List<GpuVirtualClusterRef> virtualClusters = new List<GpuVirtualClusterRef>(65536);
+        readonly List<GpuHierarchyGroup> hierarchyGroups = new List<GpuHierarchyGroup>(4096);
+        readonly List<GpuHierarchyClusterRef> hierarchyClusterRefs = new List<GpuHierarchyClusterRef>(16384);
+        readonly List<GpuHierarchyResidencyRef> hierarchyResidencyRefs = new List<GpuHierarchyResidencyRef>(16384);
+        readonly List<uint> hierarchyRootGroups = new List<uint>(256);
+        readonly List<GpuSpatialNode> spatialNodes = new List<GpuSpatialNode>(4096);
+        readonly List<uint> spatialPartRefs = new List<uint>(4096);
         readonly List<NaniteGpuCullingBackend.GpuInstanceData> instanceData = new List<NaniteGpuCullingBackend.GpuInstanceData>(32);
+        readonly List<int> dirtyInstanceDataIndices = new List<int>(32);
         readonly List<int> bvhStack = new List<int>(256);
         readonly Plane[] frustumPlaneObjects = new Plane[6];
         readonly Vector4[] frustumPlanes = new Vector4[6];
@@ -172,12 +279,20 @@ namespace Nanite
         int geometryClusterCount;
         int clusterCandidateCount;
         int instanceCount;
+        int hierarchyTraversalPassCount;
+        int hierarchyPersistentCapacity;
+        int spatialTraversalPassCount;
+        bool spatialReady;
+        bool hierarchyReady;
+        uint hierarchyPersistentEpoch;
         int rebuildSignature;
         int registryRevision = -1;
         int sceneIndexSignature;
         int sceneClusterCountMapped;
         int lastVisibleDrawQueueFrame = -1;
         int lastVisibleDrawCameraId;
+        int lastTraversalRasterBinsFrame = -1;
+        int lastTraversalRasterBinsCameraId;
         int lastShadowDrawQueueFrame = -1;
         int lastShadowDrawCameraId;
         int lastShadowDrawCascadeMask;
@@ -197,6 +312,11 @@ namespace Nanite
             visibleInstancePartDispatchArgsBuffer != null &&
             visibleDrawClusterAppendBuffer != null &&
             visibleDrawCountArgsBuffer != null &&
+            hardwareRasterClusterAppendBuffer != null &&
+            softwareRasterClusterAppendBuffer != null &&
+            hardwareRasterCountArgsBuffer != null &&
+            softwareRasterCountArgsBuffer != null &&
+            softwareRasterDispatchArgsBuffer != null &&
             partVisibleBuffer != null &&
             visibleClusterAppendBuffer != null &&
             visibleCountBuffer != null &&
@@ -226,7 +346,20 @@ namespace Nanite
             kernelClusterCullVisibleParts = -1;
             kernelInstanceCull = -1;
             kernelPartCullVisibleInstances = -1;
+            kernelSeedSpatialRoots = -1;
+            kernelTraverseSpatialNodes = -1;
+            kernelUpdateHierarchyGroupResidency = -1;
+            kernelSeedHierarchyRoots = -1;
+            kernelFinalizeHierarchyDispatch = -1;
+            kernelTraverseHierarchy = -1;
+            kernelClearHierarchyPersistent = -1;
+            kernelSeedHierarchyPersistent = -1;
+            kernelTraverseHierarchyPersistent = -1;
+            kernelSeedShadowHierarchyPersistent = -1;
+            kernelTraverseShadowHierarchyPersistent = -1;
             kernelShadowCullMultiCascadeByPart = -1;
+            kernelSeedShadowSpatialRoots = -1;
+            kernelTraverseShadowSpatialNodes = -1;
             slots.Clear();
             geometrySlots.Clear();
             geometryIndexByMeshId.Clear();
@@ -234,6 +367,12 @@ namespace Nanite
             mergedClusters.Clear();
             virtualParts.Clear();
             virtualClusters.Clear();
+            hierarchyGroups.Clear();
+            hierarchyClusterRefs.Clear();
+            hierarchyResidencyRefs.Clear();
+            hierarchyRootGroups.Clear();
+            spatialNodes.Clear();
+            spatialPartRefs.Clear();
             instanceData.Clear();
             partDataCpu = null;
             clusterDataCpu = null;
@@ -249,6 +388,12 @@ namespace Nanite
             geometryClusterCount = 0;
             clusterCandidateCount = 0;
             instanceCount = 0;
+            hierarchyTraversalPassCount = 0;
+            hierarchyPersistentCapacity = 0;
+            hierarchyReady = false;
+            spatialTraversalPassCount = 0;
+            spatialReady = false;
+            hierarchyPersistentEpoch = 0u;
             lastTransformUpdateFrame = -1;
             rebuildSignature = 0;
             registryRevision = -1;
@@ -256,6 +401,8 @@ namespace Nanite
             sceneClusterCountMapped = 0;
             lastVisibleDrawQueueFrame = -1;
             lastVisibleDrawCameraId = 0;
+            lastTraversalRasterBinsFrame = -1;
+            lastTraversalRasterBinsCameraId = 0;
             lastShadowDrawQueueFrame = -1;
             lastShadowDrawCameraId = 0;
             lastShadowDrawCascadeMask = 0;
@@ -264,11 +411,17 @@ namespace Nanite
             LastCull1Drawn = 0;
             LastCull2Candidates = 0;
             LastCull2Drawn = 0;
+            LastCullStatsReadbackFrame = -1;
+            LastCullStatsCameraId = 0;
             LastUsedCpuCandidates = false;
             LastUsedPartDrivenClusterCull = false;
             LastUsedVisiblePartQueue = false;
             LastUsedVisibleInstanceQueue = false;
+            LastUsedHierarchyQueue = false;
+            LastUsedSpatialHierarchy = false;
             LastShadowUsedFusedBatch = false;
+            LastShadowUsedHierarchyQueue = false;
+            LastShadowUsedSpatialHierarchy = false;
         }
 
         public bool EnsureClusterSceneIndex(NaniteSceneVisibilityBufferBackend scene)
@@ -289,6 +442,7 @@ namespace Nanite
             scenePageRequestBuffer = pageRequestsEnabled ? scene.PageRequestBitsetBuffer : null;
             scenePageCount = pageRequestsEnabled ? scene.GlobalPageCount : 0;
             sceneTrackPageUsage = pageRequestsEnabled && scene.PagePoolRequiresEviction;
+            sceneAllPagesResident = !pageRequestsEnabled || scene.AllPagesResident;
 
             int sig = unchecked(
                 scene.GeometryGeneration * 397 +
@@ -459,8 +613,8 @@ namespace Nanite
 
             LastClusterCount = clusterCount;
             LastClusterCandidateCount = LastUsedCpuCandidates ? clusterCandidateCount : clusterCount;
-            if (enableCullStats)
-                ReadbackCullStats();
+            if (enableCullStats && cullPassMode != CullPassMode.Pass1PrevVisible)
+                ReadbackCullStats(camera);
             return true;
         }
 
@@ -489,14 +643,30 @@ namespace Nanite
             return true;
         }
 
-        void ReadbackCullStats()
+        void ReadbackCullStats(Camera camera)
         {
-            if (cullStatsBuffer == null)
+            if (cullStatsBuffer == null || cullStatsReadbackPending)
                 return;
-            cullStatsBuffer.GetData(cullStatsCpu);
-            LastCull1Drawn = (int)cullStatsCpu[0];
-            LastCull2Candidates = (int)cullStatsCpu[1];
-            LastCull2Drawn = (int)cullStatsCpu[2];
+            cullStatsReadbackPending = true;
+            int epoch = cullStatsReadbackEpoch;
+            int requestFrame = Time.frameCount;
+            int requestCameraId = camera != null ? camera.GetInstanceID() : 0;
+            AsyncGPUReadback.Request(cullStatsBuffer, request =>
+            {
+                if (epoch != cullStatsReadbackEpoch)
+                    return;
+                cullStatsReadbackPending = false;
+                if (request.hasError)
+                    return;
+                var data = request.GetData<uint>();
+                if (data.Length < 3)
+                    return;
+                LastCull1Drawn = (int)data[0];
+                LastCull2Candidates = (int)data[1];
+                LastCull2Drawn = (int)data[2];
+                LastCullStatsReadbackFrame = requestFrame;
+                LastCullStatsCameraId = requestCameraId;
+            });
         }
 
         public bool Run(
@@ -625,8 +795,9 @@ namespace Nanite
             float zNear = Mathf.Max(1e-3f, camera.nearClipPlane);
             Matrix4x4 worldToClip = gpuProj * camera.worldToCameraMatrix;
             // Pass1 强制不测 HZB；Pass2/Legacy 按开关。
-            bool enableHzb = cullPassMode != CullPassMode.Pass1PrevVisible &&
-                             useHzb &&
+            // Main pass consumes the previous-frame HZB; post pass consumes the
+            // current-frame HZB. Pass2 recovers disocclusions rejected by Pass1.
+            bool enableHzb = useHzb &&
                              hzbTexture != null &&
                              hzbMipCount > 0;
             SetSharedParams(
@@ -699,13 +870,42 @@ namespace Nanite
             bool usePartDriven = !hasCpuCandidates &&
                                  PreferPartDrivenClusterCull &&
                                  kernelClusterCullByPart >= 0;
-            bool useVisiblePartQueue = usePartDriven &&
+            bool enableVisibleDrawQueue = enableClusterVisibleWrite &&
+                                          sceneClusterFirstTriBuffer != null &&
+                                          sceneClusterTriCountBuffer != null;
+            bool useHierarchyQueue = kEnableAtomicHierarchyTraversal &&
+                                     !hasCpuCandidates &&
+                                     enableVisibleDrawQueue &&
+                                     hierarchyReady &&
+                                     kernelSeedHierarchyRoots >= 0 &&
+                                     kernelFinalizeHierarchyDispatch >= 0 &&
+                                     kernelTraverseHierarchy >= 0 &&
+                                     kernelClearHierarchyPersistent >= 0 &&
+                                     kernelSeedHierarchyPersistent >= 0 &&
+                                     kernelTraverseHierarchyPersistent >= 0 &&
+                                     hierarchyPersistentWorkBuffer != null &&
+                                     hierarchyQueues[0] != null &&
+                                     hierarchyQueues[1] != null;
+            bool useSpatialQueue = !useHierarchyQueue &&
+                                   !hasCpuCandidates &&
+                                   usePartDriven &&
+                                   enableVisibleDrawQueue &&
+                                   spatialReady &&
+                                   kernelSeedSpatialRoots >= 0 &&
+                                   kernelFinalizeHierarchyDispatch >= 0 &&
+                                   kernelTraverseSpatialNodes >= 0 &&
+                                   hierarchyQueues[0] != null &&
+                                   hierarchyQueues[1] != null &&
+                                   partCount >= Mathf.Max(1, PartQueueMinVirtualParts);
+            bool useVisiblePartQueue = !useHierarchyQueue &&
+                                       (useSpatialQueue || usePartDriven) &&
                                        kernelClusterCullVisibleParts >= 0 &&
                                        kernelFinalizeVisiblePartDispatch >= 0 &&
                                        partCount >= Mathf.Max(1, PartQueueMinVirtualParts);
-            bool useVisibleInstanceQueue = useVisiblePartQueue &&
+            bool useVisibleInstanceQueue = (useHierarchyQueue || useVisiblePartQueue) &&
                                            kernelPartCullVisibleInstances >= 0 &&
-                                           instanceCount >= Mathf.Max(1, InstanceQueueMinInstances);
+                                           (useHierarchyQueue || useSpatialQueue ||
+                                            instanceCount >= Mathf.Max(1, InstanceQueueMinInstances));
 
             if (hasCpuCandidates)
             {
@@ -735,67 +935,76 @@ namespace Nanite
                         visibleInstancePartDispatchArgsBuffer,
                         0);
 
-                int activePartKernel = useVisibleInstanceQueue
-                    ? kernelPartCullVisibleInstances
-                    : kernelPartCull;
-                shader.SetInt("_PartCount", partCount);
-                shader.SetInt("_SceneClusterCount", visibleCountParam);
-                shader.SetInt("_CullPassMode", (int)cullPassMode);
-                shader.SetInt("_HasPrevVisible", hasPrevVisible ? 1 : 0);
-                shader.SetInt("_EnableVisibleAppend", 0);
-                shader.SetInt("_EnableClusterVisibleWrite", 0);
-                shader.SetInt("_EnableVisiblePartQueue", useVisiblePartQueue ? 1 : 0);
-                shader.SetInt("_UseInstanceCull", useVisibleInstanceQueue ? 0 : 1);
-                shader.SetBuffer(activePartKernel, "_Parts", partsBuffer);
-                shader.SetBuffer(activePartKernel, "_PartVisibleWrite", partVisibleBuffer);
-                shader.SetBuffer(activePartKernel, "_VisiblePartsOut", visiblePartAppendBuffer);
-                if (useVisibleInstanceQueue)
+                if (!useHierarchyQueue)
                 {
-                    shader.SetBuffer(activePartKernel, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
-                    shader.SetBuffer(
-                        activePartKernel,
-                        "_VisibleInstancePartDispatchArgs",
-                        visibleInstancePartDispatchArgsBuffer);
-                }
-                BindGpuSceneRefs(activePartKernel);
-                BindCullSharedBuffers(activePartKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
-                BindInstanceBuffers(activePartKernel);
-                BindHzbTexture(activePartKernel, boundHzbTexture);
+                    if (useSpatialQueue)
+                    {
+                        DispatchHierarchyGroupResidency();
+                        DispatchSpatialTraversal(boundHzbTexture);
+                    }
+                    else
+                    {
+                        int activePartKernel = useVisibleInstanceQueue
+                            ? kernelPartCullVisibleInstances
+                            : kernelPartCull;
+                        shader.SetInt("_PartCount", partCount);
+                        shader.SetInt("_SceneClusterCount", visibleCountParam);
+                        shader.SetInt("_CullPassMode", (int)cullPassMode);
+                        shader.SetInt("_HasPrevVisible", hasPrevVisible ? 1 : 0);
+                        shader.SetInt("_EnableVisibleAppend", 0);
+                        shader.SetInt("_EnableClusterVisibleWrite", 0);
+                        shader.SetInt("_EnableVisiblePartQueue", useVisiblePartQueue ? 1 : 0);
+                        shader.SetInt("_UseInstanceCull", useVisibleInstanceQueue ? 0 : 1);
+                        shader.SetBuffer(activePartKernel, "_Parts", partsBuffer);
+                        shader.SetBuffer(activePartKernel, "_PartVisibleWrite", partVisibleBuffer);
+                        shader.SetBuffer(activePartKernel, "_VisiblePartsOut", visiblePartAppendBuffer);
+                        if (useVisibleInstanceQueue)
+                        {
+                            shader.SetBuffer(activePartKernel, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
+                            shader.SetBuffer(
+                                activePartKernel,
+                                "_VisibleInstancePartDispatchArgs",
+                                visibleInstancePartDispatchArgsBuffer);
+                        }
+                        BindGpuSceneRefs(activePartKernel);
+                        BindCullSharedBuffers(activePartKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
+                        BindInstanceBuffers(activePartKernel);
+                        BindHzbTexture(activePartKernel, boundHzbTexture);
 
-                if (useVisibleInstanceQueue)
-                {
-                    shader.DispatchIndirect(activePartKernel, visibleInstancePartDispatchArgsBuffer, 0);
-                }
-                else
-                {
-                    int partGroups = (partCount + kThreadGroupSize - 1) / kThreadGroupSize;
-                    shader.Dispatch(activePartKernel, partGroups, 1, 1);
-                }
+                        if (useVisibleInstanceQueue)
+                            shader.DispatchIndirect(activePartKernel, visibleInstancePartDispatchArgsBuffer, 0);
+                        else
+                        {
+                            int partGroups = (partCount + kThreadGroupSize - 1) / kThreadGroupSize;
+                            shader.Dispatch(activePartKernel, partGroups, 1, 1);
+                        }
+                    }
 
-                if (useVisiblePartQueue)
-                {
-                    ComputeBuffer.CopyCount(visiblePartAppendBuffer, visiblePartDispatchArgsBuffer, 0);
-                    shader.SetBuffer(
-                        kernelFinalizeVisiblePartDispatch,
-                        "_VisiblePartDispatchArgsWrite",
-                        visiblePartDispatchArgsBuffer);
-                    shader.Dispatch(kernelFinalizeVisiblePartDispatch, 1, 1, 1);
+                    if (useVisiblePartQueue)
+                    {
+                        ComputeBuffer.CopyCount(visiblePartAppendBuffer, visiblePartDispatchArgsBuffer, 0);
+                        shader.SetBuffer(
+                            kernelFinalizeVisiblePartDispatch,
+                            "_VisiblePartDispatchArgsWrite",
+                            visiblePartDispatchArgsBuffer);
+                        shader.Dispatch(kernelFinalizeVisiblePartDispatch, 1, 1, 1);
+                    }
                 }
             }
 
             visibleClusterAppendBuffer.SetCounterValue(0);
-            bool enableVisibleDrawQueue = enableClusterVisibleWrite &&
-                                          sceneClusterFirstTriBuffer != null &&
-                                          sceneClusterTriCountBuffer != null;
             if (enableVisibleDrawQueue && clearMask)
+            {
                 visibleDrawClusterAppendBuffer.SetCounterValue(0);
+                hardwareRasterClusterAppendBuffer.SetCounterValue(0);
+                softwareRasterClusterAppendBuffer.SetCounterValue(0);
+            }
             // CSClusterCullVisibleParts is the lean direct draw-queue kernel. If
             // a caller needs the legacy visibility mask instead, keep the normal
             // part-driven kernel so mask consumers retain their previous ABI.
-            bool useVisiblePartClusterQueue = useVisiblePartQueue && enableVisibleDrawQueue;
-            int activeClusterKernel = useVisiblePartClusterQueue
-                ? kernelClusterCullVisibleParts
-                : (usePartDriven ? kernelClusterCullByPart : kernelClusterCull);
+            bool useVisiblePartClusterQueue = !useHierarchyQueue &&
+                                              useVisiblePartQueue &&
+                                              enableVisibleDrawQueue;
             shader.SetInt("_PartCount", partCount);
             shader.SetInt("_ClusterCount", clusterCount);
             shader.SetInt("_ClusterCandidateCount", hasCpuCandidates ? clusterCandidateCount : 0);
@@ -803,53 +1012,90 @@ namespace Nanite
             shader.SetInt("_UseInstanceCull", hasCpuCandidates ? 0 : 1);
             shader.SetInt("_EnableVisibleAppend", enableVisibleAppend ? 1 : 0);
             shader.SetInt("_EnableVisibleDrawAppend", enableVisibleDrawQueue ? 1 : 0);
+            shader.SetInt("_EnableRasterBins", enableVisibleDrawQueue && EnableTraversalRasterBins ? 1 : 0);
+            shader.SetFloat("_SoftwareRasterThresholdPixels", Mathf.Max(1f, SoftwareRasterThresholdPixels));
             shader.SetInt("_EnableClusterVisibleWrite", enableClusterVisibleWrite ? 1 : 0);
             shader.SetInt("_SceneClusterCount", visibleCountParam);
             shader.SetInt("_CullPassMode", (int)cullPassMode);
             shader.SetInt("_HasPrevVisible", hasPrevVisible ? 1 : 0);
             shader.SetInt("_EnableCullStats", enableCullStats ? 1 : 0);
-            shader.SetBuffer(activeClusterKernel, "_Clusters", clustersBuffer);
-            shader.SetBuffer(activeClusterKernel, "_PartVisible", partVisibleBuffer);
-            shader.SetBuffer(activeClusterKernel, "_VisibleClusters", visibleClusterAppendBuffer);
-            shader.SetBuffer(activeClusterKernel, "_ClusterCandidates", clusterCandidateBuffer);
-            shader.SetBuffer(activeClusterKernel, "_CullStats", cullStatsBuffer);
-            shader.SetBuffer(activeClusterKernel, "_VisibleDrawClusters", visibleDrawClusterAppendBuffer);
             ComputeBuffer fallbackSceneClusterData = GetFallbackClusterVisibleBuffer();
-            shader.SetBuffer(
-                activeClusterKernel,
-                "_SceneClusterFirstTri",
-                sceneClusterFirstTriBuffer != null ? sceneClusterFirstTriBuffer : fallbackSceneClusterData);
-            shader.SetBuffer(
-                activeClusterKernel,
-                "_SceneClusterTriCount",
-                sceneClusterTriCountBuffer != null ? sceneClusterTriCountBuffer : fallbackSceneClusterData);
-            if (useVisiblePartClusterQueue)
+            if (useHierarchyQueue)
             {
-                shader.SetBuffer(activeClusterKernel, "_VisiblePartsIn", visiblePartAppendBuffer);
-                shader.SetBuffer(activeClusterKernel, "_VisiblePartDispatchArgs", visiblePartDispatchArgsBuffer);
+                DispatchHierarchyTraversal(
+                    visibleTarget,
+                    sceneIndexBuf,
+                    prevBuf,
+                    secondBuf,
+                    pass2Buf,
+                    boundHzbTexture,
+                    fallbackSceneClusterData);
             }
-            BindGpuSceneRefs(activeClusterKernel);
-            BindPageStreamingBuffers(activeClusterKernel);
-            BindCullSharedBuffers(activeClusterKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
-            BindInstanceBuffers(activeClusterKernel);
-            BindHzbTexture(activeClusterKernel, boundHzbTexture);
+            else
+            {
+                int activeClusterKernel = useVisiblePartClusterQueue
+                    ? kernelClusterCullVisibleParts
+                    : (usePartDriven ? kernelClusterCullByPart : kernelClusterCull);
+                shader.SetBuffer(activeClusterKernel, "_Clusters", clustersBuffer);
+                shader.SetBuffer(activeClusterKernel, "_PartVisible", partVisibleBuffer);
+                shader.SetBuffer(activeClusterKernel, "_VisibleClusters", visibleClusterAppendBuffer);
+                shader.SetBuffer(activeClusterKernel, "_ClusterCandidates", clusterCandidateBuffer);
+                shader.SetBuffer(activeClusterKernel, "_CullStats", cullStatsBuffer);
+                shader.SetBuffer(activeClusterKernel, "_VisibleDrawClusters", visibleDrawClusterAppendBuffer);
+                if (useVisiblePartClusterQueue)
+                    BindRasterBinOutputs(activeClusterKernel);
+                shader.SetBuffer(
+                    activeClusterKernel,
+                    "_SceneClusterFirstTri",
+                    sceneClusterFirstTriBuffer != null ? sceneClusterFirstTriBuffer : fallbackSceneClusterData);
+                shader.SetBuffer(
+                    activeClusterKernel,
+                    "_SceneClusterTriCount",
+                    sceneClusterTriCountBuffer != null ? sceneClusterTriCountBuffer : fallbackSceneClusterData);
+                if (useVisiblePartClusterQueue)
+                {
+                    shader.SetBuffer(activeClusterKernel, "_VisiblePartsIn", visiblePartAppendBuffer);
+                    shader.SetBuffer(activeClusterKernel, "_VisiblePartDispatchArgs", visiblePartDispatchArgsBuffer);
+                }
+                BindGpuSceneRefs(activeClusterKernel);
+                BindPageStreamingBuffers(activeClusterKernel);
+                BindResidencyHierarchy(activeClusterKernel);
+                BindCullSharedBuffers(activeClusterKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
+                BindInstanceBuffers(activeClusterKernel);
+                BindHzbTexture(activeClusterKernel, boundHzbTexture);
 
-            int clusterWorkCount = usePartDriven
-                ? partCount
-                : (hasCpuCandidates ? clusterCandidateCount : clusterCount);
-            if (useVisiblePartClusterQueue)
-            {
-                shader.DispatchIndirect(activeClusterKernel, visiblePartDispatchArgsBuffer, 0);
-            }
-            else if (clusterWorkCount > 0)
-            {
-                int clusterGroups = (clusterWorkCount + kThreadGroupSize - 1) / kThreadGroupSize;
-                shader.Dispatch(activeClusterKernel, clusterGroups, 1, 1);
+                int clusterWorkCount = usePartDriven
+                    ? partCount
+                    : (hasCpuCandidates ? clusterCandidateCount : clusterCount);
+                if (useVisiblePartClusterQueue)
+                {
+                    shader.DispatchIndirect(activeClusterKernel, visiblePartDispatchArgsBuffer, 0);
+                }
+                else if (clusterWorkCount > 0)
+                {
+                    int clusterGroups = (clusterWorkCount + kThreadGroupSize - 1) / kThreadGroupSize;
+                    shader.Dispatch(activeClusterKernel, clusterGroups, 1, 1);
+                }
             }
 
             if (enableVisibleDrawQueue)
             {
                 ComputeBuffer.CopyCount(visibleDrawClusterAppendBuffer, visibleDrawCountArgsBuffer, 0);
+                ComputeBuffer.CopyCount(hardwareRasterClusterAppendBuffer, hardwareRasterCountArgsBuffer, 0);
+                ComputeBuffer.CopyCount(softwareRasterClusterAppendBuffer, softwareRasterCountArgsBuffer, 0);
+                if (kernelFinalizeRasterBinArgs >= 0)
+                {
+                    shader.SetInt("_RasterDispatchGroupsX", 65535);
+                    shader.SetBuffer(
+                        kernelFinalizeRasterBinArgs,
+                        "_SoftwareRasterCountArgs",
+                        softwareRasterCountArgsBuffer);
+                    shader.SetBuffer(
+                        kernelFinalizeRasterBinArgs,
+                        "_SoftwareRasterDispatchArgs",
+                        softwareRasterDispatchArgsBuffer);
+                    shader.Dispatch(kernelFinalizeRasterBinArgs, 1, 1, 1);
+                }
                 lastVisibleDrawQueueFrame = Time.frameCount;
                 lastVisibleDrawCameraId = camera.GetInstanceID();
             }
@@ -863,8 +1109,30 @@ namespace Nanite
             LastUsedPartDrivenClusterCull = usePartDriven;
             LastUsedVisiblePartQueue = useVisiblePartQueue;
             LastUsedVisibleInstanceQueue = useVisibleInstanceQueue;
+            LastUsedHierarchyQueue = useHierarchyQueue;
+            LastUsedSpatialHierarchy = useSpatialQueue;
+            bool producedTraversalRasterBins =
+                enableVisibleDrawQueue &&
+                EnableTraversalRasterBins &&
+                useVisiblePartClusterQueue;
+            // A later compatibility/auxiliary dispatch in the same frame must
+            // not erase the producer stamp. RenderGraph records several views
+            // and passes before Formal consumes this queue; readiness is scoped
+            // by both frame and camera below, so retaining the last successful
+            // producer cannot alias another camera.
+            if (producedTraversalRasterBins)
+            {
+                lastTraversalRasterBinsFrame = Time.frameCount;
+                lastTraversalRasterBinsCameraId = camera.GetInstanceID();
+            }
 
             return true;
+        }
+
+        void BindRasterBinOutputs(int kernel)
+        {
+            shader.SetBuffer(kernel, "_HardwareRasterClusters", hardwareRasterClusterAppendBuffer);
+            shader.SetBuffer(kernel, "_SoftwareRasterClusters", softwareRasterClusterAppendBuffer);
         }
 
         void BindGpuSceneRefs(int kernel)
@@ -883,6 +1151,7 @@ namespace Nanite
             shader.SetInt("_PageCount", enabled ? scenePageCount : 0);
             shader.SetInt("_EnablePageRequests", enabled ? 1 : 0);
             shader.SetInt("_TrackPageUsage", enabled && sceneTrackPageUsage ? 1 : 0);
+            shader.SetInt("_AllPagesResident", !enabled || sceneAllPagesResident ? 1 : 0);
             shader.SetBuffer(
                 kernel,
                 "_PageResidency",
@@ -891,6 +1160,39 @@ namespace Nanite
                 kernel,
                 "_PageRequests",
                 enabled ? scenePageRequestBuffer : fallback);
+        }
+
+        void BindResidencyHierarchy(int kernel)
+        {
+            shader.SetInt("_HierarchyGroupCount", hierarchyGroups.Count);
+            shader.SetInt("_HierarchyRefCount", hierarchyClusterRefs.Count);
+            shader.SetInt("_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
+            shader.SetBuffer(kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyGroupResidency", hierarchyGroupResidencyBuffer);
+        }
+
+        int HierarchyGroupResidencyCount => Mathf.Max(1, hierarchyResidencyRefs.Count);
+
+        void DispatchHierarchyGroupResidency()
+        {
+            if (kernelUpdateHierarchyGroupResidency < 0 || hierarchyGroupResidencyBuffer == null ||
+                hierarchyGroups.Count <= 0 || instanceCount <= 0 || sceneAllPagesResident)
+                return;
+
+            int kernel = kernelUpdateHierarchyGroupResidency;
+            shader.SetInt("_InstanceCount", instanceCount);
+            BindGpuSceneRefs(kernel);
+            BindInstanceBuffers(kernel);
+            BindPageStreamingBuffers(kernel);
+            shader.SetInt("_HierarchyGroupCount", hierarchyGroups.Count);
+            shader.SetInt("_HierarchyRefCount", hierarchyClusterRefs.Count);
+            shader.SetInt("_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
+            shader.SetBuffer(kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyResidencyRefs", hierarchyResidencyRefsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyGroupResidencyWrite", hierarchyGroupResidencyBuffer);
+            shader.Dispatch(kernel, (HierarchyGroupResidencyCount + kThreadGroupSize - 1) / kThreadGroupSize, 1, 1);
         }
 
         void BindCullSharedBuffers(
@@ -987,18 +1289,20 @@ namespace Nanite
                 return;
             lastTransformUpdateFrame = Time.frameCount;
 
-            bool dirty = false;
+            dirtyInstanceDataIndices.Clear();
             for (int s = 0; s < slots.Count; s++)
             {
                 var proxy = slots[s].proxy;
                 if (proxy == null || !proxy.isActiveAndEnabled || !proxy.NaniteRenderingActive)
                     continue;
 
-                Matrix4x4 m = proxy.transform.localToWorldMatrix;
+                Transform proxyTransform = proxy.transform;
+                Matrix4x4 m = proxyTransform.localToWorldMatrix;
+                Vector3 lossyScale = proxyTransform.lossyScale;
                 float maxScale = Mathf.Max(
-                    Mathf.Abs(proxy.transform.lossyScale.x),
-                    Mathf.Abs(proxy.transform.lossyScale.y),
-                    Mathf.Abs(proxy.transform.lossyScale.z));
+                    Mathf.Abs(lossyScale.x),
+                    Mathf.Abs(lossyScale.y),
+                    Mathf.Abs(lossyScale.z));
                 float lodErr = LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels;
                 var current = instanceData[s];
                 if (current.localToWorld != m ||
@@ -1009,14 +1313,43 @@ namespace Nanite
                     current.maxScale = maxScale;
                     current.lodErrorPixels = lodErr;
                     instanceData[s] = current;
-                    dirty = true;
+                    dirtyInstanceDataIndices.Add(s);
                 }
             }
 
-            if (!dirty)
+            if (dirtyInstanceDataIndices.Count == 0)
                 return;
+            UploadDirtyListRanges(instanceDataBuffer, instanceData, dirtyInstanceDataIndices);
+        }
 
-            instanceDataBuffer.SetData(instanceData, 0, 0, slots.Count);
+        static void UploadDirtyListRanges<T>(
+            ComputeBuffer destination,
+            List<T> source,
+            List<int> sortedDirtyIndices)
+            where T : struct
+        {
+            if (destination == null || source == null || sortedDirtyIndices == null ||
+                sortedDirtyIndices.Count == 0)
+            {
+                return;
+            }
+
+            int runStart = sortedDirtyIndices[0];
+            int runEnd = runStart + 1;
+            for (int i = 1; i <= sortedDirtyIndices.Count; i++)
+            {
+                if (i < sortedDirtyIndices.Count && sortedDirtyIndices[i] == runEnd)
+                {
+                    runEnd++;
+                    continue;
+                }
+                destination.SetData(source, runStart, runStart, runEnd - runStart);
+                if (i < sortedDirtyIndices.Count)
+                {
+                    runStart = sortedDirtyIndices[i];
+                    runEnd = runStart + 1;
+                }
+            }
         }
 
         bool RebuildMergedData(IReadOnlyList<NaniteRuntimeProxy> proxies)
@@ -1029,7 +1362,17 @@ namespace Nanite
             mergedClusters.Clear();
             virtualParts.Clear();
             virtualClusters.Clear();
+            hierarchyGroups.Clear();
+            hierarchyClusterRefs.Clear();
+            hierarchyRootGroups.Clear();
+            spatialNodes.Clear();
+            spatialPartRefs.Clear();
             instanceData.Clear();
+            bool allGeometryHasHierarchy = true;
+            int maxHierarchyMip = 0;
+            bool allGeometryHasSpatialHierarchy = true;
+            int maxSpatialDepth = 0;
+            int virtualHierarchyRefCapacity = 0;
 
             for (int i = 0; i < proxies.Count; i++)
             {
@@ -1062,6 +1405,40 @@ namespace Nanite
                         continue;
                     }
 
+                    bool hasGpuHierarchy = TryAppendGeometryHierarchy(
+                        mesh,
+                        geometryClusters,
+                        out int hierarchyRootOffset,
+                        out int hierarchyRootCount,
+                        out int hierarchyMaxMip,
+                        out int hierarchyGroupOffset);
+                    int hierarchyGroupCount = hasGpuHierarchy
+                        ? hierarchyGroups.Count - hierarchyGroupOffset
+                        : 0;
+                    if (hasGpuHierarchy)
+                    {
+                        // The spatial path visits immutable clusters directly. Attach the
+                        // refinement group once at scene build so a missing fine Page can
+                        // select this resident coarse cluster without switching schedulers.
+                        for (int refIndex = 0; refIndex < mesh.hierarchyClusterRefs.Length; refIndex++)
+                        {
+                            NaniteHierarchyClusterRef clusterRef = mesh.hierarchyClusterRefs[refIndex];
+                            if (clusterRef.refinementGroupIndex < 0 ||
+                                (uint)clusterRef.geometryClusterIndex >= (uint)geometryClusters)
+                                continue;
+                            int mergedClusterIndex = geometryClusterOffset + clusterRef.geometryClusterIndex;
+                            NaniteGpuCullingBackend.GpuClusterData cluster = mergedClusters[mergedClusterIndex];
+                            cluster.refinementGroupIndex = (uint)(hierarchyGroupOffset + clusterRef.refinementGroupIndex);
+                            mergedClusters[mergedClusterIndex] = cluster;
+                        }
+                    }
+                    bool hasSpatialHierarchy = TryAppendGeometrySpatialHierarchy(
+                        geometryPartOffset,
+                        geometryParts,
+                        out int spatialRootOffset,
+                        out int spatialRootCount,
+                        out int spatialMaxDepth);
+
                     var geometry = new GeometrySlot
                     {
                         mesh = mesh,
@@ -1071,7 +1448,17 @@ namespace Nanite
                         clusterCount = geometryClusters,
                         pagePartBase = geometryPagePartBase,
                         pagePartCount = geometryPagePartCount,
-                        bounds = ResolveMeshBounds(mesh, geometryPartOffset, geometryParts)
+                        bounds = ResolveMeshBounds(mesh, geometryPartOffset, geometryParts),
+                        hierarchyRootOffset = hierarchyRootOffset,
+                        hierarchyRootCount = hierarchyRootCount,
+                        hierarchyMaxMip = hierarchyMaxMip,
+                        hasGpuHierarchy = hasGpuHierarchy,
+                        hierarchyGroupOffset = hierarchyGroupOffset,
+                        hierarchyGroupCount = hierarchyGroupCount,
+                        spatialRootOffset = spatialRootOffset,
+                        spatialRootCount = spatialRootCount,
+                        spatialMaxDepth = spatialMaxDepth,
+                        hasSpatialHierarchy = hasSpatialHierarchy
                     };
                     geometryIndex = geometrySlots.Count;
                     geometrySlots.Add(geometry);
@@ -1079,9 +1466,27 @@ namespace Nanite
                 }
 
                 GeometrySlot geometrySlot = geometrySlots[geometryIndex];
+                allGeometryHasHierarchy &= geometrySlot.hasGpuHierarchy;
+                maxHierarchyMip = Mathf.Max(maxHierarchyMip, geometrySlot.hierarchyMaxMip);
+                allGeometryHasSpatialHierarchy &= geometrySlot.hasSpatialHierarchy;
+                maxSpatialDepth = Mathf.Max(maxSpatialDepth, geometrySlot.spatialMaxDepth);
+                if (geometrySlot.hasGpuHierarchy && geometrySlot.mesh?.hierarchyClusterRefs != null)
+                {
+                    virtualHierarchyRefCapacity = checked(
+                        virtualHierarchyRefCapacity + geometrySlot.mesh.hierarchyClusterRefs.Length);
+                }
                 int instanceIndex = slots.Count;
                 int virtualPartOffset = virtualParts.Count;
                 int virtualClusterOffset = virtualClusters.Count;
+                int hierarchyResidencyOffset = hierarchyResidencyRefs.Count;
+                for (int localGroup = 0; localGroup < geometrySlot.hierarchyGroupCount; localGroup++)
+                {
+                    hierarchyResidencyRefs.Add(new GpuHierarchyResidencyRef
+                    {
+                        instanceIndex = (uint)instanceIndex,
+                        groupIndex = (uint)(geometrySlot.hierarchyGroupOffset + localGroup)
+                    });
+                }
 
                 for (int localCluster = 0; localCluster < geometrySlot.clusterCount; localCluster++)
                 {
@@ -1152,7 +1557,18 @@ namespace Nanite
                         Mathf.Abs(proxy.transform.lossyScale.z)),
                     lodErrorPixels = LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels,
                     partOffset = (uint)virtualPartOffset,
-                    partCount = (uint)geometrySlot.partCount
+                    partCount = (uint)geometrySlot.partCount,
+                    clusterOffset = (uint)virtualClusterOffset,
+                    hierarchyRootOffset = (uint)Mathf.Max(0, geometrySlot.hierarchyRootOffset),
+                    hierarchyRootCount = (uint)Mathf.Max(0, geometrySlot.hierarchyRootCount),
+                    hierarchyFlags = geometrySlot.hasGpuHierarchy ? 1u : 0u,
+                    hierarchyGroupOffset = (uint)Mathf.Max(0, geometrySlot.hierarchyGroupOffset),
+                    hierarchyGroupCount = (uint)Mathf.Max(0, geometrySlot.hierarchyGroupCount),
+                    hierarchyResidencyOffset = (uint)hierarchyResidencyOffset,
+                    spatialRootOffset = (uint)Mathf.Max(0, geometrySlot.spatialRootOffset),
+                    spatialRootCount = (uint)Mathf.Max(0, geometrySlot.spatialRootCount),
+                    spatialFlags = geometrySlot.hasSpatialHierarchy ? 1u : 0u,
+                    spatialReserved = SupportsClusterConeCulling(proxy) ? 1u : 0u
                 });
             }
 
@@ -1161,6 +1577,24 @@ namespace Nanite
             partCount = virtualParts.Count;
             clusterCount = virtualClusters.Count;
             instanceCount = slots.Count;
+            hierarchyReady = allGeometryHasHierarchy &&
+                             hierarchyGroups.Count > 0 &&
+                             hierarchyClusterRefs.Count > 0 &&
+                             hierarchyRootGroups.Count > 0;
+            // Root seed plus one replacement step per mip. One guard pass drains terminal
+            // refs without relying on a CPU-visible queue count.
+            hierarchyTraversalPassCount = hierarchyReady
+                ? Mathf.Clamp(maxHierarchyMip + 2, 2, 32)
+                : 0;
+            hierarchyPersistentCapacity = hierarchyReady
+                ? Mathf.Max(clusterCount, virtualHierarchyRefCapacity)
+                : 0;
+            spatialReady = allGeometryHasSpatialHierarchy &&
+                           spatialNodes.Count > 0 &&
+                           spatialPartRefs.Count == geometryPartCount;
+            spatialTraversalPassCount = spatialReady
+                ? Mathf.Clamp(maxSpatialDepth, 1, 32)
+                : 0;
             if (geometryPartCount == 0 || geometryClusterCount == 0 ||
                 partCount == 0 || clusterCount == 0 || instanceCount == 0)
                 return false;
@@ -1179,12 +1613,90 @@ namespace Nanite
             clustersBuffer = new ComputeBuffer(geometryClusterCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuClusterData>());
             virtualPartsBuffer = new ComputeBuffer(partCount, Marshal.SizeOf<GpuVirtualPartRef>());
             virtualClustersBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<GpuVirtualClusterRef>());
+            if (spatialReady)
+            {
+                spatialNodesBuffer = new ComputeBuffer(
+                    spatialNodes.Count,
+                    Marshal.SizeOf<GpuSpatialNode>());
+                spatialPartRefsBuffer = new ComputeBuffer(
+                    spatialPartRefs.Count,
+                    sizeof(uint));
+            }
+            // The fast spatial cluster kernel also consumes refinement metadata for
+            // residency fallback, so typed one-element buffers remain bound even for
+            // legacy meshes without a hierarchy.
+            hierarchyGroupsBuffer = new ComputeBuffer(
+                Mathf.Max(1, hierarchyGroups.Count),
+                Marshal.SizeOf<GpuHierarchyGroup>());
+            hierarchyClusterRefsBuffer = new ComputeBuffer(
+                Mathf.Max(1, hierarchyClusterRefs.Count),
+                Marshal.SizeOf<GpuHierarchyClusterRef>());
+            hierarchyGroupResidencyBuffer = new ComputeBuffer(
+                HierarchyGroupResidencyCount,
+                sizeof(uint));
+            hierarchyResidencyRefsBuffer = new ComputeBuffer(
+                Mathf.Max(1, hierarchyResidencyRefs.Count),
+                Marshal.SizeOf<GpuHierarchyResidencyRef>());
+            if (hierarchyReady)
+            {
+                hierarchyRootGroupsBuffer = new ComputeBuffer(
+                    hierarchyRootGroups.Count,
+                    sizeof(uint));
+                // Eight state words followed by 16-byte task records. viewMask is
+                // unused for camera traversal and carries four cascade bits for shadows.
+                // includes independent reserved/published frontiers; do not fold
+                // them back into one counter or consumers can claim incomplete work.
+                int persistentWordCount = checked(8 + hierarchyPersistentCapacity * 4);
+                hierarchyPersistentWorkBuffer = new ComputeBuffer(
+                    persistentWordCount,
+                    sizeof(uint),
+                    ComputeBufferType.Raw);
+                // Shadows may be recorded/executed on a different RenderGraph queue.
+                // A separate arena prevents camera and four-view traversal from aliasing.
+                shadowHierarchyPersistentWorkBuffer = new ComputeBuffer(
+                    persistentWordCount,
+                    sizeof(uint),
+                    ComputeBufferType.Raw);
+            }
+            if (spatialReady || hierarchyReady)
+            {
+                for (int queueIndex = 0; queueIndex < 2; queueIndex++)
+                {
+                    hierarchyQueues[queueIndex] = new ComputeBuffer(
+                        clusterCount,
+                        sizeof(uint) * 2,
+                        ComputeBufferType.Append);
+                    hierarchyDispatchArgs[queueIndex] = new ComputeBuffer(
+                        4,
+                        sizeof(uint),
+                        ComputeBufferType.IndirectArguments);
+                }
+            }
+            if (spatialReady)
+            {
+                for (int queueIndex = 0; queueIndex < 2; queueIndex++)
+                {
+                    shadowSpatialQueues[queueIndex] = new ComputeBuffer(
+                        clusterCount,
+                        sizeof(uint) * 3,
+                        ComputeBufferType.Append);
+                    shadowSpatialDispatchArgs[queueIndex] = new ComputeBuffer(
+                        4,
+                        sizeof(uint),
+                        ComputeBufferType.IndirectArguments);
+                }
+            }
             visiblePartAppendBuffer = new ComputeBuffer(partCount, sizeof(uint), ComputeBufferType.Append);
             visiblePartDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             visibleInstanceAppendBuffer = new ComputeBuffer(instanceCount, sizeof(uint), ComputeBufferType.Append);
             visibleInstancePartDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             visibleDrawClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
             visibleDrawCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            hardwareRasterClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+            softwareRasterClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+            hardwareRasterCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            softwareRasterCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            softwareRasterDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
             {
                 shadowDrawClusterAppendBuffers[cascadeIndex] =
@@ -1202,17 +1714,58 @@ namespace Nanite
             clusterCandidateBuffer = new ComputeBuffer(clusterCount, sizeof(uint));
             instanceDataBuffer = new ComputeBuffer(instanceCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuInstanceData>());
             instanceVisibleBuffer = new ComputeBuffer(instanceCount, sizeof(uint));
-
             partsBuffer.SetData(partDataCpu);
             clustersBuffer.SetData(clusterDataCpu);
             virtualPartsBuffer.SetData(virtualPartRefsCpu);
             virtualClustersBuffer.SetData(virtualClusterRefsCpu);
+            if (spatialReady)
+            {
+                spatialNodesBuffer.SetData(spatialNodes);
+                spatialPartRefsBuffer.SetData(spatialPartRefs);
+            }
+            if (hierarchyGroups.Count > 0)
+                hierarchyGroupsBuffer.SetData(hierarchyGroups);
+            else
+                hierarchyGroupsBuffer.SetData(new GpuHierarchyGroup[1]);
+            if (hierarchyClusterRefs.Count > 0)
+                hierarchyClusterRefsBuffer.SetData(hierarchyClusterRefs);
+            else
+                hierarchyClusterRefsBuffer.SetData(new GpuHierarchyClusterRef[1]);
+            if (hierarchyResidencyRefs.Count > 0)
+                hierarchyResidencyRefsBuffer.SetData(hierarchyResidencyRefs);
+            else
+                hierarchyResidencyRefsBuffer.SetData(new GpuHierarchyResidencyRef[1]);
+            if (hierarchyReady)
+            {
+                hierarchyRootGroupsBuffer.SetData(hierarchyRootGroups);
+            }
+            if (spatialReady || hierarchyReady)
+            {
+                for (int queueIndex = 0; queueIndex < 2; queueIndex++)
+                {
+                    hierarchyQueues[queueIndex].SetCounterValue(0);
+                    hierarchyDispatchArgs[queueIndex].SetData(new uint[] { 0u, 1u, 1u, 0u });
+                }
+            }
+            if (spatialReady)
+            {
+                for (int queueIndex = 0; queueIndex < 2; queueIndex++)
+                {
+                    shadowSpatialQueues[queueIndex].SetCounterValue(0);
+                    shadowSpatialDispatchArgs[queueIndex].SetData(new uint[] { 0u, 1u, 1u, 0u });
+                }
+            }
             visiblePartAppendBuffer.SetCounterValue(0);
             visiblePartDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
             visibleInstanceAppendBuffer.SetCounterValue(0);
             visibleInstancePartDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
             visibleDrawClusterAppendBuffer.SetCounterValue(0);
             visibleDrawCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hardwareRasterClusterAppendBuffer.SetCounterValue(0);
+            softwareRasterClusterAppendBuffer.SetCounterValue(0);
+            hardwareRasterCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            softwareRasterCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            softwareRasterDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
             for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
             {
                 shadowDrawClusterAppendBuffers[cascadeIndex].SetCounterValue(0);
@@ -1226,6 +1779,539 @@ namespace Nanite
             lastShadowDrawQueueFrame = -1;
             lastShadowDrawCameraId = 0;
             lastShadowDrawCascadeMask = 0;
+            return true;
+        }
+
+        static bool SupportsClusterConeCulling(NaniteRuntimeProxy proxy)
+        {
+            if (proxy == null)
+                return false;
+
+            Vector3 scale = proxy.transform.lossyScale;
+            float sx = Mathf.Abs(scale.x);
+            float sy = Mathf.Abs(scale.y);
+            float sz = Mathf.Abs(scale.z);
+            float minScale = Mathf.Min(sx, Mathf.Min(sy, sz));
+            float maxScale = Mathf.Max(sx, Mathf.Max(sy, sz));
+            if (minScale <= 1e-6f || maxScale / minScale > 1.001f ||
+                proxy.transform.localToWorldMatrix.determinant <= 0f)
+                return false;
+
+            Material[] materials = proxy.resolveMaterials;
+            if (materials == null || materials.Length == 0)
+                return false;
+            for (int i = 0; i < materials.Length; i++)
+            {
+                Material material = materials[i];
+                if (material == null || !material.HasProperty("_Cull") ||
+                    Mathf.RoundToInt(material.GetFloat("_Cull")) != 2)
+                    return false;
+            }
+            return true;
+        }
+
+        void DispatchSpatialTraversal(Texture hzbTexture)
+        {
+            shader.SetInt("_PartCount", partCount);
+            shader.SetInt("_SpatialNodeCount", spatialNodes.Count);
+            shader.SetInt("_SpatialPartRefCount", spatialPartRefs.Count);
+            shader.SetInt("_EnableVisiblePartQueue", 1);
+            shader.SetInt("_UseInstanceCull", 0);
+
+            hierarchyQueues[0].SetCounterValue(0);
+            int seedKernel = kernelSeedSpatialRoots;
+            shader.SetBuffer(seedKernel, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
+            shader.SetBuffer(
+                seedKernel,
+                "_VisibleInstancePartDispatchArgs",
+                visibleInstancePartDispatchArgsBuffer);
+            shader.SetBuffer(seedKernel, "_SpatialNodes", spatialNodesBuffer);
+            shader.SetBuffer(seedKernel, "_SpatialOutputQueue", hierarchyQueues[0]);
+            BindInstanceBuffers(seedKernel);
+            shader.DispatchIndirect(seedKernel, visibleInstancePartDispatchArgsBuffer, 0);
+
+            int inputQueueIndex = 0;
+            for (int passIndex = 0; passIndex < spatialTraversalPassCount; passIndex++)
+            {
+                int outputQueueIndex = 1 - inputQueueIndex;
+                hierarchyQueues[outputQueueIndex].SetCounterValue(0);
+                ComputeBuffer.CopyCount(
+                    hierarchyQueues[inputQueueIndex],
+                    hierarchyDispatchArgs[inputQueueIndex],
+                    0);
+                shader.SetBuffer(
+                    kernelFinalizeHierarchyDispatch,
+                    "_HierarchyDispatchArgsWrite",
+                    hierarchyDispatchArgs[inputQueueIndex]);
+                shader.Dispatch(kernelFinalizeHierarchyDispatch, 1, 1, 1);
+
+                int kernel = kernelTraverseSpatialNodes;
+                shader.SetBuffer(kernel, "_SpatialNodes", spatialNodesBuffer);
+                shader.SetBuffer(kernel, "_SpatialPartRefs", spatialPartRefsBuffer);
+                shader.SetBuffer(kernel, "_SpatialInputQueue", hierarchyQueues[inputQueueIndex]);
+                shader.SetBuffer(kernel, "_SpatialOutputQueue", hierarchyQueues[outputQueueIndex]);
+                shader.SetBuffer(kernel, "_HierarchyDispatchArgs", hierarchyDispatchArgs[inputQueueIndex]);
+                shader.SetBuffer(kernel, "_Parts", partsBuffer);
+                shader.SetBuffer(kernel, "_PartVisibleWrite", partVisibleBuffer);
+                shader.SetBuffer(kernel, "_VisiblePartsOut", visiblePartAppendBuffer);
+                BindGpuSceneRefs(kernel);
+                BindInstanceBuffers(kernel);
+                BindHzbTexture(kernel, hzbTexture);
+                shader.DispatchIndirect(kernel, hierarchyDispatchArgs[inputQueueIndex], 0);
+                inputQueueIndex = outputQueueIndex;
+            }
+        }
+
+        void DispatchHierarchyTraversal(
+            ComputeBuffer visibleTarget,
+            ComputeBuffer sceneIndexBuffer,
+            ComputeBuffer prevVisible,
+            ComputeBuffer secondPassCandidates,
+            ComputeBuffer pass2Drawn,
+            Texture hzbTexture,
+            ComputeBuffer fallbackSceneClusterData)
+        {
+            shader.SetInt("_HierarchyGroupCount", hierarchyGroups.Count);
+            shader.SetInt("_HierarchyRefCount", hierarchyClusterRefs.Count);
+
+            if (kEnableUnsafePersistentTraversal &&
+                kernelClearHierarchyPersistent >= 0 &&
+                kernelSeedHierarchyPersistent >= 0 &&
+                kernelTraverseHierarchyPersistent >= 0 &&
+                hierarchyPersistentWorkBuffer != null)
+            {
+                DispatchPersistentHierarchyTraversal(
+                    visibleTarget,
+                    sceneIndexBuffer,
+                    prevVisible,
+                    secondPassCandidates,
+                    pass2Drawn,
+                    hzbTexture,
+                    fallbackSceneClusterData);
+                return;
+            }
+
+            hierarchyQueues[0].SetCounterValue(0);
+            shader.SetBuffer(kernelSeedHierarchyRoots, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
+            shader.SetBuffer(
+                kernelSeedHierarchyRoots,
+                "_VisibleInstancePartDispatchArgs",
+                visibleInstancePartDispatchArgsBuffer);
+            shader.SetBuffer(kernelSeedHierarchyRoots, "_HierarchyGroups", hierarchyGroupsBuffer);
+            shader.SetBuffer(kernelSeedHierarchyRoots, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            shader.SetBuffer(kernelSeedHierarchyRoots, "_HierarchyRootGroups", hierarchyRootGroupsBuffer);
+            shader.SetBuffer(kernelSeedHierarchyRoots, "_HierarchyOutputQueue", hierarchyQueues[0]);
+            BindInstanceBuffers(kernelSeedHierarchyRoots);
+            shader.DispatchIndirect(kernelSeedHierarchyRoots, visibleInstancePartDispatchArgsBuffer, 0);
+
+            int inputQueueIndex = 0;
+            for (int passIndex = 0; passIndex < hierarchyTraversalPassCount; passIndex++)
+            {
+                int outputQueueIndex = 1 - inputQueueIndex;
+                hierarchyQueues[outputQueueIndex].SetCounterValue(0);
+                ComputeBuffer.CopyCount(
+                    hierarchyQueues[inputQueueIndex],
+                    hierarchyDispatchArgs[inputQueueIndex],
+                    0);
+                shader.SetBuffer(
+                    kernelFinalizeHierarchyDispatch,
+                    "_HierarchyDispatchArgsWrite",
+                    hierarchyDispatchArgs[inputQueueIndex]);
+                shader.Dispatch(kernelFinalizeHierarchyDispatch, 1, 1, 1);
+
+                int kernel = kernelTraverseHierarchy;
+                shader.SetBuffer(kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+                shader.SetBuffer(kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+                shader.SetBuffer(kernel, "_HierarchyInputQueue", hierarchyQueues[inputQueueIndex]);
+                shader.SetBuffer(kernel, "_HierarchyOutputQueue", hierarchyQueues[outputQueueIndex]);
+                shader.SetBuffer(kernel, "_HierarchyDispatchArgs", hierarchyDispatchArgs[inputQueueIndex]);
+                shader.SetBuffer(kernel, "_VisibleDrawClusters", visibleDrawClusterAppendBuffer);
+                shader.SetBuffer(
+                    kernel,
+                    "_SceneClusterFirstTri",
+                    sceneClusterFirstTriBuffer ?? fallbackSceneClusterData);
+                shader.SetBuffer(
+                    kernel,
+                    "_SceneClusterTriCount",
+                    sceneClusterTriCountBuffer ?? fallbackSceneClusterData);
+                BindGpuSceneRefs(kernel);
+                BindPageStreamingBuffers(kernel);
+                BindCullSharedBuffers(
+                    kernel,
+                    visibleTarget,
+                    sceneIndexBuffer,
+                    prevVisible,
+                    secondPassCandidates,
+                    pass2Drawn);
+                BindInstanceBuffers(kernel);
+                BindHzbTexture(kernel, hzbTexture);
+                shader.DispatchIndirect(kernel, hierarchyDispatchArgs[inputQueueIndex], 0);
+                inputQueueIndex = outputQueueIndex;
+            }
+        }
+
+        void DispatchPersistentHierarchyTraversal(
+            ComputeBuffer visibleTarget,
+            ComputeBuffer sceneIndexBuffer,
+            ComputeBuffer prevVisible,
+            ComputeBuffer secondPassCandidates,
+            ComputeBuffer pass2Drawn,
+            Texture hzbTexture,
+            ComputeBuffer fallbackSceneClusterData)
+        {
+            uint epoch = NextHierarchyPersistentEpoch();
+            shader.SetInt("_HierarchyPersistentCapacity", hierarchyPersistentCapacity);
+            shader.SetInt("_HierarchyPersistentEpoch", unchecked((int)epoch));
+
+            shader.SetBuffer(
+                kernelClearHierarchyPersistent,
+                "_HierarchyPersistentWork",
+                hierarchyPersistentWorkBuffer);
+            shader.Dispatch(kernelClearHierarchyPersistent, 1, 1, 1);
+
+            int seedKernel = kernelSeedHierarchyPersistent;
+            shader.SetBuffer(seedKernel, "_VisibleInstancesIn", visibleInstanceAppendBuffer);
+            shader.SetBuffer(
+                seedKernel,
+                "_VisibleInstancePartDispatchArgs",
+                visibleInstancePartDispatchArgsBuffer);
+            shader.SetBuffer(seedKernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            shader.SetBuffer(seedKernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            shader.SetBuffer(seedKernel, "_HierarchyRootGroups", hierarchyRootGroupsBuffer);
+            shader.SetBuffer(seedKernel, "_HierarchyPersistentWork", hierarchyPersistentWorkBuffer);
+            BindInstanceBuffers(seedKernel);
+            shader.DispatchIndirect(seedKernel, visibleInstancePartDispatchArgsBuffer, 0);
+
+            int kernel = kernelTraverseHierarchyPersistent;
+            shader.SetBuffer(kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            shader.SetBuffer(kernel, "_HierarchyPersistentWork", hierarchyPersistentWorkBuffer);
+            shader.SetBuffer(kernel, "_VisibleDrawClusters", visibleDrawClusterAppendBuffer);
+            shader.SetBuffer(
+                kernel,
+                "_SceneClusterFirstTri",
+                sceneClusterFirstTriBuffer ?? fallbackSceneClusterData);
+            shader.SetBuffer(
+                kernel,
+                "_SceneClusterTriCount",
+                sceneClusterTriCountBuffer ?? fallbackSceneClusterData);
+            BindGpuSceneRefs(kernel);
+            BindPageStreamingBuffers(kernel);
+            BindCullSharedBuffers(
+                kernel,
+                visibleTarget,
+                sceneIndexBuffer,
+                prevVisible,
+                secondPassCandidates,
+                pass2Drawn);
+            BindInstanceBuffers(kernel);
+            BindHzbTexture(kernel, hzbTexture);
+            // Nyx uses vendor-tuned persistent group counts (512-1024 at 32 lanes).
+            // Unity's compatibility kernel uses 64 lanes and less LDS, so 256 groups
+            // provide the same 16K resident workers without six CPU-recorded passes.
+            shader.Dispatch(kernel, 256, 1, 1);
+        }
+
+        uint NextHierarchyPersistentEpoch()
+        {
+            hierarchyPersistentEpoch++;
+            // Zero is reserved for freshly allocated task storage.
+            if (hierarchyPersistentEpoch == 0u)
+                hierarchyPersistentEpoch = 1u;
+            return hierarchyPersistentEpoch;
+        }
+
+        struct SpatialBuildRef
+        {
+            public uint morton;
+            public int localPartIndex;
+        }
+
+        bool TryAppendGeometrySpatialHierarchy(
+            int geometryPartOffset,
+            int geometryPartCountInMesh,
+            out int rootOffset,
+            out int rootCount,
+            out int maxDepth)
+        {
+            rootOffset = spatialNodes.Count;
+            rootCount = 0;
+            maxDepth = 0;
+            if (geometryPartOffset < 0 || geometryPartCountInMesh <= 0 ||
+                geometryPartOffset + geometryPartCountInMesh > mergedParts.Count)
+                return false;
+
+            Vector3 centerMin = new Vector3(
+                float.PositiveInfinity,
+                float.PositiveInfinity,
+                float.PositiveInfinity);
+            Vector3 centerMax = new Vector3(
+                float.NegativeInfinity,
+                float.NegativeInfinity,
+                float.NegativeInfinity);
+            for (int localPart = 0; localPart < geometryPartCountInMesh; localPart++)
+            {
+                Vector4 sphere = mergedParts[geometryPartOffset + localPart].selfSphere;
+                Vector3 center = new Vector3(sphere.x, sphere.y, sphere.z);
+                centerMin = Vector3.Min(centerMin, center);
+                centerMax = Vector3.Max(centerMax, center);
+            }
+
+            Vector3 extent = centerMax - centerMin;
+            extent.x = Mathf.Max(extent.x, 1e-6f);
+            extent.y = Mathf.Max(extent.y, 1e-6f);
+            extent.z = Mathf.Max(extent.z, 1e-6f);
+            var refs = new List<SpatialBuildRef>(geometryPartCountInMesh);
+            for (int localPart = 0; localPart < geometryPartCountInMesh; localPart++)
+            {
+                Vector4 sphere = mergedParts[geometryPartOffset + localPart].selfSphere;
+                Vector3 center = new Vector3(sphere.x, sphere.y, sphere.z);
+                Vector3 normalized = new Vector3(
+                    Mathf.Clamp01((center.x - centerMin.x) / extent.x),
+                    Mathf.Clamp01((center.y - centerMin.y) / extent.y),
+                    Mathf.Clamp01((center.z - centerMin.z) / extent.z));
+                refs.Add(new SpatialBuildRef
+                {
+                    morton = SpatialMorton3D(normalized),
+                    localPartIndex = localPart
+                });
+            }
+            refs.Sort((a, b) =>
+            {
+                int order = a.morton.CompareTo(b.morton);
+                return order != 0 ? order : a.localPartIndex.CompareTo(b.localPartIndex);
+            });
+
+            spatialNodes.Add(default);
+            maxDepth = BuildSpatialNodeAt(
+                rootOffset,
+                refs,
+                0,
+                refs.Count,
+                geometryPartOffset);
+            rootCount = 1;
+            return true;
+        }
+
+        int BuildSpatialNodeAt(
+            int nodeIndex,
+            List<SpatialBuildRef> sortedRefs,
+            int rangeStart,
+            int rangeCount,
+            int geometryPartOffset)
+        {
+            Vector4 bounds = Vector4.zero;
+            Vector4 lodBounds = Vector4.zero;
+            float maxParentError = 0f;
+            uint flags = 0u;
+            for (int i = 0; i < rangeCount; i++)
+            {
+                int localPart = sortedRefs[rangeStart + i].localPartIndex;
+                NaniteGpuCullingBackend.GpuPartData part = mergedParts[geometryPartOffset + localPart];
+                Vector4 partBounds = SanitizeSphere(part.selfSphere);
+                Vector4 partLodBounds = SanitizeSphere(
+                    part.parentSphere.w > 0f ? part.parentSphere : part.selfSphere);
+                bounds = i == 0 ? partBounds : MergeSpatialSpheres(bounds, partBounds);
+                lodBounds = i == 0 ? partLodBounds : MergeSpatialSpheres(lodBounds, partLodBounds);
+                maxParentError = Mathf.Max(maxParentError, part.maxParentError);
+                if ((part.lodFlags & NaniteGpuCullingBackend.TerminalDisappearLodFlag) != 0u)
+                    flags |= kSpatialNodeHasTerminal;
+            }
+
+            if (rangeCount <= kSpatialLeafPartCount)
+            {
+                int partRefStart = spatialPartRefs.Count;
+                for (int i = 0; i < rangeCount; i++)
+                    spatialPartRefs.Add((uint)sortedRefs[rangeStart + i].localPartIndex);
+                spatialNodes[nodeIndex] = new GpuSpatialNode
+                {
+                    boundingSphere = bounds,
+                    lodSphere = lodBounds,
+                    maxParentError = maxParentError,
+                    childStart = 0u,
+                    childCount = 0u,
+                    partRefStart = (uint)partRefStart,
+                    partRefCount = (uint)rangeCount,
+                    flags = flags | kSpatialNodeLeaf
+                };
+                return 1;
+            }
+
+            int childCount = Mathf.Min(
+                kSpatialBranchFactor,
+                (rangeCount + kSpatialLeafPartCount - 1) / kSpatialLeafPartCount);
+            int childStart = spatialNodes.Count;
+            for (int child = 0; child < childCount; child++)
+                spatialNodes.Add(default);
+
+            int maxChildDepth = 0;
+            int consumed = 0;
+            for (int child = 0; child < childCount; child++)
+            {
+                int remaining = rangeCount - consumed;
+                int childrenRemaining = childCount - child;
+                int childRangeCount = (remaining + childrenRemaining - 1) / childrenRemaining;
+                int childDepth = BuildSpatialNodeAt(
+                    childStart + child,
+                    sortedRefs,
+                    rangeStart + consumed,
+                    childRangeCount,
+                    geometryPartOffset);
+                maxChildDepth = Mathf.Max(maxChildDepth, childDepth);
+                consumed += childRangeCount;
+            }
+
+            spatialNodes[nodeIndex] = new GpuSpatialNode
+            {
+                boundingSphere = bounds,
+                lodSphere = lodBounds,
+                maxParentError = maxParentError,
+                childStart = (uint)childStart,
+                childCount = (uint)childCount,
+                partRefStart = 0u,
+                partRefCount = 0u,
+                flags = flags
+            };
+            return maxChildDepth + 1;
+        }
+
+        static Vector4 SanitizeSphere(Vector4 sphere)
+        {
+            if (float.IsNaN(sphere.x) || float.IsInfinity(sphere.x) ||
+                float.IsNaN(sphere.y) || float.IsInfinity(sphere.y) ||
+                float.IsNaN(sphere.z) || float.IsInfinity(sphere.z) ||
+                float.IsNaN(sphere.w) || float.IsInfinity(sphere.w))
+                return new Vector4(0f, 0f, 0f, 1e30f);
+            sphere.w = Mathf.Max(0f, sphere.w);
+            return sphere;
+        }
+
+        static Vector4 MergeSpatialSpheres(Vector4 a, Vector4 b)
+        {
+            Vector3 ac = new Vector3(a.x, a.y, a.z);
+            Vector3 bc = new Vector3(b.x, b.y, b.z);
+            float ar = Mathf.Max(0f, a.w);
+            float br = Mathf.Max(0f, b.w);
+            Vector3 delta = bc - ac;
+            float distance = delta.magnitude;
+            if (ar >= distance + br)
+                return a;
+            if (br >= distance + ar)
+                return b;
+            if (distance <= 1e-8f)
+                return new Vector4(ac.x, ac.y, ac.z, Mathf.Max(ar, br));
+            float radius = (distance + ar + br) * 0.5f;
+            Vector3 center = ac + delta * ((radius - ar) / distance);
+            return new Vector4(center.x, center.y, center.z, radius);
+        }
+
+        static uint SpatialMorton3D(Vector3 normalized)
+        {
+            uint x = (uint)Mathf.Clamp(Mathf.FloorToInt(normalized.x * 1023f), 0, 1023);
+            uint y = (uint)Mathf.Clamp(Mathf.FloorToInt(normalized.y * 1023f), 0, 1023);
+            uint z = (uint)Mathf.Clamp(Mathf.FloorToInt(normalized.z * 1023f), 0, 1023);
+            return SpatialExpandMortonBits(x) |
+                   (SpatialExpandMortonBits(y) << 1) |
+                   (SpatialExpandMortonBits(z) << 2);
+        }
+
+        static uint SpatialExpandMortonBits(uint value)
+        {
+            value &= 0x000003ffu;
+            value = (value | (value << 16)) & 0x030000FFu;
+            value = (value | (value << 8)) & 0x0300F00Fu;
+            value = (value | (value << 4)) & 0x030C30C3u;
+            value = (value | (value << 2)) & 0x09249249u;
+            return value;
+        }
+
+        bool TryAppendGeometryHierarchy(
+            NaniteMesh mesh,
+            int geometryClusterCountInMesh,
+            out int rootOffset,
+            out int rootCount,
+            out int maxMip,
+            out int groupOffset)
+        {
+            rootOffset = hierarchyRootGroups.Count;
+            rootCount = 0;
+            maxMip = 0;
+            groupOffset = hierarchyGroups.Count;
+            if (mesh == null ||
+                mesh.hierarchyVersion != NaniteHierarchyGroup.CurrentVersion ||
+                mesh.hierarchyGroups == null || mesh.hierarchyGroups.Length == 0 ||
+                mesh.hierarchyClusterRefs == null || mesh.hierarchyClusterRefs.Length == 0 ||
+                mesh.hierarchyRootGroups == null || mesh.hierarchyRootGroups.Length == 0)
+                return false;
+
+            int groupBase = hierarchyGroups.Count;
+            groupOffset = groupBase;
+            int refBase = hierarchyClusterRefs.Count;
+            for (int groupIndex = 0; groupIndex < mesh.hierarchyGroups.Length; groupIndex++)
+            {
+                NaniteHierarchyGroup group = mesh.hierarchyGroups[groupIndex];
+                int fineEnd = group.fineClusterStart + group.fineClusterCount;
+                int coarseEnd = group.coarseClusterStart + group.coarseClusterCount;
+                if (group.fineClusterStart < 0 || group.fineClusterCount <= 0 ||
+                    fineEnd > mesh.hierarchyClusterRefs.Length ||
+                    group.coarseClusterStart < 0 || group.coarseClusterCount < 0 ||
+                    coarseEnd > mesh.hierarchyClusterRefs.Length)
+                    return false;
+            }
+
+            for (int refIndex = 0; refIndex < mesh.hierarchyClusterRefs.Length; refIndex++)
+            {
+                NaniteHierarchyClusterRef clusterRef = mesh.hierarchyClusterRefs[refIndex];
+                if (clusterRef.geometryClusterIndex < 0 ||
+                    clusterRef.geometryClusterIndex >= geometryClusterCountInMesh ||
+                    clusterRef.refinementGroupIndex < -1 ||
+                    clusterRef.refinementGroupIndex >= mesh.hierarchyGroups.Length)
+                    return false;
+            }
+
+            for (int rootIndex = 0; rootIndex < mesh.hierarchyRootGroups.Length; rootIndex++)
+            {
+                int groupIndex = mesh.hierarchyRootGroups[rootIndex];
+                if (groupIndex < 0 || groupIndex >= mesh.hierarchyGroups.Length ||
+                    !mesh.hierarchyGroups[groupIndex].IsRootSet)
+                    return false;
+            }
+
+            for (int groupIndex = 0; groupIndex < mesh.hierarchyGroups.Length; groupIndex++)
+            {
+                NaniteHierarchyGroup group = mesh.hierarchyGroups[groupIndex];
+                hierarchyGroups.Add(new GpuHierarchyGroup
+                {
+                    boundingSphere = group.boundingSphere,
+                    minLodError = group.minLodError,
+                    maxParentLodError = group.maxParentLodError,
+                    fineClusterStart = (uint)(refBase + group.fineClusterStart),
+                    fineClusterCount = (uint)group.fineClusterCount,
+                    coarseClusterStart = (uint)(refBase + group.coarseClusterStart),
+                    coarseClusterCount = (uint)group.coarseClusterCount,
+                    mipLevel = (uint)Mathf.Max(0, group.mipLevel),
+                    flags = (uint)group.flags
+                });
+                maxMip = Mathf.Max(maxMip, group.mipLevel);
+            }
+
+            for (int refIndex = 0; refIndex < mesh.hierarchyClusterRefs.Length; refIndex++)
+            {
+                NaniteHierarchyClusterRef clusterRef = mesh.hierarchyClusterRefs[refIndex];
+                hierarchyClusterRefs.Add(new GpuHierarchyClusterRef
+                {
+                    geometryClusterIndex = (uint)clusterRef.geometryClusterIndex,
+                    pageIndex = (uint)Mathf.Max(0, clusterRef.pageIndex),
+                    pageClusterIndex = (uint)Mathf.Max(0, clusterRef.pageClusterIndex),
+                    refinementGroupIndex = clusterRef.refinementGroupIndex >= 0
+                        ? (uint)(groupBase + clusterRef.refinementGroupIndex)
+                        : uint.MaxValue
+                });
+            }
+
+            for (int rootIndex = 0; rootIndex < mesh.hierarchyRootGroups.Length; rootIndex++)
+                hierarchyRootGroups.Add((uint)(groupBase + mesh.hierarchyRootGroups[rootIndex]));
+            rootCount = mesh.hierarchyRootGroups.Length;
             return true;
         }
 
@@ -1270,7 +2356,8 @@ namespace Nanite
             int cascadeIndex,
             Matrix4x4 shadowViewMatrix,
             Matrix4x4 shadowProjectionMatrix,
-            int shadowResolution)
+            int shadowResolution,
+            Vector3 shadowRayDirection)
         {
             if (cmd == null || camera == null || !SupportsGpuVisibleMask ||
                 kernelInstanceCull < 0 || kernelPartCull < 0 || kernelClusterCullByPart < 0 ||
@@ -1293,6 +2380,8 @@ namespace Nanite
                 kernelPartCullVisibleInstances >= 0 &&
                 instanceCount >= Mathf.Max(1, ShadowInstanceQueueMinInstances);
             LastShadowUsedFusedBatch = false;
+            LastShadowUsedHierarchyQueue = false;
+            LastShadowUsedSpatialHierarchy = false;
             LastShadowUsedVisiblePartQueue = useVisiblePartQueue;
             LastShadowUsedVisibleInstanceQueue = useVisibleInstanceQueue;
 
@@ -1329,7 +2418,8 @@ namespace Nanite
                 shadowWorldToClip,
                 Mathf.Max(1, shadowResolution),
                 useVisiblePartQueue,
-                useVisibleInstanceQueue);
+                useVisibleInstanceQueue,
+                shadowRayDirection);
 
             // Instance frustum cull. The append output is disabled for this path; its buffer is
             // still bound because Unity validates every resource declared by the kernel.
@@ -1414,16 +2504,17 @@ namespace Nanite
             int cascadeCount,
             Matrix4x4[] shadowViewMatrices,
             Matrix4x4[] shadowProjectionMatrices,
-            int[] shadowResolutions)
+            int[] shadowResolutions,
+            Vector3 shadowRayDirection)
         {
             int activeCascadeCount = Mathf.Clamp(cascadeCount, 0, kMaxShadowCascades);
+            LastShadowUsedHierarchyQueue = false;
             if (cmd == null || camera == null || !SupportsGpuVisibleMask ||
                 kernelShadowCullMultiCascadeByPart < 0 || activeCascadeCount <= 0 ||
                 shadowViewMatrices == null || shadowProjectionMatrices == null || shadowResolutions == null ||
                 shadowViewMatrices.Length < activeCascadeCount ||
                 shadowProjectionMatrices.Length < activeCascadeCount ||
-                shadowResolutions.Length < activeCascadeCount ||
-                partCount >= Mathf.Max(1, ShadowPartQueueMinVirtualParts))
+                shadowResolutions.Length < activeCascadeCount)
                 return false;
 
             for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
@@ -1480,6 +2571,14 @@ namespace Nanite
             cmd.SetComputeIntParam(shader, "_ShadowCascadeCount", activeCascadeCount);
             cmd.SetComputeVectorArrayParam(shader, "_ShadowFrustumPlanes", shadowBatchFrustumPlanes);
             cmd.SetComputeVectorParam(shader, "_ShadowProjectionScales", shadowBatchProjectionScales);
+            Vector3 normalizedShadowRay = shadowRayDirection.sqrMagnitude > 1e-12f
+                ? shadowRayDirection.normalized
+                : Vector3.forward;
+            cmd.SetComputeVectorParam(shader, "_ShadowRayDirection", new Vector4(
+                normalizedShadowRay.x,
+                normalizedShadowRay.y,
+                normalizedShadowRay.z,
+                0f));
             cmd.SetComputeIntParam(shader, "_InstanceCount", instanceCount);
             cmd.SetComputeIntParam(shader, "_PartCount", partCount);
             cmd.SetComputeIntParam(shader, "_ClusterCount", clusterCount);
@@ -1492,12 +2591,115 @@ namespace Nanite
                 scenePageRequestBuffer != null;
             cmd.SetComputeIntParam(shader, "_PageCount", pageRequestsEnabled ? scenePageCount : 0);
             cmd.SetComputeIntParam(shader, "_EnablePageRequests", pageRequestsEnabled ? 1 : 0);
+            cmd.SetComputeIntParam(shader, "_AllPagesResident", !pageRequestsEnabled || sceneAllPagesResident ? 1 : 0);
             cmd.SetComputeIntParam(
                 shader,
                 "_TrackPageUsage",
                 pageRequestsEnabled && sceneTrackPageUsage ? 1 : 0);
 
             ComputeBuffer fallback = GetFallbackClusterVisibleBuffer();
+            bool useSpatialShadow = spatialReady &&
+                                    kernelSeedShadowSpatialRoots >= 0 &&
+                                    kernelTraverseShadowSpatialNodes >= 0 &&
+                                    kernelFinalizeHierarchyDispatch >= 0 &&
+                                    shadowSpatialQueues[0] != null &&
+                                    shadowSpatialQueues[1] != null;
+            if (useSpatialShadow)
+            {
+                RecordHierarchyGroupResidency(cmd, pageRequestsEnabled, fallback);
+                RecordShadowSpatialTraversal(cmd, pageRequestsEnabled, fallback);
+                for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+                {
+                    cmd.CopyCounterValue(
+                        shadowDrawClusterAppendBuffers[cascadeIndex],
+                        shadowDrawCountArgsBuffers[cascadeIndex],
+                        0u);
+                }
+
+                lastShadowDrawQueueFrame = Time.frameCount;
+                lastShadowDrawCameraId = camera.GetInstanceID();
+                lastShadowDrawCascadeMask = (1 << activeCascadeCount) - 1;
+                LastShadowUsedFusedBatch = true;
+                LastShadowUsedHierarchyQueue = false;
+                LastShadowUsedSpatialHierarchy = true;
+                LastShadowUsedVisiblePartQueue = true;
+                LastShadowUsedVisibleInstanceQueue = true;
+                return true;
+            }
+            bool useHierarchyShadow =
+                kEnableUnsafePersistentTraversal &&
+                hierarchyReady &&
+                shadowHierarchyPersistentWorkBuffer != null &&
+                kernelClearHierarchyPersistent >= 0 &&
+                kernelSeedShadowHierarchyPersistent >= 0 &&
+                kernelTraverseShadowHierarchyPersistent >= 0;
+            if (useHierarchyShadow)
+            {
+                uint epoch = NextHierarchyPersistentEpoch();
+                cmd.SetComputeIntParam(shader, "_HierarchyGroupCount", hierarchyGroups.Count);
+                cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
+                cmd.SetComputeIntParam(shader, "_HierarchyPersistentCapacity", hierarchyPersistentCapacity);
+                cmd.SetComputeIntParam(shader, "_HierarchyPersistentEpoch", unchecked((int)epoch));
+
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernelClearHierarchyPersistent,
+                    "_HierarchyPersistentWork",
+                    shadowHierarchyPersistentWorkBuffer);
+                cmd.DispatchCompute(shader, kernelClearHierarchyPersistent, 1, 1, 1);
+
+                int seedKernel = kernelSeedShadowHierarchyPersistent;
+                cmd.SetComputeBufferParam(shader, seedKernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+                cmd.SetComputeBufferParam(shader, seedKernel, "_HierarchyRootGroups", hierarchyRootGroupsBuffer);
+                cmd.SetComputeBufferParam(shader, seedKernel, "_Instances", instanceDataBuffer);
+                cmd.SetComputeBufferParam(shader, seedKernel, "_HierarchyPersistentWork", shadowHierarchyPersistentWorkBuffer);
+                cmd.DispatchCompute(shader, seedKernel, Mathf.Max(1, instanceCount), 1, 1);
+
+                int traverseKernel = kernelTraverseShadowHierarchyPersistent;
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_HierarchyPersistentWork", shadowHierarchyPersistentWorkBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_Clusters", clustersBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_VirtualClusters", virtualClustersBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_Instances", instanceDataBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    traverseKernel,
+                    "_PageResidency",
+                    pageRequestsEnabled ? scenePageResidencyBuffer : fallback);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    traverseKernel,
+                    "_PageRequests",
+                    pageRequestsEnabled ? scenePageRequestBuffer : fallback);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_ShadowVisibleDrawClusters0", shadowDrawClusterAppendBuffers[0]);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_ShadowVisibleDrawClusters1", shadowDrawClusterAppendBuffers[1]);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_ShadowVisibleDrawClusters2", shadowDrawClusterAppendBuffers[2]);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_ShadowVisibleDrawClusters3", shadowDrawClusterAppendBuffers[3]);
+                cmd.DispatchCompute(shader, traverseKernel, 256, 1, 1);
+
+                for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+                {
+                    cmd.CopyCounterValue(
+                        shadowDrawClusterAppendBuffers[cascadeIndex],
+                        shadowDrawCountArgsBuffers[cascadeIndex],
+                        0u);
+                }
+
+                lastShadowDrawQueueFrame = Time.frameCount;
+                lastShadowDrawCameraId = camera.GetInstanceID();
+                lastShadowDrawCascadeMask = (1 << activeCascadeCount) - 1;
+                LastShadowUsedFusedBatch = true;
+                LastShadowUsedHierarchyQueue = true;
+                LastShadowUsedSpatialHierarchy = false;
+                LastShadowUsedVisiblePartQueue = false;
+                LastShadowUsedVisibleInstanceQueue = false;
+                return true;
+            }
+
             cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
@@ -1506,6 +2708,10 @@ namespace Nanite
             cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+            cmd.SetComputeIntParam(shader, "_HierarchyGroupCount", hierarchyGroups.Count);
+            cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
             cmd.SetComputeBufferParam(
                 shader,
                 kernel,
@@ -1555,9 +2761,129 @@ namespace Nanite
             lastShadowDrawCameraId = camera.GetInstanceID();
             lastShadowDrawCascadeMask = (1 << activeCascadeCount) - 1;
             LastShadowUsedFusedBatch = true;
+            LastShadowUsedHierarchyQueue = false;
+            LastShadowUsedSpatialHierarchy = false;
             LastShadowUsedVisiblePartQueue = false;
             LastShadowUsedVisibleInstanceQueue = false;
             return true;
+        }
+
+        void RecordShadowSpatialTraversal(
+            UnsafeCommandBuffer cmd,
+            bool pageRequestsEnabled,
+            ComputeBuffer fallback)
+        {
+            cmd.SetComputeIntParam(shader, "_SpatialNodeCount", spatialNodes.Count);
+            cmd.SetComputeIntParam(shader, "_SpatialPartRefCount", spatialPartRefs.Count);
+            cmd.SetBufferCounterValue(shadowSpatialQueues[0], 0u);
+
+            int seedKernel = kernelSeedShadowSpatialRoots;
+            cmd.SetComputeBufferParam(shader, seedKernel, "_SpatialNodes", spatialNodesBuffer);
+            cmd.SetComputeBufferParam(shader, seedKernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(
+                shader,
+                seedKernel,
+                "_ShadowSpatialOutputQueue",
+                shadowSpatialQueues[0]);
+            cmd.DispatchCompute(shader, seedKernel, Mathf.Max(1, instanceCount), 1, 1);
+
+            int inputQueueIndex = 0;
+            for (int passIndex = 0; passIndex < spatialTraversalPassCount; passIndex++)
+            {
+                int outputQueueIndex = 1 - inputQueueIndex;
+                cmd.SetBufferCounterValue(shadowSpatialQueues[outputQueueIndex], 0u);
+                cmd.CopyCounterValue(
+                    shadowSpatialQueues[inputQueueIndex],
+                    shadowSpatialDispatchArgs[inputQueueIndex],
+                    0u);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernelFinalizeHierarchyDispatch,
+                    "_HierarchyDispatchArgsWrite",
+                    shadowSpatialDispatchArgs[inputQueueIndex]);
+                cmd.DispatchCompute(shader, kernelFinalizeHierarchyDispatch, 1, 1, 1);
+
+                int kernel = kernelTraverseShadowSpatialNodes;
+                cmd.SetComputeBufferParam(shader, kernel, "_SpatialNodes", spatialNodesBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_SpatialPartRefs", spatialPartRefsBuffer);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_ShadowSpatialInputQueue",
+                    shadowSpatialQueues[inputQueueIndex]);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_ShadowSpatialOutputQueue",
+                    shadowSpatialQueues[outputQueueIndex]);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_HierarchyDispatchArgs",
+                    shadowSpatialDispatchArgs[inputQueueIndex]);
+                cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+                cmd.SetComputeIntParam(shader, "_HierarchyGroupCount", hierarchyGroups.Count);
+                cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
+                cmd.SetComputeIntParam(shader, "_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroupResidency", hierarchyGroupResidencyBuffer);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_PageResidency",
+                    pageRequestsEnabled ? scenePageResidencyBuffer : fallback);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_PageRequests",
+                    pageRequestsEnabled ? scenePageRequestBuffer : fallback);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters0", shadowDrawClusterAppendBuffers[0]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters1", shadowDrawClusterAppendBuffers[1]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters2", shadowDrawClusterAppendBuffers[2]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters3", shadowDrawClusterAppendBuffers[3]);
+                cmd.DispatchCompute(
+                    shader,
+                    kernel,
+                    shadowSpatialDispatchArgs[inputQueueIndex],
+                    0u);
+                inputQueueIndex = outputQueueIndex;
+            }
+        }
+
+        void RecordHierarchyGroupResidency(
+            UnsafeCommandBuffer cmd,
+            bool pageRequestsEnabled,
+            ComputeBuffer fallback)
+        {
+            if (kernelUpdateHierarchyGroupResidency < 0 || hierarchyGroupResidencyBuffer == null ||
+                hierarchyGroups.Count <= 0 || instanceCount <= 0 || sceneAllPagesResident)
+                return;
+
+            int kernel = kernelUpdateHierarchyGroupResidency;
+            cmd.SetComputeIntParam(shader, "_InstanceCount", instanceCount);
+            cmd.SetComputeIntParam(shader, "_HierarchyGroupCount", hierarchyGroups.Count);
+            cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
+            cmd.SetComputeIntParam(shader, "_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
+            cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyResidencyRefs", hierarchyResidencyRefsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroupResidencyWrite", hierarchyGroupResidencyBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_PageResidency",
+                pageRequestsEnabled ? scenePageResidencyBuffer : fallback);
+            cmd.SetComputeBufferParam(shader, kernel, "_PageRequests",
+                pageRequestsEnabled ? scenePageRequestBuffer : fallback);
+            cmd.DispatchCompute(shader, kernel,
+                (HierarchyGroupResidencyCount + kThreadGroupSize - 1) / kThreadGroupSize, 1, 1);
         }
 
         public bool DispatchShadowDrawQueueFinalizeBatch(
@@ -1604,7 +2930,8 @@ namespace Nanite
             Matrix4x4 shadowWorldToClip,
             int shadowResolution,
             bool useVisiblePartQueue,
-            bool useVisibleInstanceQueue)
+            bool useVisibleInstanceQueue,
+            Vector3 shadowRayDirection)
         {
             cmd.SetComputeVectorParam(shader, "_CameraPos", new Vector4(
                 cameraPosition.x,
@@ -1641,6 +2968,14 @@ namespace Nanite
             cmd.SetComputeIntParam(shader, "_CullPassMode", (int)CullPassMode.Legacy);
             cmd.SetComputeIntParam(shader, "_HasPrevVisible", 0);
             cmd.SetComputeIntParam(shader, "_EnableCullStats", 0);
+            Vector3 normalizedShadowRay = shadowRayDirection.sqrMagnitude > 1e-12f
+                ? shadowRayDirection.normalized
+                : Vector3.forward;
+            cmd.SetComputeVectorParam(shader, "_ShadowRayDirection", new Vector4(
+                normalizedShadowRay.x,
+                normalizedShadowRay.y,
+                normalizedShadowRay.z,
+                0f));
             bool pageRequestsEnabled =
                 scenePageCount > 0 &&
                 scenePageResidencyBuffer != null &&
@@ -1657,6 +2992,10 @@ namespace Nanite
                 shader,
                 "_TrackPageUsage",
                 pageRequestsEnabled && sceneTrackPageUsage ? 1 : 0);
+            cmd.SetComputeIntParam(
+                shader,
+                "_AllPagesResident",
+                !pageRequestsEnabled || sceneAllPagesResident ? 1 : 0);
         }
 
         void BindShadowInstanceKernel(UnsafeCommandBuffer cmd, int kernel)
@@ -1699,6 +3038,12 @@ namespace Nanite
             cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+            cmd.SetComputeIntParam(shader, "_HierarchyGroupCount", hierarchyGroups.Count);
+            cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
+            cmd.SetComputeIntParam(shader, "_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroupResidency", hierarchyGroupResidencyBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VisibleDrawClusters", drawQueue);
             cmd.SetComputeBufferParam(shader, kernel, "_ClusterVisible", fallback);
             cmd.SetComputeBufferParam(shader, kernel, "_VisibleClusters", visibleClusterAppendBuffer);
@@ -1733,21 +3078,47 @@ namespace Nanite
         public int GeometryClusterCount => geometryClusterCount;
         public int VirtualPartCount => partCount;
         public int VirtualClusterCount => clusterCount;
+        public int HierarchyGroupCount => hierarchyGroups.Count;
+        public int HierarchyRefCount => hierarchyClusterRefs.Count;
+        public int HierarchyTraversalPassCount =>
+            kEnableUnsafePersistentTraversal && hierarchyReady && hierarchyPersistentWorkBuffer != null
+                ? 1
+                : hierarchyTraversalPassCount;
+        public int SpatialNodeCount => spatialNodes.Count;
+        public int SpatialTraversalPassCount => spatialTraversalPassCount;
+        // Quarantined by default after a D3D12 TDR exposed a wave-level
+        // deadlock in the first persistent consumer protocol. The corrected
+        // kernel remains available for an explicit GPU-debug validation run;
+        // production uses the bounded multi-pass hierarchy until then.
+        // Experimental only. Scalar lane-level persistent consumption cannot
+        // guarantee both wave progress and late-child draining on Unity's
+        // compute model; never enable these in the production renderer.
         public int PartQueueMinVirtualParts { get; set; } = 4096;
         public int InstanceQueueMinInstances { get; set; } = 64;
         public int ShadowPartQueueMinVirtualParts { get; set; } = 32768;
         public int ShadowInstanceQueueMinInstances { get; set; } = 64;
         public bool PreferBvhCandidates { get; set; } = true;
         public bool PreferPartDrivenClusterCull { get; set; } = true;
+        public bool EnableTraversalRasterBins { get; set; }
+        public float SoftwareRasterThresholdPixels { get; set; } = 16f;
         public bool LastUsedCpuCandidates { get; private set; }
         public bool LastUsedPartDrivenClusterCull { get; private set; }
         public bool LastUsedVisiblePartQueue { get; private set; }
         public bool LastUsedVisibleInstanceQueue { get; private set; }
+        public bool LastUsedHierarchyQueue { get; private set; }
+        public bool LastUsedSpatialHierarchy { get; private set; }
         public bool LastShadowUsedVisiblePartQueue { get; private set; }
         public bool LastShadowUsedVisibleInstanceQueue { get; private set; }
         public bool LastShadowUsedFusedBatch { get; private set; }
+        public bool LastShadowUsedHierarchyQueue { get; private set; }
+        public bool LastShadowUsedSpatialHierarchy { get; private set; }
         public ComputeBuffer VisibleDrawClusterBuffer => visibleDrawClusterAppendBuffer;
         public ComputeBuffer VisibleDrawCountArgsBuffer => visibleDrawCountArgsBuffer;
+        public ComputeBuffer HardwareRasterClusterBuffer => hardwareRasterClusterAppendBuffer;
+        public ComputeBuffer SoftwareRasterClusterBuffer => softwareRasterClusterAppendBuffer;
+        public ComputeBuffer HardwareRasterCountArgsBuffer => hardwareRasterCountArgsBuffer;
+        public ComputeBuffer SoftwareRasterCountArgsBuffer => softwareRasterCountArgsBuffer;
+        public ComputeBuffer SoftwareRasterDispatchArgsBuffer => softwareRasterDispatchArgsBuffer;
         public ComputeBuffer GetShadowDrawClusterBuffer(int cascadeIndex) =>
             cascadeIndex >= 0 && cascadeIndex < kMaxShadowCascades
                 ? shadowDrawClusterAppendBuffers[cascadeIndex]
@@ -1774,11 +3145,45 @@ namespace Nanite
             lastVisibleDrawCameraId == camera.GetInstanceID() &&
             visibleDrawClusterAppendBuffer != null &&
             visibleDrawCountArgsBuffer != null;
+        public bool IsTraversalRasterBinQueueReady(Camera camera) =>
+            EnableTraversalRasterBins &&
+            camera != null &&
+            lastTraversalRasterBinsFrame == Time.frameCount &&
+            lastTraversalRasterBinsCameraId == camera.GetInstanceID() &&
+            kernelFinalizeRasterBinArgs >= 0 &&
+            IsVisibleDrawQueueReady(camera) &&
+            hardwareRasterClusterAppendBuffer != null &&
+            softwareRasterClusterAppendBuffer != null &&
+            hardwareRasterCountArgsBuffer != null &&
+            softwareRasterCountArgsBuffer != null &&
+            softwareRasterDispatchArgsBuffer != null;
+        // RenderGraph records consumers before the cull pass executes. This is
+        // the record-time contract: the configured production path owns valid
+        // queue resources and will populate them before a dependent consumer.
+        // IsTraversalRasterBinQueueReady remains the execution-time diagnostic.
+        public bool CanRecordTraversalRasterBinQueue =>
+            EnableTraversalRasterBins &&
+            kernelClusterCullVisibleParts >= 0 &&
+            kernelFinalizeVisiblePartDispatch >= 0 &&
+            kernelFinalizeRasterBinArgs >= 0 &&
+            PreferPartDrivenClusterCull &&
+            partCount >= Mathf.Max(1, PartQueueMinVirtualParts) &&
+            sceneClusterFirstTriBuffer != null &&
+            sceneClusterTriCountBuffer != null &&
+            visibleDrawClusterAppendBuffer != null &&
+            visibleDrawCountArgsBuffer != null &&
+            hardwareRasterClusterAppendBuffer != null &&
+            softwareRasterClusterAppendBuffer != null &&
+            hardwareRasterCountArgsBuffer != null &&
+            softwareRasterCountArgsBuffer != null &&
+            softwareRasterDispatchArgsBuffer != null;
         public int LastClusterCandidateCount { get; private set; }
         public int LastClusterCount { get; private set; }
         public int LastCull1Drawn { get; private set; }
         public int LastCull2Candidates { get; private set; }
         public int LastCull2Drawn { get; private set; }
+        public int LastCullStatsReadbackFrame { get; private set; } = -1;
+        public int LastCullStatsCameraId { get; private set; }
 
         static int ComputeRebuildSignature(IReadOnlyList<NaniteRuntimeProxy> proxies)
         {
@@ -2004,8 +3409,23 @@ namespace Nanite
                 kernelClusterCullVisibleParts = shader.FindKernel("CSClusterCullVisibleParts");
                 kernelInstanceCull = shader.FindKernel("CSInstanceCull");
                 kernelPartCullVisibleInstances = shader.FindKernel("CSPartCullVisibleInstances");
+                kernelSeedSpatialRoots = shader.FindKernel("CSSeedSpatialRoots");
+                kernelTraverseSpatialNodes = shader.FindKernel("CSTraverseSpatialNodes");
+                kernelUpdateHierarchyGroupResidency = shader.FindKernel("CSUpdateHierarchyGroupResidency");
+                kernelSeedHierarchyRoots = shader.FindKernel("CSSeedHierarchyRoots");
+                kernelFinalizeHierarchyDispatch = shader.FindKernel("CSFinalizeHierarchyDispatch");
+                kernelTraverseHierarchy = shader.FindKernel("CSTraverseHierarchy");
+                kernelClearHierarchyPersistent = shader.FindKernel("CSClearHierarchyPersistent");
+                kernelSeedHierarchyPersistent = shader.FindKernel("CSSeedHierarchyPersistent");
+                kernelTraverseHierarchyPersistent = shader.FindKernel("CSTraverseHierarchyPersistent");
+                kernelSeedShadowHierarchyPersistent = shader.FindKernel("CSSeedShadowHierarchyPersistent");
+                kernelTraverseShadowHierarchyPersistent = shader.FindKernel("CSTraverseShadowHierarchyPersistent");
                 try { kernelShadowCullMultiCascadeByPart = shader.FindKernel("CSShadowCullMultiCascadeByPart"); }
                 catch { kernelShadowCullMultiCascadeByPart = -1; }
+                try { kernelSeedShadowSpatialRoots = shader.FindKernel("CSSeedShadowSpatialRoots"); }
+                catch { kernelSeedShadowSpatialRoots = -1; }
+                try { kernelTraverseShadowSpatialNodes = shader.FindKernel("CSTraverseShadowSpatialNodes"); }
+                catch { kernelTraverseShadowSpatialNodes = -1; }
                 try
                 {
                     kernelClearClusterVisible = shader.FindKernel("CSClearClusterVisible");
@@ -2019,6 +3439,8 @@ namespace Nanite
                 catch { kernelClearSecondPassCandidates = -1; }
                 try { kernelCopyUintBuffer = shader.FindKernel("CSCopyUintBuffer"); }
                 catch { kernelCopyUintBuffer = -1; }
+                try { kernelFinalizeRasterBinArgs = shader.FindKernel("CSFinalizeRasterBinArgs"); }
+                catch { kernelFinalizeRasterBinArgs = -1; }
                 try { kernelClearCullStats = shader.FindKernel("CSClearCullStats"); }
                 catch { kernelClearCullStats = -1; }
                 try { kernelOrMasksToVisible = shader.FindKernel("CSOrMasksToVisible"); }
@@ -2034,16 +3456,46 @@ namespace Nanite
 
         void ReleaseBuffers()
         {
+            cullStatsReadbackEpoch++;
+            cullStatsReadbackPending = false;
             partsBuffer?.Release();
             clustersBuffer?.Release();
             virtualPartsBuffer?.Release();
             virtualClustersBuffer?.Release();
+            spatialNodesBuffer?.Release();
+            spatialPartRefsBuffer?.Release();
+            hierarchyGroupsBuffer?.Release();
+            hierarchyClusterRefsBuffer?.Release();
+            hierarchyGroupResidencyBuffer?.Release();
+            hierarchyResidencyRefsBuffer?.Release();
+            hierarchyRootGroupsBuffer?.Release();
+            hierarchyPersistentWorkBuffer?.Release();
+            shadowHierarchyPersistentWorkBuffer?.Release();
+            for (int hierarchyQueueIndex = 0; hierarchyQueueIndex < 2; hierarchyQueueIndex++)
+            {
+                hierarchyQueues[hierarchyQueueIndex]?.Release();
+                hierarchyDispatchArgs[hierarchyQueueIndex]?.Release();
+                hierarchyQueues[hierarchyQueueIndex] = null;
+                hierarchyDispatchArgs[hierarchyQueueIndex] = null;
+            }
+            for (int queueIndex = 0; queueIndex < 2; queueIndex++)
+            {
+                shadowSpatialQueues[queueIndex]?.Release();
+                shadowSpatialDispatchArgs[queueIndex]?.Release();
+                shadowSpatialQueues[queueIndex] = null;
+                shadowSpatialDispatchArgs[queueIndex] = null;
+            }
             visiblePartAppendBuffer?.Release();
             visiblePartDispatchArgsBuffer?.Release();
             visibleInstanceAppendBuffer?.Release();
             visibleInstancePartDispatchArgsBuffer?.Release();
             visibleDrawClusterAppendBuffer?.Release();
             visibleDrawCountArgsBuffer?.Release();
+            hardwareRasterClusterAppendBuffer?.Release();
+            softwareRasterClusterAppendBuffer?.Release();
+            hardwareRasterCountArgsBuffer?.Release();
+            softwareRasterCountArgsBuffer?.Release();
+            softwareRasterDispatchArgsBuffer?.Release();
             for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
             {
                 shadowDrawClusterAppendBuffers[cascadeIndex]?.Release();
@@ -2070,12 +3522,26 @@ namespace Nanite
             clustersBuffer = null;
             virtualPartsBuffer = null;
             virtualClustersBuffer = null;
+            spatialNodesBuffer = null;
+            spatialPartRefsBuffer = null;
+            hierarchyGroupsBuffer = null;
+            hierarchyClusterRefsBuffer = null;
+            hierarchyGroupResidencyBuffer = null;
+            hierarchyResidencyRefsBuffer = null;
+            hierarchyRootGroupsBuffer = null;
+            hierarchyPersistentWorkBuffer = null;
+            shadowHierarchyPersistentWorkBuffer = null;
             visiblePartAppendBuffer = null;
             visiblePartDispatchArgsBuffer = null;
             visibleInstanceAppendBuffer = null;
             visibleInstancePartDispatchArgsBuffer = null;
             visibleDrawClusterAppendBuffer = null;
             visibleDrawCountArgsBuffer = null;
+            hardwareRasterClusterAppendBuffer = null;
+            softwareRasterClusterAppendBuffer = null;
+            hardwareRasterCountArgsBuffer = null;
+            softwareRasterCountArgsBuffer = null;
+            softwareRasterDispatchArgsBuffer = null;
             partVisibleBuffer = null;
             visibleClusterAppendBuffer = null;
             visibleCountBuffer = null;
@@ -2087,6 +3553,7 @@ namespace Nanite
             scenePageRequestBuffer = null;
             scenePageCount = 0;
             sceneTrackPageUsage = false;
+            sceneAllPagesResident = true;
             instanceDataBuffer = null;
             instanceVisibleBuffer = null;
             fallbackClusterVisibleBuffer = null;
@@ -2094,6 +3561,11 @@ namespace Nanite
             fallbackSecondPassBuffer = null;
             fallbackPass2DrawnBuffer = null;
             cullStatsBuffer = null;
+            hierarchyReady = false;
+            hierarchyTraversalPassCount = 0;
+            hierarchyPersistentCapacity = 0;
+            spatialReady = false;
+            spatialTraversalPassCount = 0;
             lastShadowDrawQueueFrame = -1;
             lastShadowDrawCameraId = 0;
             lastShadowDrawCascadeMask = 0;

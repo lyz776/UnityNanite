@@ -10,6 +10,8 @@ namespace Nanite
     {
         [Header("Versioned Page Payload")]
         [SerializeField] TextAsset binaryPayload;
+        [SerializeField] int binaryPayloadOffset;
+        [SerializeField] int binaryPayloadSize;
         [SerializeField] NanitePageBinaryStats binaryStats;
 
         [Header("Legacy Compatibility Payload")]
@@ -70,6 +72,10 @@ namespace Nanite
         }
 
         public TextAsset BinaryPayload => binaryPayload;
+        public int BinaryPayloadOffset => Mathf.Max(0, binaryPayloadOffset);
+        public int BinaryPayloadSize => binaryPayloadSize > 0
+            ? binaryPayloadSize
+            : (binaryPayload != null ? binaryPayload.bytes.Length : 0);
         public NanitePageBinaryStats BinaryStats => binaryStats;
         public bool HasBinaryPayload => binaryPayload != null;
 
@@ -82,11 +88,66 @@ namespace Nanite
             decodedVertexData != null && decodedVertexData.Length > 0 &&
             decodedIndices != null && decodedIndices.Length > 0;
 
-        public void SetBinaryPayload(TextAsset payload, NanitePageBinaryStats stats)
+        public void SetBinaryPayload(
+            TextAsset payload,
+            NanitePageBinaryStats stats,
+            int payloadOffset = 0,
+            int payloadSize = -1)
         {
             binaryPayload = payload;
+            binaryPayloadOffset = Mathf.Max(0, payloadOffset);
+            binaryPayloadSize = payloadSize > 0
+                ? payloadSize
+                : (payload != null ? payload.bytes.Length : 0);
             binaryStats = stats;
             ResetDecodeState();
+        }
+
+        public bool TryGetStoragePayload(out byte[] storagePayload, out string error)
+        {
+            storagePayload = null;
+            if (binaryPayload == null)
+            {
+                error = "Page has no binary payload.";
+                return false;
+            }
+
+            byte[] bulk = binaryPayload.bytes;
+            if (!TryResolveStorageRange(bulk, out int offset, out int size, out error))
+                return false;
+
+            if (offset == 0 && size == bulk.Length)
+            {
+                storagePayload = bulk;
+                error = null;
+                return true;
+            }
+
+            storagePayload = new byte[size];
+            Buffer.BlockCopy(bulk, offset, storagePayload, 0, size);
+            error = null;
+            return true;
+        }
+
+        public bool TryResolveStorageRange(
+            byte[] bulkPayload,
+            out int offset,
+            out int size,
+            out string error)
+        {
+            offset = Mathf.Max(0, binaryPayloadOffset);
+            size = binaryPayloadSize > 0
+                ? binaryPayloadSize
+                : (bulkPayload != null ? bulkPayload.Length : 0);
+            if (bulkPayload == null || offset < 0 || size <= 0 ||
+                offset > bulkPayload.Length - size)
+            {
+                int bulkSize = bulkPayload != null ? bulkPayload.Length : 0;
+                error = $"Page payload range [{offset}, {offset + size}) exceeds bulk size {bulkSize}.";
+                return false;
+            }
+            error = null;
+            return true;
         }
 
         public bool TryDecodeBinaryPayload(out NanitePageDecodedData decoded, out string error)
@@ -97,8 +158,9 @@ namespace Nanite
                 error = "Page has no binary payload.";
                 return false;
             }
-
-            if (!NanitePageStorageCodec.TryUnpack(binaryPayload.bytes, out byte[] packedPage, out error))
+            byte[] bulk = binaryPayload.bytes;
+            if (!TryResolveStorageRange(bulk, out int offset, out int size, out error) ||
+                !NanitePageStorageCodec.TryUnpack(bulk, offset, size, out byte[] packedPage, out error))
                 return false;
             return NanitePageBinaryCodec.TryDecode(packedPage, out decoded, out error);
         }

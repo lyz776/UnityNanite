@@ -1,4 +1,5 @@
 #pragma kernel CSTileClassify
+#pragma kernel CSClearTileBins
 #pragma multi_compile _ NANITE_COMPACT_VBUFFER
 
 // 每 group 处理一个 tile；64 线程并行扫像素并用 groupshared 归约 mask。
@@ -11,8 +12,26 @@ Texture2D<float4> _NaniteVBufferTex;
 #endif
 StructuredBuffer<int> _TriangleSubMesh;
 StructuredBuffer<int> _InstanceSubMeshMaterial;
+StructuredBuffer<uint2> _InstanceMaterialRange;
+struct NaniteMaterialData
+{
+    float4 baseColor;
+    float4 emissionColor;
+    float4 baseMapST;
+    float4 surface0;
+    float4 surface1;
+    float4 surface2;
+    float4 feature0;
+};
+StructuredBuffer<NaniteMaterialData> _NaniteMaterialData;
 
-RWStructuredBuffer<uint> _TileMaterialMask;
+// x stores exact shader-family bits. y is a compatibility-bin Bloom mask; collisions
+// only admit extra resolve tiles because the fragment shader compares the exact bin.
+RWStructuredBuffer<uint2> _TileMaterialMask;
+// 0..31: shader-family bins, 32..63: compatibility Bloom bins.
+// Each bin owns a compact tile range and one DrawProceduralIndirect record.
+RWStructuredBuffer<uint> _TileMaterialBinList;
+RWStructuredBuffer<uint> _TileMaterialBinArgs;
 
 int _MaxSubMeshCount;
 int _TriangleCount;
@@ -20,36 +39,72 @@ int _InstanceCount;
 int _MaterialCount;
 int _TileCountX;
 int _TileCountY;
+int _TileCount;
 int _TileSize;
 int _UseNormalizedIds;
 int2 _ScreenSize;
 
-groupshared uint gsTileMask;
+groupshared uint gsFamilyMask;
+groupshared uint gsMaterialBloom;
+
+static const uint TILE_BIN_COUNT = 64u;
+
+[numthreads(64, 1, 1)]
+void CSClearTileBins(uint3 id : SV_DispatchThreadID)
+{
+    uint bin = id.x;
+    if (bin >= TILE_BIN_COUNT)
+        return;
+    uint argsBase = bin * 4u;
+    _TileMaterialBinArgs[argsBase + 0u] = 6u;
+    _TileMaterialBinArgs[argsBase + 1u] = 0u;
+    _TileMaterialBinArgs[argsBase + 2u] = 0u;
+    _TileMaterialBinArgs[argsBase + 3u] = 0u;
+}
+
+void AppendTileToBins(uint mask, uint binBase, uint tileIndex)
+{
+    while (mask != 0u)
+    {
+        uint bit = firstbitlow(mask);
+        uint bin = binBase + bit;
+        uint compactIndex;
+        InterlockedAdd(_TileMaterialBinArgs[bin * 4u + 1u], 1u, compactIndex);
+        if (compactIndex < (uint)_TileCount)
+            _TileMaterialBinList[bin * (uint)_TileCount + compactIndex] = tileIndex;
+        mask &= mask - 1u;
+    }
+}
 
 #if defined(NANITE_COMPACT_VBUFFER)
-uint DecodeMaterialBit(uint2 encoded)
+uint2 DecodeMaterialBits(uint2 encoded)
 {
     if (encoded.x == 0u || encoded.y == 0u)
-        return 0u;
+        return 0u.xx;
 
     int instanceId = (int)(encoded.x - 1u);
     int triangleId = (int)(encoded.y - 1u);
     if (instanceId < 0 || instanceId >= _InstanceCount || triangleId < 0 || triangleId >= _TriangleCount)
-        return 0u;
+        return 0u.xx;
 
+    uint2 materialRange = _InstanceMaterialRange[instanceId];
     int subMeshId = _TriangleSubMesh[triangleId];
-    subMeshId = clamp(subMeshId, 0, max(0, _MaxSubMeshCount - 1));
-    int materialId = _InstanceSubMeshMaterial[instanceId * _MaxSubMeshCount + subMeshId];
-    if (materialId < 0 || materialId >= _MaterialCount || materialId >= 32)
-        return 0u;
-
-    return 1u << materialId;
+    subMeshId = clamp(subMeshId, 0, max(0, (int)materialRange.y - 1));
+    int materialId = _InstanceSubMeshMaterial[materialRange.x + (uint)subMeshId];
+    if (materialId < 0 || materialId >= _MaterialCount)
+        return 0u.xx;
+    NaniteMaterialData materialData = _NaniteMaterialData[materialId];
+    int familyId = (int)round(materialData.feature0.z);
+    int compatibilityBin = (int)round(materialData.feature0.w);
+    return uint2(
+        familyId > 0 && familyId < 32 ? (1u << familyId) : 0u,
+        compatibilityBin > 0 ? (1u << ((uint)compatibilityBin & 31u)) : 0u);
 }
 #else
-uint DecodeMaterialBit(float4 encoded)
+uint2 DecodeMaterialBits(float4 encoded)
 {
     if (encoded.y <= 0.0 || encoded.z <= 0.0)
-        return 0u;
+        return 0u.xx;
 
     int instanceId = -1;
     int triangleId = -1;
@@ -74,15 +129,20 @@ uint DecodeMaterialBit(float4 encoded)
     }
 
     if (instanceId < 0 || instanceId >= _InstanceCount || triangleId < 0 || triangleId >= _TriangleCount)
-        return 0u;
+        return 0u.xx;
 
+    uint2 materialRange = _InstanceMaterialRange[instanceId];
     int subMeshId = _TriangleSubMesh[triangleId];
-    subMeshId = clamp(subMeshId, 0, max(0, _MaxSubMeshCount - 1));
-    int materialId = _InstanceSubMeshMaterial[instanceId * _MaxSubMeshCount + subMeshId];
-    if (materialId < 0 || materialId >= _MaterialCount || materialId >= 32)
-        return 0u;
-
-    return 1u << materialId;
+    subMeshId = clamp(subMeshId, 0, max(0, (int)materialRange.y - 1));
+    int materialId = _InstanceSubMeshMaterial[materialRange.x + (uint)subMeshId];
+    if (materialId < 0 || materialId >= _MaterialCount)
+        return 0u.xx;
+    NaniteMaterialData materialData = _NaniteMaterialData[materialId];
+    int familyId = (int)round(materialData.feature0.z);
+    int compatibilityBin = (int)round(materialData.feature0.w);
+    return uint2(
+        familyId > 0 && familyId < 32 ? (1u << familyId) : 0u,
+        compatibilityBin > 0 ? (1u << ((uint)compatibilityBin & 31u)) : 0u);
 }
 #endif
 
@@ -90,7 +150,10 @@ uint DecodeMaterialBit(float4 encoded)
 void CSTileClassify(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, uint groupIndex : SV_GroupIndex)
 {
     if (groupIndex == 0)
-        gsTileMask = 0u;
+    {
+        gsFamilyMask = 0u;
+        gsMaterialBloom = 0u;
+    }
     GroupMemoryBarrierWithGroupSync();
 
     uint tileX = groupId.x;
@@ -118,9 +181,11 @@ void CSTileClassify(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupTh
                 #else
                 float4 encoded = _NaniteVBufferTex.Load(int3(px, py, 0));
                 #endif
-                uint bit = DecodeMaterialBit(encoded);
-                if (bit != 0u)
-                    InterlockedOr(gsTileMask, bit);
+                uint2 bits = DecodeMaterialBits(encoded);
+                if (bits.x != 0u)
+                    InterlockedOr(gsFamilyMask, bits.x);
+                if (bits.y != 0u)
+                    InterlockedOr(gsMaterialBloom, bits.y);
             }
         }
     }
@@ -129,6 +194,8 @@ void CSTileClassify(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupTh
     if (groupIndex == 0 && tileX < (uint)_TileCountX && tileY < (uint)_TileCountY)
     {
         uint tileIndex = tileY * (uint)_TileCountX + tileX;
-        _TileMaterialMask[tileIndex] = gsTileMask;
+        _TileMaterialMask[tileIndex] = uint2(gsFamilyMask, gsMaterialBloom);
+        AppendTileToBins(gsFamilyMask, 0u, tileIndex);
+        AppendTileToBins(gsMaterialBloom, 32u, tileIndex);
     }
 }

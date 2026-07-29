@@ -59,7 +59,7 @@
 在 **`Native\API_CPP`** 打开终端（PowerShell / cmd），把 `MESHOPT_SRC_DIR` 改成你机器上真实的 `src` 路径：
 
 ```bat
-cmake -B build -A x64 -DMESHOPT_SRC_DIR="C:/Users/lyz20/Downloads/meshoptimizer-master/meshoptimizer-master/src"
+cmake -B build -A x64 -DMESHOPT_SRC_DIR="../meshoptimizer/src"
 cmake --build build --config Release
 ```
 

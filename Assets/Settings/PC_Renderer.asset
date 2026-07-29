@@ -71,10 +71,10 @@ MonoBehaviour:
   m_Active: 1
   settings:
     enable: 1
-    useHzbCulling: 0
+    useHzbCulling: 1
     adaptiveHzbCulling: 1
     hzbMinClusterCount: 50000
-    usePreviousHzbOnFirstCull: 0
+    usePreviousHzbOnFirstCull: 1
     useBvhCandidates: 1
     cpuBvhMaxInstances: 0
     gpuPartQueueMinVirtualParts: 4096
@@ -92,19 +92,19 @@ MonoBehaviour:
     enableVBufferPreview: 0
     vbufferPreviewMaxPackets: 1
     enableDebugVisualization: 0
-    debugVisualizationMode: 0
+    debugVisualizationMode: 1
     debugVisualizationEvent: 300
     enableFormalVisibilityBuffer: 1
     enableFormalVisibilityBufferExperimentalGate: 1
     enableCompactFormalVBuffer: 1
     enableMaterialTileCulling: 1
     adaptiveMaterialTileCulling: 1
-    materialTileMinMaterialCount: 3
+    materialTileMinMaterialCount: 2
     lightProbeRefreshInterval: 30
     enablePackedPageRaster: 1
     enablePackedDirectDiagnostic: 0
     pageTranscodeShader: {fileID: 7200000, guid: e938f09d1f514e858d563e6c617dd30c, type: 3}
-    enablePageStreamingUploads: 0
+    enablePageStreamingUploads: 1
     pagePoolMaxMiB: 128
     pageRequestReadbackInterval: 3
     pageUploadsPerPoll: 8
@@ -113,7 +113,8 @@ MonoBehaviour:
     hzbMinMipSize: 8
     formalVBufferHalfResolution: 0
     enableFormalDepthFill: 0
-    formalRasterizationMode: 0
+    formalRasterizationMode: 1
+    hybridSoftwareMaxEdgePixels: 16
     hzbBuilderShader: {fileID: 7200000, guid: e677b32b9bb91d5459df6f43266960bb, type: 3}
     gpuCullingShader: {fileID: 7200000, guid: 9012562cbcf8b78478343750791f57bf, type: 3}
     materialTileClassifyShader: {fileID: 7200000, guid: cbfa3d75757ac4346b6c3757d17ef570, type: 3}

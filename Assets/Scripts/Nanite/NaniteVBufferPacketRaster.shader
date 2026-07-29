@@ -214,7 +214,11 @@ Shader "Nanite/VBufferPacketRaster"
                     uint geometryVertexCount = (uint)_GeometryVertexCount;
                     int instance = (int)(input.vertexID / geometryVertexCount);
                     int logicalVertex = (int)(input.vertexID % geometryVertexCount);
-                    float3 posOS = DecodePositionOS(logicalVertex);
+                    float3 posOS;
+                    if (NaniteUsePackedPageGeometry())
+                        posOS = _NaniteResidentVertices[logicalVertex].positionOS;
+                    else
+                        posOS = DecodePositionOS(logicalVertex);
                     float3 posWS = mul(_InstanceLocalToWorld[instance], float4(posOS, 1.0)).xyz;
                     o.positionCS = TransformWorldToHClip(posWS);
                     o.packedInstance = (float)instance;
@@ -457,6 +461,94 @@ Shader "Nanite/VBufferPacketRaster"
             #endif
                 float shade = lerp(1.0, 0.55, saturate(depth01));
                 return float4(rgb * shade, 1.0);
+            }
+            ENDHLSL
+        }
+
+        // Unity does not expose SM 6.6 64-bit typed UAV atomics through
+        // ShaderLab. The async software rasterizer therefore produces an
+        // independent depth/winner pair. The merge draws only software-covered
+        // tiles and uses the fixed-function depth test to combine both paths while
+        // preserving the exact compact VBuffer ABI consumed by resolve.
+        Pass
+        {
+            Name "HybridSoftwareMerge"
+            Cull Off
+            ZTest LEqual
+            ZWrite On
+            Blend Off
+
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma vertex vertHybridTiles
+            #pragma fragment fragHybridMerge
+
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+            Texture2D<uint> _NaniteSoftwareDepth;
+            Texture2D<uint> _NaniteSoftwareWinner;
+            StructuredBuffer<uint3> _NaniteSoftwareClusters;
+            StructuredBuffer<uint> _NaniteSoftwareTileList;
+            uint _NaniteSoftwareScreenWidth;
+            uint _NaniteSoftwareScreenHeight;
+            uint _NaniteSoftwareTileCountX;
+            uint _NaniteSoftwareTileSize;
+
+            struct Attributes
+            {
+                uint vertexID : SV_VertexID;
+                uint instanceID : SV_InstanceID;
+            };
+
+            struct Varyings
+            {
+                float4 positionCS : SV_POSITION;
+            };
+
+            Varyings vertHybridTiles(Attributes input)
+            {
+                Varyings output;
+                uint tileIndex = _NaniteSoftwareTileList[input.instanceID];
+                uint tileCountX = max(1u, _NaniteSoftwareTileCountX);
+                uint2 tileCoord = uint2(tileIndex % tileCountX, tileIndex / tileCountX);
+                uint cornerIndex = input.vertexID % 6u;
+                float2 corner = float2(
+                    (cornerIndex == 1u || cornerIndex >= 4u) ? 1.0 : 0.0,
+                    (cornerIndex == 2u || cornerIndex == 3u || cornerIndex == 5u) ? 1.0 : 0.0);
+                float tileSize = max(1.0, (float)_NaniteSoftwareTileSize);
+                float2 screenSize = max(
+                    float2(_NaniteSoftwareScreenWidth, _NaniteSoftwareScreenHeight),
+                    1.0.xx);
+                float2 pixelMin = float2(tileCoord) * tileSize;
+                float2 pixelMax = min(pixelMin + tileSize, screenSize);
+                float2 uv = lerp(pixelMin, pixelMax, corner) / screenSize;
+                float2 ndc = uv * 2.0 - 1.0;
+                ndc.y = -ndc.y;
+                output.positionCS = float4(ndc, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
+                return output;
+            }
+
+            uint2 fragHybridMerge(Varyings input, out float outputDepth : SV_Depth) : SV_Target
+            {
+                uint2 pixel = uint2(input.positionCS.xy);
+                if (pixel.x >= _NaniteSoftwareScreenWidth ||
+                    pixel.y >= _NaniteSoftwareScreenHeight)
+                    discard;
+
+                uint packedWinner = _NaniteSoftwareWinner.Load(int3(pixel, 0));
+                if (packedWinner == 0u)
+                    discard;
+
+                uint payload = packedWinner - 1u;
+                uint softwareClusterIndex = payload >> 7u;
+                uint triangleInCluster = payload & 127u;
+                uint3 draw = _NaniteSoftwareClusters[softwareClusterIndex];
+                if (triangleInCluster >= draw.y)
+                    discard;
+
+                outputDepth = asfloat(_NaniteSoftwareDepth.Load(int3(pixel, 0)));
+                uint triangleId = draw.x + triangleInCluster;
+                return uint2(draw.z + 1u, triangleId + 1u);
             }
             ENDHLSL
         }

@@ -543,7 +543,10 @@ namespace Nanite
                         if (page == null || page.clusterArray == null || vr.clusterIndex < 0 || vr.clusterIndex >= page.clusterArray.Length)
                             continue;
 
-                        Vector4 s = TransformSphere(page.clusterArray[vr.clusterIndex].selfSphere, maxScale);
+                        NaniteCluster cluster = page.clusterArray[vr.clusterIndex];
+                        Vector4 s = TransformSphere(
+                            cluster.geometrySphere.w > 0f ? cluster.geometrySphere : cluster.selfSphere,
+                            maxScale);
                         Gizmos.DrawWireSphere(new Vector3(s.x, s.y, s.z), s.w * boundsSphereScale);
                     }
                 }
@@ -557,7 +560,10 @@ namespace Nanite
 
                         for (int i = 0; i < page.clusterArray.Length; i++)
                         {
-                            Vector4 s = TransformSphere(page.clusterArray[i].selfSphere, maxScale);
+                            NaniteCluster cluster = page.clusterArray[i];
+                            Vector4 s = TransformSphere(
+                                cluster.geometrySphere.w > 0f ? cluster.geometrySphere : cluster.selfSphere,
+                                maxScale);
                             Gizmos.DrawWireSphere(new Vector3(s.x, s.y, s.z), s.w * boundsSphereScale);
                         }
                     }
