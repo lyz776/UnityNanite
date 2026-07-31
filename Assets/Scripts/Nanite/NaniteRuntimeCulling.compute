@@ -23,9 +23,12 @@
 #pragma kernel CSClearCullStats
 #pragma kernel CSOrMasksToVisible
 #pragma kernel CSFinalizeRasterBinArgs
+#pragma kernel CSRecoverHzbRejectedClusters
 #pragma kernel CSShadowCullMultiCascadeByPart
 #pragma kernel CSSeedShadowSpatialRoots
 #pragma kernel CSTraverseShadowSpatialNodes
+#pragma kernel CSSeedShadowHierarchyRoots
+#pragma kernel CSTraverseShadowHierarchy
 
 // CullPassMode:
 // 0 = legacy full frustum/LOD cut with optional HZB
@@ -44,6 +47,7 @@ struct GpuPartData
     int clusterCount;
     int instanceIndex;
     uint lodFlags;
+    uint consumerGroupIndex;
 };
 
 struct GpuClusterData
@@ -71,7 +75,7 @@ struct GpuClusterData
 // at the authored pixel threshold, but use the same conservative two-texel
 // shadow target as a raster-specific LOD bias. This is independent per cascade
 // because ShadowProjectionScale already contains that cascade's texel density.
-#define SHADOW_LOD_MIN_TEXELS 2.0
+float _ShadowLodMinTexels;
 
 StructuredBuffer<GpuPartData> _Parts;
 StructuredBuffer<GpuClusterData> _Clusters;
@@ -79,12 +83,19 @@ StructuredBuffer<GpuClusterData> _Clusters;
 // Each virtual reference is only uint4(instance, geometryIndex, relation/range).
 StructuredBuffer<uint4> _VirtualParts;
 StructuredBuffer<uint4> _VirtualClusters;
+// One immutable Page-table address per unique geometry cluster. Production
+// queues carry (instance, geometryCluster), so residency must not recover the
+// Page through an instance-expanded virtual-cluster record.
+StructuredBuffer<uint> _GeometryClusterPageIndex;
 // Part cull writes this mask while cluster cull only reads it. Splitting the
 // declarations removes one otherwise unnecessary UAV from cluster kernels.
 StructuredBuffer<uint> _PartVisible;
 RWStructuredBuffer<uint> _PartVisibleWrite;
-AppendStructuredBuffer<uint> _VisiblePartsOut;
-StructuredBuffer<uint> _VisiblePartsIn;
+// Production traversal carries (instance, immutable geometry Part). This is
+// the same indirection used by NVIDIA's render-cluster list and avoids a full
+// instance x Part expansion in the hot queue.
+AppendStructuredBuffer<uint2> _VisiblePartsOut;
+StructuredBuffer<uint2> _VisiblePartsIn;
 // The finalize kernel writes these args, while indirect cluster cull only reads
 // them. Keeping both views separate prevents the read-only cluster kernel from
 // consuming an unnecessary UAV slot on D3D12 (Windows Player supports eight).
@@ -104,6 +115,9 @@ struct GpuHierarchyGroup
     uint coarseClusterCount;
     uint mipLevel;
     uint flags;
+    uint fineTriangleCount;
+    uint coarseTriangleCount;
+    float fineSurfaceArea;
 };
 struct GpuSpatialNode
 {
@@ -158,6 +172,9 @@ StructuredBuffer<uint> _SceneClusterTriCount;
 StructuredBuffer<uint> _PrevClusterVisible;
 RWStructuredBuffer<uint> _SecondPassCandidates;
 RWStructuredBuffer<uint> _Pass2Drawn;
+AppendStructuredBuffer<uint3> _HzbRejectedClustersOut; // geometryCluster, instance, sceneCluster
+StructuredBuffer<uint3> _HzbRejectedClusters;
+StructuredBuffer<uint> _HzbRejectedDispatchArgs;
 StructuredBuffer<uint> _UintCopySrc;
 RWStructuredBuffer<uint> _UintCopyDst;
 RWStructuredBuffer<uint> _CullStats; // [0]=pass1Drawn [1]=pass2Candidates [2]=pass2Drawn
@@ -181,6 +198,7 @@ int _EnableVisibleDrawAppend;
 int _EnableRasterBins;
 float _SoftwareRasterThresholdPixels;
 int _EnableClusterVisibleWrite;
+int _EnableClusterBackfaceCull;
 int _SceneClusterCount;
 int _CullPassMode;
 int _HasPrevVisible;
@@ -201,6 +219,8 @@ struct GpuInstanceData
     uint partOffset;
     uint partCount;
     uint clusterOffset;
+    uint geometryPartOffset;
+    uint geometryClusterOffset;
     uint hierarchyRootOffset;
     uint hierarchyRootCount;
     uint hierarchyFlags;
@@ -214,16 +234,31 @@ struct GpuInstanceData
 };
 
 float4 _FrustumPlanes[6];
-float4 _ShadowFrustumPlanes[24];
+// ComputeDirectionalShadowMatricesAndCullingPrimitives supplies caster culling
+// planes, which are not equivalent to planes reconstructed from the receiver
+// projection. Up to ten planes are supported per Unity ShadowSplitData.
+float4 _ShadowCasterPlanes[40];
+float4 _ShadowCasterPlaneCounts;
+float4 _ShadowCullingSpheres[4];
 int _ShadowCascadeCount;
 StructuredBuffer<GpuInstanceData> _Instances;
 RWStructuredBuffer<uint> _InstanceVisible;
 
 float4 _CameraPos;
+float4 _CameraForward;
+float4 _ProjectionNdcScale;
 float _ProjectionScale;
 float _OrthographicLodScale;
 float _ZNear;
 float4x4 _WorldToClip;
+// HZB sampling has its own view contract. Pass 1 samples the previous-frame
+// pyramid with the previous-frame view, while frustum/LOD selection continues
+// to use the current camera above. Pass 2 samples current depth/current view.
+float4 _HzbCameraPos;
+float4 _HzbCameraForward;
+float4 _HzbProjectionNdcScale;
+float _HzbZNear;
+float4x4 _HzbWorldToClip;
 float4 _ScreenSize;
 float4 _ShadowProjectionScales;
 float4 _ShadowRayDirection;
@@ -286,7 +321,10 @@ float ProjectedError(float error, float4 sphere, int instanceIndex)
     // 屏幕空间投影「直径」像素（Bevy/Nanite 常用 diameter < ~1px 作为 imperceptible）。
     // 此前按半径估会偏保守 → 远处残留过多 cluster。
     float dist = max(length(sphere.xyz - _CameraPos.xyz) - sphere.w, _ZNear);
-    return (2.0 * worldError * _ProjectionScale) / dist;
+    // _ProjectionScale already contains screenHeight * cot(fov/2) * 0.5.
+    // This is the clusterlod projected-error equation; an extra diameter
+    // factor delays every transition and leaves remote geometry over-dense.
+    return (worldError * _ProjectionScale) / dist;
 }
 
 // Bevy: lod_error_is_imperceptible — 误差球屏幕投影 ≤ threshold。
@@ -318,56 +356,175 @@ float ProjectedDiameterPixels(float4 sphere)
     return (2.0 * sphere.w * _ProjectionScale) / dist;
 }
 
-float DecodeConeSnorm8(uint value)
+bool RootGroupVisibleForCamera(GpuHierarchyGroup group, int instanceIndex)
 {
-    int signedValue = (int)(value << 24u) >> 24;
-    return max(-1.0, (float)signedValue / 127.0);
+    float4 sphere = TransformSphere(group.boundingSphere, instanceIndex);
+    // Root membership is atomic.  Culling individual terminal meshlets opens
+    // holes; culling the complete root producer once its bound is sub-pixel is
+    // both conservative and lets the distance curve reach zero eventually.
+    return SphereVisible(sphere) &&
+        ProjectedDiameterPixels(sphere) > TERMINAL_DISAPPEAR_PIXELS;
+}
+
+float ProjectedGroupSurfacePixels(GpuHierarchyGroup group, float4 worldSphere, int instanceIndex)
+{
+    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
+    float maxScale = max(_Instances[instanceIndex].maxScale, 1e-6);
+    float linearPixelsPerObjectUnit;
+    if (_UseOrthographicLod != 0)
+    {
+        linearPixelsPerObjectUnit = _OrthographicLodScale * maxScale;
+    }
+    else
+    {
+        float dist = max(length(worldSphere.xyz - _CameraPos.xyz) - worldSphere.w, _ZNear);
+        linearPixelsPerObjectUnit = _ProjectionScale * maxScale / dist;
+    }
+    // fineSurfaceArea is the unsigned area of every fine triangle, not its
+    // view-facing projected coverage. For a closed surface, Cauchy's projection
+    // formula gives a mean one-sided projected area of surfaceArea / 4. Using
+    // the raw area here over-refined the 4K 432-instance stress scene to 21.7M
+    // triangles even though the objects occupied only a fraction of the frame.
+    // Geometric error remains the hard refinement bound below, so this factor
+    // only calibrates the ~one projected pixel per triangle density target.
+    const float kMeanOneSidedProjection = 0.25;
+    return max(0.0, group.fineSurfaceArea) * kMeanOneSidedProjection *
+        linearPixelsPerObjectUnit * linearPixelsPerObjectUnit;
+}
+
+bool HierarchyGroupNeedsRefinement(
+    uint groupIndex,
+    int instanceIndex,
+    float thresholdPixels)
+{
+    if (groupIndex >= (uint)_HierarchyGroupCount)
+        return false;
+
+    GpuHierarchyGroup group = _HierarchyGroups[groupIndex];
+    float4 sphere = TransformSphere(group.boundingSphere, instanceIndex);
+    bool errorVisible = !LodErrorIsImperceptible(
+        group.maxParentLodError,
+        sphere,
+        thresholdPixels,
+        instanceIndex);
+    if (group.fineTriangleCount == 0u || group.coarseTriangleCount == 0u)
+        return errorVisible;
+
+    // Error remains the hard quality bound. In addition, do not select a coarse
+    // representation whose triangle budget is below the projected surface pixel
+    // budget. This keeps close/large-screen geometry detailed and naturally stops
+    // requesting finer levels as triangles become sub-pixel with distance.
+    float projectedSurfacePixels = ProjectedGroupSurfacePixels(group, sphere, instanceIndex);
+    bool densityUnderBudget = (float)group.coarseTriangleCount < projectedSurfacePixels;
+    return errorVisible || densityUnderBudget;
+}
+
+bool HierarchyGroupFineResidentCached(uint groupIndex, uint instanceIndex);
+bool HierarchyFineWorkingSetResident(
+    GpuHierarchyGroup group,
+    uint instanceIndex,
+    bool requestPages);
+
+bool ShouldSelectClusterGroupLod(
+    GpuClusterData cluster,
+    uint geometryPartIndex,
+    float parentError,
+    float selfError,
+    float4 parentSphere,
+    float4 selfSphere,
+    float parentThresholdPixels,
+    float selfThresholdPixels,
+    int instanceIndex)
+{
+    uint consumerGroup = geometryPartIndex != 0xFFFFFFFFu
+        ? _Parts[geometryPartIndex].consumerGroupIndex
+        : 0xFFFFFFFFu;
+    bool parentNeedsRefinement = consumerGroup < (uint)_HierarchyGroupCount
+        ? HierarchyGroupNeedsRefinement(
+            consumerGroup,
+            instanceIndex,
+            parentThresholdPixels)
+        : !LodErrorIsImperceptible(
+            parentError,
+            parentSphere,
+            parentThresholdPixels,
+            instanceIndex);
+    bool consumerResident = consumerGroup >= (uint)_HierarchyGroupCount ||
+        HierarchyGroupFineResidentCached(consumerGroup, (uint)instanceIndex);
+    if (parentNeedsRefinement && !consumerResident && consumerGroup < (uint)_HierarchyGroupCount)
+        HierarchyFineWorkingSetResident(_HierarchyGroups[consumerGroup], (uint)instanceIndex, true);
+
+    bool selfNeedsRefinement = cluster.refinementGroupIndex < (uint)_HierarchyGroupCount
+        ? HierarchyGroupNeedsRefinement(
+            cluster.refinementGroupIndex,
+            instanceIndex,
+            selfThresholdPixels)
+        : !LodErrorIsImperceptible(
+            selfError,
+            selfSphere,
+            selfThresholdPixels,
+            instanceIndex);
+    bool refinementResident = cluster.refinementGroupIndex >= (uint)_HierarchyGroupCount ||
+        HierarchyGroupFineResidentCached(cluster.refinementGroupIndex, (uint)instanceIndex);
+    if (selfNeedsRefinement && !refinementResident &&
+        cluster.refinementGroupIndex < (uint)_HierarchyGroupCount)
+    {
+        HierarchyFineWorkingSetResident(
+            _HierarchyGroups[cluster.refinementGroupIndex],
+            (uint)instanceIndex,
+            true);
+    }
+    return parentNeedsRefinement && consumerResident &&
+        (!selfNeedsRefinement || !refinementResident);
 }
 
 bool ClusterBackfaceCulled(GpuClusterData cluster, int instanceIndex, float4 worldGeometrySphere)
 {
-    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
-    // spatialReserved bit 0 is authored only for positive, near-uniform transforms
-    // and one-sided material sets. Non-uniform/double-sided instances fail open.
-    if ((_Instances[instanceIndex].spatialReserved & 1u) == 0u || _UseOrthographicLod != 0)
+    if (_EnableClusterBackfaceCull == 0 || cluster.packedCone == 0u)
         return false;
 
-    float cutoff = DecodeConeSnorm8(cluster.packedCone >> 24u);
-    if (cutoff >= 0.999)
+    int sx = (int)(cluster.packedCone << 24) >> 24;
+    int sy = (int)(cluster.packedCone << 16) >> 24;
+    int sz = (int)(cluster.packedCone << 8) >> 24;
+    int sc = (int)cluster.packedCone >> 24;
+    float cutoff = (float)sc / 127.0;
+    if (cutoff >= 1.0 || instanceIndex < 0 || instanceIndex >= _InstanceCount)
         return false;
-    float3 localAxis = float3(
-        DecodeConeSnorm8(cluster.packedCone),
-        DecodeConeSnorm8(cluster.packedCone >> 8u),
-        DecodeConeSnorm8(cluster.packedCone >> 16u));
-    if (dot(localAxis, localAxis) < 0.25)
+
+    float3 axisOS = float3(sx, sy, sz) / 127.0;
+    float4x4 localToWorld = _Instances[instanceIndex].localToWorld;
+    float3 c0 = mul((float3x3)localToWorld, float3(1.0, 0.0, 0.0));
+    float3 c1 = mul((float3x3)localToWorld, float3(0.0, 1.0, 0.0));
+    float3 c2 = mul((float3x3)localToWorld, float3(0.0, 0.0, 1.0));
+    float l0 = length(c0);
+    float l1 = length(c1);
+    float l2 = length(c2);
+    float minScale = min(l0, min(l1, l2));
+    float maxScale = max(l0, max(l1, l2));
+    if (minScale <= 1e-6 || maxScale > minScale * 1.01)
         return false;
-    float3 worldAxis = normalize(mul((float3x3)_Instances[instanceIndex].localToWorld, localAxis));
-    float3 view = worldGeometrySphere.xyz - _CameraPos.xyz;
-    // meshoptimizer sphere form: dot(center-camera, axis) >= cutoff*distance+radius.
-    return dot(view, worldAxis) >= cutoff * length(view) + worldGeometrySphere.w;
+
+    // CPU admission already rejects non-uniform, mirrored transforms. Use the
+    // exact same matrix-vector convention as TransformSphere; manually reading
+    // matrix fields and rebuilding an inverse-transpose can observe the uploaded
+    // Unity matrix in the opposite row/column convention and rotate the cone to
+    // an unrelated direction, which caused catastrophic close-view rejection.
+    float3 axisWS = normalize(mul((float3x3)localToWorld, axisOS));
+    if (_UseOrthographicLod != 0)
+        return dot(_CameraForward.xyz, axisWS) >= cutoff;
+
+    float3 toCenter = worldGeometrySphere.xyz - _CameraPos.xyz;
+    float distanceToCenter = length(toCenter);
+    return dot(toCenter, axisWS) >=
+        cutoff * distanceToCenter + worldGeometrySphere.w;
 }
 
 bool ClusterDirectionalShadowBackfaceCulled(GpuClusterData cluster, int instanceIndex)
 {
-    instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
-    // The same material/transform admission used by camera cone culling applies
-    // to a directional-light view.  At infinity meshoptimizer's sphere term
-    // vanishes, leaving dot(light-to-surface, coneAxis) >= coneCutoff.
-    if ((_Instances[instanceIndex].spatialReserved & 1u) == 0u)
-        return false;
-
-    float cutoff = DecodeConeSnorm8(cluster.packedCone >> 24u);
-    if (cutoff >= 0.999)
-        return false;
-    float3 localAxis = float3(
-        DecodeConeSnorm8(cluster.packedCone),
-        DecodeConeSnorm8(cluster.packedCone >> 8u),
-        DecodeConeSnorm8(cluster.packedCone >> 16u));
-    if (dot(localAxis, localAxis) < 0.25)
-        return false;
-    float3 worldAxis = normalize(mul((float3x3)_Instances[instanceIndex].localToWorld, localAxis));
-    float3 rayDirection = normalize(_ShadowRayDirection.xyz);
-    return dot(rayDirection, worldAxis) >= cutoff;
+    // Keep shadow and camera visibility on the same fail-open contract. A
+    // camera-visible meshlet must not lose its caster merely because the
+    // unversioned cone winding is ambiguous.
+    return false;
 }
 
 float CameraLodErrorPixels(int instanceIndex)
@@ -377,10 +534,14 @@ float CameraLodErrorPixels(int instanceIndex)
 
 float2 ProjectToUv(float3 worldPos, out float depth01)
 {
-    float4 clip = mul(_WorldToClip, float4(worldPos, 1.0));
+    float4 clip = mul(_HzbWorldToClip, float4(worldPos, 1.0));
     float invW = 1.0 / max(abs(clip.w), 1e-6);
     float2 ndc = clip.xy * invW;
-    float2 uv = ndc * 0.5 + 0.5;
+    // Texture2D.Load uses a top-left origin on the D3D runtime targeted by
+    // this compute shader. Raster viewport Y therefore maps +NDC to UV 0,
+    // not UV 1. Sampling the mirrored row can turn another car into a false
+    // occluder in close views.
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     depth01 = saturate(clip.z * invW);
     return uv;
 }
@@ -390,39 +551,76 @@ bool IsOccludedByHzb(float4 sphere)
     if (_UseHzb == 0 || _HizMipCount <= 0)
         return false;
 
-    float3 toCenter = sphere.xyz - _CameraPos.xyz;
+    float occlusionRadius = max(0.0, sphere.w);
+
+    float3 toCenter = sphere.xyz - _HzbCameraPos.xyz;
     float centerDist = length(toCenter);
-    if (centerDist <= sphere.w * 1.25 + _ZNear)
+    if (centerDist <= occlusionRadius * 1.25 + _HzbZNear)
         return false;
 
-    float dist = max(centerDist, _ZNear);
-    float radiusPixels = max(1.0, _ProjectionScale * sphere.w / dist);
-    float centerDepth;
-    float2 centerUv = ProjectToUv(sphere.xyz, centerDepth);
-    float2 uvRadius = radiusPixels * _ScreenSize.zw;
+    float4 centerClip = mul(_HzbWorldToClip, float4(sphere.xyz, 1.0));
+    float centerW = abs(centerClip.w);
+    // A bound intersecting the near plane has an unbounded perspective
+    // footprint. It must remain visible rather than entering HZB.
+    if (centerW <= occlusionRadius + _HzbZNear)
+        return false;
+
+    float2 centerNdc = centerClip.xy / max(abs(centerClip.w), 1e-6);
+    float2 centerUv = float2(
+        centerNdc.x * 0.5 + 0.5,
+        0.5 - centerNdc.y * 0.5);
+    // Conservative perspective sphere rectangle. The |centerNdc| term covers
+    // the projection-center shift caused by the near side of an off-axis
+    // sphere; distance-to-center under-bounds this footprint and was the main
+    // source of probabilistic large holes.
+    float nearW = max(centerW - occlusionRadius, _HzbZNear);
+    float2 ndcRadius =
+        (_HzbProjectionNdcScale.xy + abs(centerNdc)) * occlusionRadius / nearW;
+    float2 uvRadius = max(ndcRadius * 0.5, float2(1e-7, 1e-7));
     float2 uvMin = centerUv - uvRadius;
     float2 uvMax = centerUv + uvRadius;
     // A partially off-screen bound has no complete HZB coverage.
     if (any(uvMin < 0.0) || any(uvMax > 1.0))
         return false;
 
-    // Select a mip where the projected rectangle covers at most ~2x2 texels,
-    // then test all four texels. This is the conservative HZB rectangle test
-    // used by GPU-driven occlusion paths; a center sample is not sufficient.
-    float diameterPixels = max(2.0, radiusPixels * 2.0);
+    // Select against the real HZB dimensions (mip0 may be half-resolution).
+    // The pyramid intentionally stops early, so reject the test when its last
+    // mip is still too fine to cover the rectangle with at most 2x2 texels.
+    uint hzbWidth, hzbHeight, hzbLevels;
+    _HizTexture.GetDimensions(0, hzbWidth, hzbHeight, hzbLevels);
+    float2 footprintTexels = (uvMax - uvMin) * float2(hzbWidth, hzbHeight);
+    float diameterTexels = max(1.0, max(footprintTexels.x, footprintTexels.y));
     int mip = (int)clamp(
-        ceil(log2(diameterPixels)) - 1.0,
+        ceil(log2(diameterTexels)),
         0.0,
         (float)(_HizMipCount - 1));
-    float d00 = _HizTexture.SampleLevel(sampler_HizTexture, uvMin, mip);
-    float d10 = _HizTexture.SampleLevel(sampler_HizTexture, float2(uvMax.x, uvMin.y), mip);
-    float d01 = _HizTexture.SampleLevel(sampler_HizTexture, float2(uvMin.x, uvMax.y), mip);
-    float d11 = _HizTexture.SampleLevel(sampler_HizTexture, uvMax, mip);
+    uint mipWidth, mipHeight, ignoredLevels;
+    _HizTexture.GetDimensions((uint)mip, mipWidth, mipHeight, ignoredLevels);
+    int2 maxTexel = int2(mipWidth, mipHeight) - 1;
+    int2 texelMin = clamp(
+        int2(floor(uvMin * float2(mipWidth, mipHeight))),
+        int2(0, 0),
+        maxTexel);
+    int2 texelMax = clamp(
+        int2(floor(uvMax * float2(mipWidth, mipHeight))),
+        int2(0, 0),
+        maxTexel);
+    if (any(texelMax - texelMin > 1))
+        return false;
 
-    float3 viewDirection = toCenter / max(centerDist, 1e-6);
+    float d00 = _HizTexture.Load(int3(texelMin, mip));
+    float d10 = _HizTexture.Load(int3(int2(texelMax.x, texelMin.y), mip));
+    float d01 = _HizTexture.Load(int3(int2(texelMin.x, texelMax.y), mip));
+    float d11 = _HizTexture.Load(int3(texelMax, mip));
+
+    // Hardware depth is a function of camera-space Z, not Euclidean distance.
+    // The conservative near bound of a sphere is its point one radius toward
+    // the camera plane. Using the radial direction underestimates this bound
+    // for off-axis clusters and can incorrectly place them behind an occluder.
+    float3 cameraForward = normalize(_HzbCameraForward.xyz);
     float closestDepth;
     ProjectToUv(
-        sphere.xyz - viewDirection * sphere.w,
+        sphere.xyz - cameraForward * occlusionRadius,
         closestDepth);
     const float depthEpsilon = 1e-4;
     if (_ReversedZ != 0)
@@ -534,7 +732,7 @@ GpuClusterData LoadClusterData(
         uint4 virtualCluster = _VirtualClusters[workIndex];
         instanceIndex = (int)virtualCluster.x;
         partIndex = (int)virtualCluster.z;
-        globalPageIndex = virtualCluster.w;
+        globalPageIndex = _GeometryClusterPageIndex[virtualCluster.y];
         return _Clusters[virtualCluster.y];
     }
 
@@ -545,18 +743,56 @@ GpuClusterData LoadClusterData(
     return cluster;
 }
 
-void CullPart(uint i)
+uint ResolveSceneClusterIndex(uint workIndex)
 {
-    if (i >= (uint)_PartCount)
+    uint geometryClusterIndex = workIndex;
+    if (_UseGpuSceneRefs != 0)
+    {
+        if (workIndex >= (uint)_ClusterCount)
+            return 0xFFFFFFFFu;
+        geometryClusterIndex = _VirtualClusters[workIndex].y;
+    }
+    return geometryClusterIndex < (uint)_SceneClusterCount
+        ? _ClusterSceneIndex[geometryClusterIndex]
+        : 0xFFFFFFFFu;
+}
+
+uint ResolveGeometryClusterIndex(uint workIndex)
+{
+    if (_UseGpuSceneRefs == 0)
+        return workIndex;
+    if (workIndex >= (uint)_ClusterCount)
+        return 0xFFFFFFFFu;
+    return _VirtualClusters[workIndex].y;
+}
+
+uint ResolveGeometryPartIndex(int workPartIndex)
+{
+    if (workPartIndex < 0 || workPartIndex >= _PartCount)
+        return 0xFFFFFFFFu;
+    return _UseGpuSceneRefs != 0
+        ? _VirtualParts[workPartIndex].y
+        : (uint)workPartIndex;
+}
+
+void CullResolvedPart(
+    uint geometryPartIndex,
+    int instanceIndex,
+    uint visibilityIndex,
+    bool writeVisibility)
+{
+    uint geometryPartCount;
+    uint geometryPartStride;
+    _Parts.GetDimensions(geometryPartCount, geometryPartStride);
+    if (geometryPartIndex >= geometryPartCount || instanceIndex < 0 ||
+        instanceIndex >= _InstanceCount)
         return;
 
-    int instanceIndex;
-    uint unusedClusterStart;
-    uint unusedClusterCount;
-    GpuPartData part = LoadPartData(i, instanceIndex, unusedClusterStart, unusedClusterCount);
+    GpuPartData part = _Parts[geometryPartIndex];
     if (_UseInstanceCull != 0 && _InstanceVisible[instanceIndex] == 0u)
     {
-        _PartVisibleWrite[i] = 0u;
+        if (writeVisibility && visibilityIndex < (uint)_PartCount)
+            _PartVisibleWrite[visibilityIndex] = 0u;
         return;
     }
     float lodError = CameraLodErrorPixels(instanceIndex);
@@ -568,16 +804,42 @@ void CullPart(uint i)
     float4 lodSphere = TransformSphere(part.parentSphere.w > 0 ? part.parentSphere : part.selfSphere, instanceIndex);
 
     // Part：父误差尚可感知则保留（与 Bevy part 粗筛一致）。
-    bool visible = SphereVisible(selfSphere) &&
-                   !LodErrorIsImperceptible(part.maxParentError, lodSphere, parentLodError, instanceIndex);
+    // Part admission must use the same consumer-group predicate as the final
+    // cluster cut. An error-only test discards density-required fine Parts
+    // before cluster traversal can select them, producing close-view holes.
+    bool partNeedsRefinement = part.consumerGroupIndex < (uint)_HierarchyGroupCount
+        ? HierarchyGroupNeedsRefinement(
+            part.consumerGroupIndex,
+            instanceIndex,
+            parentLodError)
+        : !LodErrorIsImperceptible(
+            part.maxParentError,
+            lodSphere,
+            parentLodError,
+            instanceIndex);
+    bool visible = SphereVisible(selfSphere) && partNeedsRefinement;
 
     // Pass1 不做 HZB；Pass2/legacy 才测遮挡。
     if (visible && _CullPassMode != CULL_MODE_PASS1 && IsOccludedByHzb(selfSphere))
         visible = false;
 
-    _PartVisibleWrite[i] = visible ? 1u : 0u;
+    if (writeVisibility && visibilityIndex < (uint)_PartCount)
+        _PartVisibleWrite[visibilityIndex] = visible ? 1u : 0u;
     if (visible && _EnableVisiblePartQueue != 0)
-        _VisiblePartsOut.Append(i);
+        _VisiblePartsOut.Append(uint2((uint)instanceIndex, geometryPartIndex));
+}
+
+void CullPart(uint i)
+{
+    if (i >= (uint)_PartCount)
+        return;
+
+    int instanceIndex;
+    uint unusedClusterStart;
+    uint unusedClusterCount;
+    LoadPartData(i, instanceIndex, unusedClusterStart, unusedClusterCount);
+    uint geometryPartIndex = _UseGpuSceneRefs != 0 ? _VirtualParts[i].y : i;
+    CullResolvedPart(geometryPartIndex, instanceIndex, i, true);
 }
 
 [numthreads(64, 1, 1)]
@@ -699,10 +961,77 @@ void AppendVisibleDrawClusterRasterBins(
 uint EncodePageRequestPriority(float projectedImportance)
 {
     if (projectedImportance >= 1e29)
-        return 0xFFFFFFFFu;
+        projectedImportance = 1.0;
     // 8.8 fixed-point pixels retain useful ordering below one pixel while
     // allowing very large near-camera errors to saturate safely.
     return (uint)clamp(ceil(max(projectedImportance, 1.0 / 256.0) * 256.0), 1.0, 16777215.0);
+}
+
+void AppendHzbRejectedCluster(
+    uint geometryClusterIndex,
+    uint instanceIndex,
+    uint sceneClusterIndex)
+{
+    if (geometryClusterIndex >= (uint)_ClusterCount ||
+        instanceIndex >= (uint)_InstanceCount ||
+        sceneClusterIndex >= (uint)_SceneClusterCount)
+        return;
+    _HzbRejectedClustersOut.Append(uint3(
+        geometryClusterIndex,
+        instanceIndex,
+        sceneClusterIndex));
+    if (_EnableCullStats != 0)
+        InterlockedAdd(_CullStats[1], 1u);
+}
+
+// Pass2 consumes the exact instance-qualified records rejected by Pass1. The
+// old geometry-only mask made identical mesh instances contaminate one another
+// and forced a complete second traversal; in stress scenes it recovered more
+// clusters than Pass1 had rejected. This kernel is O(rejected), preserves the
+// selected producer cut, and only appends genuine current-HZB disocclusions.
+[numthreads(64, 1, 1)]
+void CSRecoverHzbRejectedClusters(uint3 id : SV_DispatchThreadID)
+{
+    uint rejectedIndex = id.x;
+    uint rejectedCount = _HzbRejectedDispatchArgs[3];
+    if (rejectedIndex >= rejectedCount)
+        return;
+
+    uint3 rejected = _HzbRejectedClusters[rejectedIndex];
+    uint geometryClusterIndex = rejected.x;
+    uint instanceIndex = rejected.y;
+    uint sceneClusterIndex = rejected.z;
+    uint geometryClusterCount;
+    uint geometryClusterStride;
+    _Clusters.GetDimensions(geometryClusterCount, geometryClusterStride);
+    if (geometryClusterIndex >= geometryClusterCount ||
+        instanceIndex >= (uint)_InstanceCount ||
+        sceneClusterIndex >= (uint)_SceneClusterCount)
+        return;
+
+    GpuClusterData cluster = _Clusters[geometryClusterIndex];
+    float4 geometrySphere = TransformSphere(cluster.geometrySphere, (int)instanceIndex);
+    if (IsOccludedByHzb(geometrySphere))
+        return;
+
+    AppendVisibleDrawClusterRasterBins(
+        sceneClusterIndex,
+        instanceIndex,
+        geometrySphere,
+        cluster.longestEdge);
+    _Pass2Drawn[sceneClusterIndex] = 1u;
+    if (_EnableCullStats != 0)
+        InterlockedAdd(_CullStats[2], 1u);
+}
+
+float PageRequestImportance(float projectedError, float projectedDiameter)
+{
+    // FLT_MAX marks a terminal/root producer, not an infinite streaming need.
+    // Rank that producer by visible footprint so it cannot starve finite-error
+    // fine Pages when the physical pool is over-subscribed.
+    return projectedError >= 1e29
+        ? max(projectedDiameter, 1.0 / 256.0)
+        : max(projectedError, projectedDiameter);
 }
 
 void RequestPageIfNeeded(uint globalPageIndex, float projectedImportance)
@@ -771,22 +1100,9 @@ void CSTraverseSpatialNodes(uint3 id : SV_DispatchThreadID)
     if (!SphereVisible(worldSphere))
         return;
 
-    // Conservative subtree LOD rejection. lodSphere encloses every descendant
-    // parent-error sphere and maxParentError is their maximum. Using the terminal
-    // threshold whenever any descendant is terminal can only retain extra work;
-    // it cannot remove a required Part.
-    float threshold = CameraLodErrorPixels((int)instanceIndex);
-    if ((node.flags & SPATIAL_NODE_HAS_TERMINAL) != 0u)
-        threshold = min(threshold, TERMINAL_DISAPPEAR_PIXELS);
-    float4 worldLodSphere = TransformSphere(
-        node.lodSphere.w > 0.0 ? node.lodSphere : node.boundingSphere,
-        (int)instanceIndex);
-    if (LodErrorIsImperceptible(
-            node.maxParentError,
-            worldLodSphere,
-            threshold,
-            (int)instanceIndex))
-        return;
+    // Spatial nodes have no aggregate surface-area/triangle budget, so the
+    // legacy error-only subtree test cannot prove density-imperceptibility.
+    // The exact Part predicate below is the first safe LOD early-out.
 
     if ((node.flags & SPATIAL_NODE_LEAF) != 0u)
     {
@@ -795,7 +1111,11 @@ void CSTraverseSpatialNodes(uint3 id : SV_DispatchThreadID)
         {
             uint localPart = _SpatialPartRefs[refIndex];
             if (localPart < _Instances[instanceIndex].partCount)
-                CullPart(_Instances[instanceIndex].partOffset + localPart);
+                CullResolvedPart(
+                    _Instances[instanceIndex].geometryPartOffset + localPart,
+                    (int)instanceIndex,
+                    0u,
+                    false);
         }
         return;
     }
@@ -823,25 +1143,37 @@ uint HierarchyVirtualClusterIndex(uint instanceIndex, uint hierarchyRefIndex)
     return _Instances[instanceIndex].clusterOffset + hierarchyRef.x;
 }
 
-bool HierarchyFineWorkingSetResident(GpuHierarchyGroup group, uint instanceIndex)
+uint HierarchyGeometryClusterIndex(uint instanceIndex, uint hierarchyRefIndex)
+{
+    uint4 hierarchyRef = _HierarchyClusterRefs[hierarchyRefIndex];
+    return _Instances[instanceIndex].geometryClusterOffset + hierarchyRef.x;
+}
+
+bool HierarchyFineWorkingSetResident(
+    GpuHierarchyGroup group,
+    uint instanceIndex,
+    bool requestPages)
 {
     bool resident = true;
     float4 worldGroupSphere = TransformSphere(group.boundingSphere, (int)instanceIndex);
-    float requestPriority = ProjectedError(
-        group.maxParentLodError,
-        worldGroupSphere,
-        (int)instanceIndex);
+    float requestPriority = PageRequestImportance(
+        ProjectedError(group.maxParentLodError, worldGroupSphere, (int)instanceIndex),
+        ProjectedDiameterPixels(worldGroupSphere));
     uint end = min((uint)_HierarchyRefCount, group.fineClusterStart + group.fineClusterCount);
     for (uint refIndex = group.fineClusterStart; refIndex < end; refIndex++)
     {
-        uint virtualClusterIndex = HierarchyVirtualClusterIndex(instanceIndex, refIndex);
-        if (virtualClusterIndex >= (uint)_ClusterCount)
+        uint geometryClusterIndex = HierarchyGeometryClusterIndex(instanceIndex, refIndex);
+        uint geometryClusterCount;
+        uint geometryClusterStride;
+        _Clusters.GetDimensions(geometryClusterCount, geometryClusterStride);
+        if (geometryClusterIndex >= geometryClusterCount)
         {
             resident = false;
             continue;
         }
-        uint globalPageIndex = _VirtualClusters[virtualClusterIndex].w;
-        RequestPageIfNeeded(globalPageIndex, requestPriority);
+        uint globalPageIndex = _GeometryClusterPageIndex[geometryClusterIndex];
+        if (requestPages)
+            RequestPageIfNeeded(globalPageIndex, requestPriority);
         resident = resident && HierarchyPageResident(globalPageIndex);
     }
     return resident;
@@ -863,6 +1195,22 @@ bool ClusterNeedsResidentCoarseFallback(GpuClusterData cluster, uint instanceInd
     // preferable to emitting a fine address before its Page Table publication.
     return residencyIndex >= (uint)_HierarchyGroupResidencyCount ||
         _HierarchyGroupResidency[residencyIndex] == 0u;
+}
+
+bool HierarchyGroupFineResidentCached(uint groupIndex, uint instanceIndex)
+{
+    if (_AllPagesResident != 0)
+        return true;
+    if (groupIndex >= (uint)_HierarchyGroupCount || instanceIndex >= (uint)_InstanceCount)
+        return false;
+    GpuInstanceData instanceData = _Instances[instanceIndex];
+    if (groupIndex < instanceData.hierarchyGroupOffset ||
+        groupIndex >= instanceData.hierarchyGroupOffset + instanceData.hierarchyGroupCount)
+        return false;
+    uint residencyIndex = instanceData.hierarchyResidencyOffset +
+        groupIndex - instanceData.hierarchyGroupOffset;
+    return residencyIndex < (uint)_HierarchyGroupResidencyCount &&
+        _HierarchyGroupResidency[residencyIndex] != 0u;
 }
 
 // Residency is global per Page but the hierarchy references are geometry-local,
@@ -889,7 +1237,7 @@ void CSUpdateHierarchyGroupResidency(uint3 id : SV_DispatchThreadID)
     }
 
     _HierarchyGroupResidencyWrite[residencyIndex] = _AllPagesResident != 0 ||
-        HierarchyFineWorkingSetResident(_HierarchyGroups[groupIndex], instanceIndex)
+        HierarchyFineWorkingSetResident(_HierarchyGroups[groupIndex], instanceIndex, false)
             ? 1u
             : 0u;
 }
@@ -915,9 +1263,9 @@ void EmitHierarchySelectedCluster(uint hierarchyRefIndex, uint instanceIndex)
     float4 requestLodSphere = TransformSphere(
         cluster.parentSphere.w > 0.0 ? cluster.parentSphere : cluster.selfSphere,
         (int)instanceIndex);
-    RequestPageIfNeeded(
-        globalPageIndex,
-        ProjectedError(cluster.parentError, requestLodSphere, (int)instanceIndex));
+    RequestPageIfNeeded(globalPageIndex, PageRequestImportance(
+        ProjectedError(cluster.parentError, requestLodSphere, (int)instanceIndex),
+        ProjectedDiameterPixels(geometrySphere)));
     if (!HierarchyPageResident(globalPageIndex))
         return;
 
@@ -925,41 +1273,23 @@ void EmitHierarchySelectedCluster(uint hierarchyRefIndex, uint instanceIndex)
         ClusterBackfaceCulled(cluster, (int)instanceIndex, geometrySphere))
         return;
 
-    bool terminalDisappear = (cluster.lodFlags & LOD_FLAG_TERMINAL_DISAPPEAR) != 0u;
-    if (terminalDisappear)
-    {
-        float4 parentSphere = TransformSphere(
-            cluster.parentSphere.w > 0.0 ? cluster.parentSphere : cluster.selfSphere,
-            (int)instanceIndex);
-        float terminalThreshold = min(
-            max(0.01, LodErrorPixels((int)instanceIndex)),
-            TERMINAL_DISAPPEAR_PIXELS);
-        if (LodErrorIsImperceptible(
-                cluster.parentError,
-                parentSphere,
-                terminalThreshold,
-                (int)instanceIndex))
-            return;
-    }
-    else if (ProjectedDiameterPixels(geometrySphere) < 1.0)
-    {
-        return;
-    }
+    // Root disappearance is handled atomically in the seed kernels. Never cull
+    // one selected hierarchy member here, even for legacy finite-error roots.
 
-    uint sceneClusterIndex = _ClusterSceneIndex[virtualClusterIndex];
+    uint sceneClusterIndex = ResolveSceneClusterIndex(virtualClusterIndex);
     if (_CullPassMode == CULL_MODE_PASS1)
     {
+        // Test the selected producer, not a candidate from another LOD. Any
+        // previous-HZB rejection is retained for the current-HZB recovery pass,
+        // matching NVIDIA's two-pass traversal contract.
         if (IsOccludedByHzb(geometrySphere))
         {
-            if (sceneClusterIndex < (uint)_SceneClusterCount)
-            {
-                _SecondPassCandidates[sceneClusterIndex] = 1u;
-                if (_EnableCullStats != 0)
-                    InterlockedAdd(_CullStats[1], 1u);
-            }
+            AppendHzbRejectedCluster(
+                ResolveGeometryClusterIndex(virtualClusterIndex),
+                instanceIndex,
+                sceneClusterIndex);
             return;
         }
-
         AppendVisibleDrawCluster(sceneClusterIndex, instanceIndex, geometrySphere);
         if (sceneClusterIndex < (uint)_SceneClusterCount)
         {
@@ -972,15 +1302,8 @@ void EmitHierarchySelectedCluster(uint hierarchyRefIndex, uint instanceIndex)
 
     if (_CullPassMode == CULL_MODE_PASS2)
     {
-        if (sceneClusterIndex >= (uint)_SceneClusterCount ||
-            _SecondPassCandidates[sceneClusterIndex] == 0u ||
-            IsOccludedByHzb(geometrySphere))
-            return;
-        AppendVisibleDrawCluster(sceneClusterIndex, instanceIndex, geometrySphere);
-        _ClusterVisible[sceneClusterIndex] = 1u;
-        _Pass2Drawn[sceneClusterIndex] = 1u;
-        if (_EnableCullStats != 0)
-            InterlockedAdd(_CullStats[2], 1u);
+        // Instance-qualified recovery is handled by
+        // CSRecoverHzbRejectedClusters without retraversing the scene.
         return;
     }
 
@@ -1016,6 +1339,8 @@ void CSSeedHierarchyRoots(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_G
         if (rootGroupIndex >= (uint)_HierarchyGroupCount)
             continue;
         GpuHierarchyGroup rootGroup = _HierarchyGroups[rootGroupIndex];
+        if (!RootGroupVisibleForCamera(rootGroup, (int)instanceIndex))
+            continue;
         uint fineEnd = min(
             (uint)_HierarchyRefCount,
             rootGroup.fineClusterStart + rootGroup.fineClusterCount);
@@ -1068,8 +1393,10 @@ void CSTraverseHierarchy(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // Every coarse ref in this producer group arrives together. Only its canonical first
-    // ref evaluates and emits the atomic replacement, preventing duplicate expansion.
+    // A geometry cluster appears once in its consumer's fine range and once in
+    // its producer's coarse range. The incoming ref is therefore an intentional
+    // alias, so canonicalization must compare immutable geometry-cluster IDs,
+    // not flat ref addresses.
     uint4 firstCoarseRef = _HierarchyClusterRefs[group.coarseClusterStart];
     if (selectedRef.x != firstCoarseRef.x)
         return;
@@ -1079,12 +1406,11 @@ void CSTraverseHierarchy(uint3 id : SV_DispatchThreadID)
         return;
 
     float lodError = CameraLodErrorPixels((int)instanceIndex);
-    bool refine = !LodErrorIsImperceptible(
-        group.maxParentLodError,
-        groupSphere,
-        lodError,
-        (int)instanceIndex);
-    refine = refine && HierarchyFineWorkingSetResident(group, instanceIndex);
+    bool refine = HierarchyGroupNeedsRefinement(
+        refinementGroupIndex,
+        (int)instanceIndex,
+        lodError);
+    refine = refine && HierarchyFineWorkingSetResident(group, instanceIndex, true);
 
     if (refine)
     {
@@ -1339,6 +1665,8 @@ void CSSeedHierarchyPersistent(uint3 groupId : SV_GroupID, uint3 groupThreadId :
         if (rootGroupIndex >= (uint)_HierarchyGroupCount)
             continue;
         GpuHierarchyGroup rootGroup = _HierarchyGroups[rootGroupIndex];
+        if (!RootGroupVisibleForCamera(rootGroup, (int)instanceIndex))
+            continue;
         uint fineEnd = min(
             (uint)_HierarchyRefCount,
             rootGroup.fineClusterStart + rootGroup.fineClusterCount);
@@ -1428,12 +1756,11 @@ void CSTraverseHierarchyPersistent(uint3 id : SV_DispatchThreadID)
         }
 
         float lodError = CameraLodErrorPixels((int)instanceIndex);
-        bool refine = !LodErrorIsImperceptible(
-            group.maxParentLodError,
-            groupSphere,
-            lodError,
-            (int)instanceIndex);
-        refine = refine && HierarchyFineWorkingSetResident(group, instanceIndex);
+        bool refine = HierarchyGroupNeedsRefinement(
+            refinementGroupIndex,
+            (int)instanceIndex,
+            lodError);
+        refine = refine && HierarchyFineWorkingSetResident(group, instanceIndex, true);
 
         uint fineEnd = min(
             (uint)_HierarchyRefCount,
@@ -1497,7 +1824,9 @@ void CullCluster(uint clusterIdx)
 
     // parent / self 必须用各自的误差球投影（Bevy/Nanite），不能共用一个球。
     float4 parentSphere = TransformSphere(c.parentSphere.w > 0 ? c.parentSphere : c.selfSphere, instanceIndex);
-    if (!ShouldSelectClusterLod(
+    if (!ShouldSelectClusterGroupLod(
+            c,
+            ResolveGeometryPartIndex(virtualPartIndex),
             c.parentError,
             c.selfError,
             parentSphere,
@@ -1508,21 +1837,21 @@ void CullCluster(uint clusterIdx)
         return;
 
     // 整簇屏幕直径 < 1px：亚像素簇直接丢（与 lodError 脱钩，避免 T=8 时误挖 6px 洞）。
-    {
-        if (!terminalDisappear && ProjectedDiameterPixels(geometrySphere) < 1.0)
-            return;
-    }
-
-    // Request only the selected cut. Request priority is projected geometric
-    // error, so near/high-error Pages win over traversal/page-id order.
-    RequestPageIfNeeded(globalPageIndex, max(
-        ProjectedError(c.parentError, parentSphere, instanceIndex),
-        ProjectedDiameterPixels(geometrySphere)));
+    // Non-terminal clusters belong to an atomic cut and must not disappear
+    // independently. Explicit terminal groups use their parent-error test.
 
     uint gi = 0xFFFFFFFFu;
     if ((_EnableClusterVisibleWrite != 0 || _EnableVisibleDrawAppend != 0) &&
         clusterIdx < (uint)_ClusterCount)
-        gi = _ClusterSceneIndex[clusterIdx];
+        gi = ResolveSceneClusterIndex(clusterIdx);
+
+    // Request only the selected cut. Request priority is projected geometric
+    // error, so near/high-error Pages win over traversal/page-id order.
+    RequestPageIfNeeded(globalPageIndex, PageRequestImportance(
+        ProjectedError(c.parentError, parentSphere, instanceIndex),
+        ProjectedDiameterPixels(geometrySphere)));
+    if (!HierarchyPageResident(globalPageIndex))
+        return;
 
     if (_CullPassMode == CULL_MODE_PASS1)
     {
@@ -1530,12 +1859,10 @@ void CullCluster(uint clusterIdx)
         // the post pass, which retests them against the current-frame HZB.
         if (IsOccludedByHzb(geometrySphere))
         {
-            if (gi < (uint)_SceneClusterCount)
-            {
-                _SecondPassCandidates[gi] = 1u;
-                if (_EnableCullStats != 0)
-                    InterlockedAdd(_CullStats[1], 1u);
-            }
+            AppendHzbRejectedCluster(
+                ResolveGeometryClusterIndex(clusterIdx),
+                (uint)instanceIndex,
+                gi);
             return;
         }
 
@@ -1555,21 +1882,8 @@ void CullCluster(uint clusterIdx)
 
     if (_CullPassMode == CULL_MODE_PASS2)
     {
-        // Post pass appends disocclusions from the current-frame HZB.
-        if (gi >= (uint)_SceneClusterCount || _SecondPassCandidates[gi] == 0u)
-            return;
-        if (IsOccludedByHzb(geometrySphere))
-            return;
-
-        AppendVisibleDrawCluster(gi, (uint)instanceIndex, geometrySphere);
-
-        if (_EnableVisibleAppend != 0)
-            _VisibleClusters.Append(uint3((uint)instanceIndex, (uint)c.pageIndex, (uint)c.clusterIndex));
-
-        _ClusterVisible[gi] = 1u;
-        _Pass2Drawn[gi] = 1u;
-        if (_EnableCullStats != 0)
-            InterlockedAdd(_CullStats[2], 1u);
+        // Instance-qualified recovery is handled by
+        // CSRecoverHzbRejectedClusters without retraversing the scene.
         return;
     }
 
@@ -1644,74 +1958,71 @@ void CSFinalizeRasterBinArgs(uint3 id : SV_DispatchThreadID)
 // legacy mask/Bevy bookkeeping outputs. Keeping it in a dedicated function is
 // important on Windows: the old generic CullCluster path reflected nine UAVs,
 // while D3D11-class Player dispatches accept at most eight.
-void CullVisiblePartClusterToDrawQueue(uint clusterIdx)
+void CullVisibleGeometryClusterToDrawQueue(
+    uint geometryClusterIndex,
+    uint instanceIndex,
+    uint geometryPartIndex,
+    uint globalPageIndex)
 {
-    int instanceIndex;
-    int virtualPartIndex;
-    uint globalPageIndex;
-    GpuClusterData cluster = LoadClusterData(
-        clusterIdx,
-        instanceIndex,
-        virtualPartIndex,
-        globalPageIndex);
-    if (virtualPartIndex < 0 || virtualPartIndex >= _PartCount ||
-        _PartVisible[virtualPartIndex] == 0u)
+    uint geometryClusterCount;
+    uint geometryClusterStride;
+    _Clusters.GetDimensions(geometryClusterCount, geometryClusterStride);
+    if (geometryClusterIndex >= geometryClusterCount ||
+        instanceIndex >= (uint)_InstanceCount)
         return;
+    GpuClusterData cluster = _Clusters[geometryClusterIndex];
 
-    float lodError = CameraLodErrorPixels(instanceIndex);
+    float lodError = CameraLodErrorPixels((int)instanceIndex);
     bool terminalDisappear = (cluster.lodFlags & LOD_FLAG_TERMINAL_DISAPPEAR) != 0u;
     float parentLodError = terminalDisappear
-        ? min(max(0.01, LodErrorPixels(instanceIndex)), TERMINAL_DISAPPEAR_PIXELS)
+        ? min(max(0.01, LodErrorPixels((int)instanceIndex)), TERMINAL_DISAPPEAR_PIXELS)
         : lodError;
-    float4 geometrySphere = TransformSphere(cluster.geometrySphere, instanceIndex);
-    float4 selfLodSphere = TransformSphere(cluster.selfSphere, instanceIndex);
+    float4 geometrySphere = TransformSphere(cluster.geometrySphere, (int)instanceIndex);
+    float4 selfLodSphere = TransformSphere(cluster.selfSphere, (int)instanceIndex);
     if (!SphereVisible(geometrySphere) ||
-        ClusterBackfaceCulled(cluster, instanceIndex, geometrySphere))
+        ClusterBackfaceCulled(cluster, (int)instanceIndex, geometrySphere))
         return;
     float4 parentSphere = TransformSphere(
         cluster.parentSphere.w > 0 ? cluster.parentSphere : cluster.selfSphere,
-        instanceIndex);
-    bool forceResidentCoarse = ClusterNeedsResidentCoarseFallback(
-        cluster,
-        (uint)instanceIndex);
-    if (!forceResidentCoarse && !ShouldSelectClusterLod(
+        (int)instanceIndex);
+    if (!ShouldSelectClusterGroupLod(
+            cluster,
+            geometryPartIndex,
             cluster.parentError,
             cluster.selfError,
             parentSphere,
             selfLodSphere,
             parentLodError,
             lodError,
-            instanceIndex))
+            (int)instanceIndex))
         return;
-    RequestPageIfNeeded(globalPageIndex, max(
-        ProjectedError(cluster.parentError, parentSphere, instanceIndex),
+    uint sceneClusterIndex = geometryClusterIndex < (uint)_SceneClusterCount
+        ? _ClusterSceneIndex[geometryClusterIndex]
+        : 0xFFFFFFFFu;
+    RequestPageIfNeeded(globalPageIndex, PageRequestImportance(
+        ProjectedError(cluster.parentError, parentSphere, (int)instanceIndex),
         ProjectedDiameterPixels(geometrySphere)));
     // A direct spatial cut must never submit an address that has not been
     // published by the resident Page Table. When a finer working set is missing,
     // its refinement parent is forced into the cut until all child Pages publish.
     if (!HierarchyPageResident(globalPageIndex))
         return;
-    if (!terminalDisappear && ProjectedDiameterPixels(geometrySphere) < 1.0)
-        return;
+    // Preserve the complete selected cut; per-cluster subpixel rejection is
+    // not topology-safe for disconnected or hard-surface producer groups.
 
-    if (clusterIdx >= (uint)_ClusterCount)
-        return;
-    uint sceneClusterIndex = _ClusterSceneIndex[clusterIdx];
     if (_CullPassMode == CULL_MODE_PASS1)
     {
         if (IsOccludedByHzb(geometrySphere))
         {
-            if (sceneClusterIndex < (uint)_SceneClusterCount)
-            {
-                _SecondPassCandidates[sceneClusterIndex] = 1u;
-                if (_EnableCullStats != 0)
-                    InterlockedAdd(_CullStats[1], 1u);
-            }
+            AppendHzbRejectedCluster(
+                geometryClusterIndex,
+                instanceIndex,
+                sceneClusterIndex);
             return;
         }
         AppendVisibleDrawClusterRasterBins(
             sceneClusterIndex,
-            (uint)instanceIndex,
+            instanceIndex,
             geometrySphere,
             cluster.longestEdge);
         if (sceneClusterIndex < (uint)_SceneClusterCount)
@@ -1724,26 +2035,15 @@ void CullVisiblePartClusterToDrawQueue(uint clusterIdx)
     }
     if (_CullPassMode == CULL_MODE_PASS2)
     {
-        if (sceneClusterIndex >= (uint)_SceneClusterCount ||
-            _SecondPassCandidates[sceneClusterIndex] == 0u ||
-            IsOccludedByHzb(geometrySphere))
-            return;
-        AppendVisibleDrawClusterRasterBins(
-            sceneClusterIndex,
-            (uint)instanceIndex,
-            geometrySphere,
-            cluster.longestEdge);
-        _ClusterVisible[sceneClusterIndex] = 1u;
-        _Pass2Drawn[sceneClusterIndex] = 1u;
-        if (_EnableCullStats != 0)
-            InterlockedAdd(_CullStats[2], 1u);
+        // Instance-qualified recovery is handled by
+        // CSRecoverHzbRejectedClusters without retraversing the scene.
         return;
     }
     if (IsOccludedByHzb(geometrySphere))
         return;
     AppendVisibleDrawClusterRasterBins(
         sceneClusterIndex,
-        (uint)instanceIndex,
+        instanceIndex,
         geometrySphere,
         cluster.longestEdge);
     if (_EnableClusterVisibleWrite != 0 && sceneClusterIndex < (uint)_SceneClusterCount)
@@ -1759,30 +2059,82 @@ void CSClusterCullVisibleParts(uint3 id : SV_DispatchThreadID)
     if (queueIndex >= visiblePartCount)
         return;
 
-    uint partIndex = _VisiblePartsIn[queueIndex];
-    if (partIndex >= (uint)_PartCount)
+    uint2 work = _VisiblePartsIn[queueIndex];
+    uint instanceIndex = work.x;
+    uint geometryPartIndex = work.y;
+    uint geometryPartCount;
+    uint geometryPartStride;
+    _Parts.GetDimensions(geometryPartCount, geometryPartStride);
+    if (instanceIndex >= (uint)_InstanceCount ||
+        geometryPartIndex >= geometryPartCount)
         return;
 
-    int unusedInstanceIndex;
-    uint clusterStart;
-    uint clusterCount;
-    LoadPartData(partIndex, unusedInstanceIndex, clusterStart, clusterCount);
-    uint end = min((uint)_ClusterCount, clusterStart + clusterCount);
-    for (uint clusterIndex = clusterStart; clusterIndex < end; clusterIndex++)
-        CullVisiblePartClusterToDrawQueue(clusterIndex);
+    GpuPartData part = _Parts[geometryPartIndex];
+    uint geometryClusterCount;
+    uint geometryClusterStride;
+    _Clusters.GetDimensions(geometryClusterCount, geometryClusterStride);
+    uint geometryClusterStart = (uint)max(0, part.clusterStart);
+    uint end = min(geometryClusterCount, geometryClusterStart + (uint)max(0, part.clusterCount));
+    for (uint geometryClusterIndex = geometryClusterStart;
+         geometryClusterIndex < end;
+         geometryClusterIndex++)
+    {
+        CullVisibleGeometryClusterToDrawQueue(
+            geometryClusterIndex,
+            instanceIndex,
+            geometryPartIndex,
+            _GeometryClusterPageIndex[geometryClusterIndex]);
+    }
 }
+
+float ShadowProjectionScale(int cascadeIndex);
 
 bool ShadowSphereVisible(float4 sphere, int cascadeIndex)
 {
-    int planeBase = cascadeIndex * 6;
-    [unroll]
-    for (int planeIndex = 0; planeIndex < 6; planeIndex++)
+    int planeCount = cascadeIndex == 0
+        ? (int)_ShadowCasterPlaneCounts.x
+        : cascadeIndex == 1
+            ? (int)_ShadowCasterPlaneCounts.y
+            : cascadeIndex == 2
+                ? (int)_ShadowCasterPlaneCounts.z
+                : (int)_ShadowCasterPlaneCounts.w;
+    planeCount = clamp(planeCount, 0, 10);
+    // Keep a two-texel guard band so a caster cannot pop at a cascade boundary
+    // due to quantized bounds, depth bias or PCF reach. The native split planes
+    // already describe directional caster admission; no receiver-plane sweep or
+    // guessed light convention is involved here.
+    float worldTexelGuard = 2.0 / max(ShadowProjectionScale(cascadeIndex), 1e-6);
+    float guardedRadius = max(0.0, sphere.w) + worldTexelGuard;
+    if (planeCount > 0)
     {
-        float4 p = _ShadowFrustumPlanes[planeBase + planeIndex];
-        if (dot(p.xyz, sphere.xyz) + p.w < -sphere.w)
-            return false;
+        int planeBase = cascadeIndex * 10;
+        [loop]
+        for (int planeIndex = 0; planeIndex < planeCount; planeIndex++)
+        {
+            float4 plane = _ShadowCasterPlanes[planeBase + planeIndex];
+            if (dot(plane.xyz, sphere.xyz) + plane.w < -guardedRadius)
+                return false;
+        }
+        return true;
     }
-    return true;
+
+    // When a scene contains only external GPU-driven casters Unity cannot build
+    // native split planes. The receiver culling sphere is still valid. Project
+    // the caster sphere onto the plane perpendicular to the directional ray and
+    // test an infinite swept cylinder. This cannot reject an upstream caster
+    // whose shadow overlaps the receiver sphere, while removing the vast majority
+    // of unrelated instances that the former unconditional admission submitted.
+    float4 receiverSphere = _ShadowCullingSpheres[clamp(cascadeIndex, 0, 3)];
+    float3 rayDirection = _ShadowRayDirection.xyz;
+    float rayLengthSq = dot(rayDirection, rayDirection);
+    if (receiverSphere.w <= 0.0 || rayLengthSq <= 1e-12)
+        return true;
+    rayDirection *= rsqrt(rayLengthSq);
+    float3 receiverToCaster = sphere.xyz - receiverSphere.xyz;
+    float axial = dot(receiverToCaster, rayDirection);
+    float3 lateral = receiverToCaster - rayDirection * axial;
+    float overlapRadius = receiverSphere.w + guardedRadius;
+    return dot(lateral, lateral) <= overlapRadius * overlapRadius;
 }
 
 float ShadowProjectionScale(int cascadeIndex)
@@ -1798,16 +2150,10 @@ float ShadowProjectionScale(int cascadeIndex)
 
 float ShadowLodErrorPixels(int instanceIndex, int cascadeIndex)
 {
-    // Every cascade owns roughly the same atlas area while covering an
-    // increasingly large world-space footprint. Reusing the near-cascade
-    // budget in all four cascades repeats sub-texel triangles: the 154-instance
-    // capture reached about 4x/8x useful texel coverage in the distant slices.
-    // Scale geometric error with cascade footprint so the shadow cut converges
-    // toward one useful triangle sample per filtered shadow texel.
-    float cascadeBias = cascadeIndex == 0
-        ? 1.0
-        : (cascadeIndex == 1 ? 2.0 : (cascadeIndex == 2 ? 4.0 : 8.0));
-    return max(SHADOW_LOD_MIN_TEXELS * cascadeBias, LodErrorPixels(instanceIndex));
+    // ShadowProjectionScale already falls with cascade world coverage. Applying
+    // another 1/2/4/8 cascade multiplier double-counts distance and selected the
+    // terminal proxy even when a car still covered hundreds of shadow texels.
+    return max(1.0, _ShadowLodMinTexels);
 }
 
 float ShadowProjectedError(float error, int instanceIndex, int cascadeIndex)
@@ -1816,7 +2162,12 @@ float ShadowProjectedError(float error, int instanceIndex, int cascadeIndex)
         return 1e30;
     instanceIndex = clamp(instanceIndex, 0, max(_InstanceCount - 1, 0));
     float worldError = error * max(_Instances[instanceIndex].maxScale, 1e-6);
-    return 2.0 * worldError * ShadowProjectionScale(cascadeIndex);
+    // ShadowProjectionScale is already 0.5 * resolution * NDC-per-world,
+    // i.e. texels per world-space radius.  Treat simplification error as a
+    // radius, matching meshoptimizer/NVIDIA's half-pixel error convention;
+    // multiplying by two here interpreted it as a diameter and refined every
+    // cascade one LOD too far.
+    return worldError * ShadowProjectionScale(cascadeIndex);
 }
 
 bool ShadowLodErrorIsImperceptible(
@@ -1848,6 +2199,89 @@ bool ShouldSelectShadowClusterLod(
                cascadeIndex);
 }
 
+bool ShadowHierarchyGroupNeedsRefinement(
+    uint groupIndex,
+    int instanceIndex,
+    int cascadeIndex,
+    float thresholdPixels)
+{
+    if (groupIndex >= (uint)_HierarchyGroupCount)
+        return false;
+    GpuHierarchyGroup group = _HierarchyGroups[groupIndex];
+    bool errorVisible = !ShadowLodErrorIsImperceptible(
+        group.maxParentLodError,
+        thresholdPixels,
+        instanceIndex,
+        cascadeIndex);
+    if (group.fineTriangleCount == 0u || group.coarseTriangleCount == 0u)
+        return errorVisible;
+
+    // Match camera continuous LOD in the light projection. Error protects the
+    // silhouette; projected surface density prevents a 37-triangle terminal
+    // proxy from representing a caster that occupies thousands of atlas texels.
+    float maxScale = max(_Instances[instanceIndex].maxScale, 1e-6);
+    float texelsPerObjectUnit = ShadowProjectionScale(cascadeIndex) * maxScale;
+    const float kMeanOneSidedProjection = 0.25;
+    float projectedSurfaceTexels = max(0.0, group.fineSurfaceArea) *
+        kMeanOneSidedProjection * texelsPerObjectUnit * texelsPerObjectUnit;
+    bool densityUnderBudget = (float)group.coarseTriangleCount < projectedSurfaceTexels;
+    return errorVisible || densityUnderBudget;
+}
+
+bool ShouldSelectShadowClusterGroupLod(
+    GpuClusterData cluster,
+    uint geometryPartIndex,
+    float parentError,
+    float selfError,
+    float parentThresholdPixels,
+    float selfThresholdPixels,
+    int instanceIndex,
+    int cascadeIndex)
+{
+    uint consumerGroup = geometryPartIndex != 0xFFFFFFFFu
+        ? _Parts[geometryPartIndex].consumerGroupIndex
+        : 0xFFFFFFFFu;
+    bool parentNeedsRefinement = consumerGroup < (uint)_HierarchyGroupCount
+        ? ShadowHierarchyGroupNeedsRefinement(
+            consumerGroup,
+            instanceIndex,
+            cascadeIndex,
+            parentThresholdPixels)
+        : !ShadowLodErrorIsImperceptible(
+            parentError,
+            parentThresholdPixels,
+            instanceIndex,
+            cascadeIndex);
+    bool consumerResident = consumerGroup >= (uint)_HierarchyGroupCount ||
+        HierarchyGroupFineResidentCached(consumerGroup, (uint)instanceIndex);
+    if (parentNeedsRefinement && !consumerResident && consumerGroup < (uint)_HierarchyGroupCount)
+        HierarchyFineWorkingSetResident(_HierarchyGroups[consumerGroup], (uint)instanceIndex, true);
+
+    bool selfNeedsRefinement = cluster.refinementGroupIndex < (uint)_HierarchyGroupCount
+        ? ShadowHierarchyGroupNeedsRefinement(
+            cluster.refinementGroupIndex,
+            instanceIndex,
+            cascadeIndex,
+            selfThresholdPixels)
+        : !ShadowLodErrorIsImperceptible(
+            selfError,
+            selfThresholdPixels,
+            instanceIndex,
+            cascadeIndex);
+    bool refinementResident = cluster.refinementGroupIndex >= (uint)_HierarchyGroupCount ||
+        HierarchyGroupFineResidentCached(cluster.refinementGroupIndex, (uint)instanceIndex);
+    if (selfNeedsRefinement && !refinementResident &&
+        cluster.refinementGroupIndex < (uint)_HierarchyGroupCount)
+    {
+        HierarchyFineWorkingSetResident(
+            _HierarchyGroups[cluster.refinementGroupIndex],
+            (uint)instanceIndex,
+            true);
+    }
+    return parentNeedsRefinement && consumerResident &&
+        (!selfNeedsRefinement || !refinementResident);
+}
+
 void AppendShadowVisibleDrawCluster(int cascadeIndex, uint sceneClusterIndex, uint instanceIndex)
 {
     if (sceneClusterIndex >= (uint)_SceneClusterCount)
@@ -1870,16 +2304,19 @@ void AppendShadowVisibleDrawCluster(int cascadeIndex, uint sceneClusterIndex, ui
 
 uint ShadowVisibleCascadeMask(float4 sphere, uint requestedMask);
 
-void CullShadowPart(uint partIndex, uint requestedCascadeMask)
+void CullResolvedShadowPart(
+    uint geometryPartIndex,
+    uint instanceIndex,
+    uint requestedCascadeMask)
 {
-    if (partIndex >= (uint)_PartCount)
+    uint geometryPartCount;
+    uint geometryPartStride;
+    _Parts.GetDimensions(geometryPartCount, geometryPartStride);
+    if (geometryPartIndex >= geometryPartCount || instanceIndex >= (uint)_InstanceCount)
         return;
 
-    int instanceIndex;
-    uint clusterStart;
-    uint partClusterCount;
-    GpuPartData part = LoadPartData(partIndex, instanceIndex, clusterStart, partClusterCount);
-    float4 partSphere = TransformSphere(part.selfSphere, instanceIndex);
+    GpuPartData part = _Parts[geometryPartIndex];
+    float4 partSphere = TransformSphere(part.selfSphere, (int)instanceIndex);
 
     int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
     uint partCascadeMask = 0u;
@@ -1888,73 +2325,101 @@ void CullShadowPart(uint partIndex, uint requestedCascadeMask)
         uint cascadeBit = 1u << cascadeIndex;
         if ((requestedCascadeMask & cascadeBit) == 0u)
             continue;
-        float lodError = ShadowLodErrorPixels(instanceIndex, cascadeIndex);
+        float lodError = ShadowLodErrorPixels((int)instanceIndex, cascadeIndex);
         bool terminalDisappear = (part.lodFlags & LOD_FLAG_TERMINAL_DISAPPEAR) != 0u;
         float parentLodError = terminalDisappear
-            ? min(max(0.01, LodErrorPixels(instanceIndex)), TERMINAL_DISAPPEAR_SHADOW_TEXELS)
+            ? min(max(0.01, LodErrorPixels((int)instanceIndex)), TERMINAL_DISAPPEAR_SHADOW_TEXELS)
             : lodError;
-        if (ShadowSphereVisible(partSphere, cascadeIndex) &&
-            !ShadowLodErrorIsImperceptible(
+        bool parentNeedsRefinement = part.consumerGroupIndex < (uint)_HierarchyGroupCount
+            ? ShadowHierarchyGroupNeedsRefinement(
+                part.consumerGroupIndex,
+                (int)instanceIndex,
+                cascadeIndex,
+                parentLodError)
+            : !ShadowLodErrorIsImperceptible(
                 part.maxParentError,
                 parentLodError,
-                instanceIndex,
-                cascadeIndex))
+                (int)instanceIndex,
+                cascadeIndex);
+        // Part and cluster admission must use the same refinement predicate.
+        // Error-only Part rejection followed by density-aware cluster selection
+        // creates an empty cut: the coarse producer is rejected for insufficient
+        // surface density while every fine producer was already pruned here.
+        if (ShadowSphereVisible(partSphere, cascadeIndex) && parentNeedsRefinement)
             partCascadeMask |= 1u << cascadeIndex;
     }
     if (partCascadeMask == 0u)
         return;
 
-    uint clusterEnd = min((uint)_ClusterCount, clusterStart + partClusterCount);
-    for (uint clusterIndex = clusterStart; clusterIndex < clusterEnd; clusterIndex++)
+    uint geometryClusterCount;
+    uint geometryClusterStride;
+    _Clusters.GetDimensions(geometryClusterCount, geometryClusterStride);
+    uint clusterStart = (uint)max(0, part.clusterStart);
+    uint clusterEnd = min(
+        geometryClusterCount,
+        clusterStart + (uint)max(0, part.clusterCount));
+    for (uint geometryClusterIndex = clusterStart;
+         geometryClusterIndex < clusterEnd;
+         geometryClusterIndex++)
     {
-        int clusterInstanceIndex;
-        int unusedPartIndex;
-        uint globalPageIndex;
-        GpuClusterData cluster = LoadClusterData(
-            clusterIndex,
-            clusterInstanceIndex,
-            unusedPartIndex,
-            globalPageIndex);
+        GpuClusterData cluster = _Clusters[geometryClusterIndex];
+        uint globalPageIndex = _GeometryClusterPageIndex[geometryClusterIndex];
 
-        float4 clusterSphere = TransformSphere(cluster.geometrySphere, clusterInstanceIndex);
-        if (ClusterDirectionalShadowBackfaceCulled(cluster, clusterInstanceIndex))
+        float4 clusterSphere = TransformSphere(cluster.geometrySphere, (int)instanceIndex);
+        if (ClusterDirectionalShadowBackfaceCulled(cluster, (int)instanceIndex))
             continue;
-        uint sceneClusterIndex = _ClusterSceneIndex[clusterIndex];
-        RequestPageIfNeeded(globalPageIndex);
-        if (!HierarchyPageResident(globalPageIndex))
-            continue;
-        bool forceResidentCoarse = ClusterNeedsResidentCoarseFallback(
-            cluster,
-            (uint)clusterInstanceIndex);
+        uint sceneClusterIndex = geometryClusterIndex < (uint)_SceneClusterCount
+            ? _ClusterSceneIndex[geometryClusterIndex]
+            : 0xFFFFFFFFu;
         for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
         {
-            float lodError = ShadowLodErrorPixels(clusterInstanceIndex, cascadeIndex);
+            float lodError = ShadowLodErrorPixels((int)instanceIndex, cascadeIndex);
             bool terminalDisappear = (cluster.lodFlags & LOD_FLAG_TERMINAL_DISAPPEAR) != 0u;
             float parentLodError = terminalDisappear
-                ? min(max(0.01, LodErrorPixels(clusterInstanceIndex)), TERMINAL_DISAPPEAR_SHADOW_TEXELS)
+                ? min(max(0.01, LodErrorPixels((int)instanceIndex)), TERMINAL_DISAPPEAR_SHADOW_TEXELS)
                 : lodError;
             uint cascadeBit = 1u << cascadeIndex;
             if ((partCascadeMask & cascadeBit) == 0u ||
                 !ShadowSphereVisible(clusterSphere, cascadeIndex))
                 continue;
-            if (!forceResidentCoarse && !ShouldSelectShadowClusterLod(
+            if (!ShouldSelectShadowClusterGroupLod(
+                    cluster,
+                    geometryPartIndex,
                     cluster.parentError,
                     cluster.selfError,
                     parentLodError,
                     lodError,
-                    clusterInstanceIndex,
+                    (int)instanceIndex,
                     cascadeIndex))
                 continue;
-            if (!terminalDisappear &&
-                2.0 * clusterSphere.w * ShadowProjectionScale(cascadeIndex) < 1.0)
+            // Request only after the cascade's atomic LOD predicate admits this
+            // producer. Requesting every cluster before traversal was the exact
+            // false-positive pattern fixed by NVIDIA's streaming implementation.
+            RequestPageIfNeeded(globalPageIndex);
+            if (!HierarchyPageResident(globalPageIndex))
                 continue;
-
             AppendShadowVisibleDrawCluster(
                 cascadeIndex,
                 sceneClusterIndex,
-                (uint)clusterInstanceIndex);
+                instanceIndex);
         }
     }
+}
+
+void CullShadowPart(uint partIndex, uint requestedCascadeMask)
+{
+    if (partIndex >= (uint)_PartCount)
+        return;
+    if (_UseGpuSceneRefs != 0)
+    {
+        uint4 virtualPart = _VirtualParts[partIndex];
+        CullResolvedShadowPart(virtualPart.y, virtualPart.x, requestedCascadeMask);
+        return;
+    }
+
+    GpuPartData part = _Parts[partIndex];
+    uint instanceIndex = part.instanceIndex < 0 ? 0u : (uint)part.instanceIndex;
+    CullResolvedShadowPart(partIndex, instanceIndex, requestedCascadeMask);
 }
 
 // Compatibility fallback. The production large-scene path reaches the same
@@ -1978,6 +2443,11 @@ void CSSeedShadowSpatialRoots(uint3 groupId : SV_GroupID, uint3 groupThreadId : 
     uint cascadeMask = _ShadowCascadeCount >= 4
         ? 0xFu
         : ((1u << (uint)max(_ShadowCascadeCount, 0)) - 1u);
+    cascadeMask = ShadowVisibleCascadeMask(
+        TransformSphere(instanceData.bounds, (int)instanceIndex),
+        cascadeMask);
+    if (cascadeMask == 0u)
+        return;
     for (uint localRoot = groupThreadId.x;
          localRoot < instanceData.spatialRootCount;
          localRoot += 64u)
@@ -2005,22 +2475,11 @@ void CSTraverseShadowSpatialNodes(uint3 id : SV_DispatchThreadID)
     GpuSpatialNode node = _SpatialNodes[nodeIndex];
     float4 worldSphere = TransformSphere(node.boundingSphere, (int)instanceIndex);
     uint cascadeMask = ShadowVisibleCascadeMask(worldSphere, work.z);
-    int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
-    for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
-    {
-        uint bit = 1u << cascadeIndex;
-        if ((cascadeMask & bit) == 0u)
-            continue;
-        float threshold = ShadowLodErrorPixels((int)instanceIndex, cascadeIndex);
-        if ((node.flags & SPATIAL_NODE_HAS_TERMINAL) != 0u)
-            threshold = min(threshold, TERMINAL_DISAPPEAR_SHADOW_TEXELS);
-        if (ShadowLodErrorIsImperceptible(
-                node.maxParentError,
-                threshold,
-                (int)instanceIndex,
-                cascadeIndex))
-            cascadeMask &= ~bit;
-    }
+    // Spatial nodes only aggregate bounds and max error; they do not carry the
+    // fine/coarse surface density needed by the exact shadow LOD predicate.
+    // Error-only subtree rejection drops every producer below a node even when
+    // the complete caster still spans many shadow texels.  Traverse to Parts and
+    // let ShouldSelectShadowClusterGroupLod choose the atomic producer cut.
     if (cascadeMask == 0u)
         return;
 
@@ -2031,7 +2490,10 @@ void CSTraverseShadowSpatialNodes(uint3 id : SV_DispatchThreadID)
         {
             uint localPart = _SpatialPartRefs[refIndex];
             if (localPart < _Instances[instanceIndex].partCount)
-                CullShadowPart(_Instances[instanceIndex].partOffset + localPart, cascadeMask);
+                CullResolvedShadowPart(
+                    _Instances[instanceIndex].geometryPartOffset + localPart,
+                    instanceIndex,
+                    cascadeMask);
         }
         return;
     }
@@ -2052,6 +2514,21 @@ uint ShadowVisibleCascadeMask(float4 sphere, uint requestedMask)
             visibleMask |= bit;
     }
     return visibleMask;
+}
+
+uint RootGroupVisibleShadowMask(
+    GpuHierarchyGroup group,
+    uint instanceIndex,
+    uint requestedMask)
+{
+    // Do not apply terminal disappearance to shadow roots.  A root group is a
+    // producer cut, not an independently discardable screen primitive: dropping
+    // it removes a spatial portion of the caster and produces the striped/blocked
+    // atlas seen with large instance grids.  Raster viewport/depth clipping is
+    // conservative and the hierarchy below still chooses an appropriate cut for
+    // each cascade.
+    float4 sphere = TransformSphere(group.boundingSphere, (int)instanceIndex);
+    return ShadowVisibleCascadeMask(sphere, requestedMask);
 }
 
 void EmitHierarchySelectedShadowCluster(
@@ -2089,8 +2566,7 @@ void EmitHierarchySelectedShadowCluster(
     if (visibleMask == 0u)
         return;
 
-    bool terminalDisappear = (cluster.lodFlags & LOD_FLAG_TERMINAL_DISAPPEAR) != 0u;
-    uint sceneClusterIndex = _ClusterSceneIndex[virtualClusterIndex];
+    uint sceneClusterIndex = ResolveSceneClusterIndex(virtualClusterIndex);
     int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
     for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
     {
@@ -2098,27 +2574,137 @@ void EmitHierarchySelectedShadowCluster(
         if ((visibleMask & bit) == 0u)
             continue;
 
-        if (terminalDisappear)
-        {
-            float terminalThreshold = min(
-                max(0.01, LodErrorPixels((int)instanceIndex)),
-                TERMINAL_DISAPPEAR_SHADOW_TEXELS);
-            if (ShadowLodErrorIsImperceptible(
-                    cluster.parentError,
-                    terminalThreshold,
-                    (int)instanceIndex,
-                    cascadeIndex))
-                continue;
-        }
-        else if (2.0 * geometrySphere.w * ShadowProjectionScale(cascadeIndex) < 1.0)
-        {
-            continue;
-        }
+        // Root disappearance is handled per producer/cascade in the seed kernel.
 
         AppendShadowVisibleDrawCluster(
             cascadeIndex,
             sceneClusterIndex,
             instanceIndex);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CSSeedShadowHierarchyRoots(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint instanceIndex = groupId.x;
+    if (instanceIndex >= (uint)_InstanceCount)
+        return;
+    GpuInstanceData instanceData = _Instances[instanceIndex];
+    if ((instanceData.hierarchyFlags & 1u) == 0u)
+        return;
+    uint cascadeMask = _ShadowCascadeCount >= 4
+        ? 0xFu
+        : ((1u << (uint)max(_ShadowCascadeCount, 0)) - 1u);
+    cascadeMask = ShadowVisibleCascadeMask(
+        TransformSphere(instanceData.bounds, (int)instanceIndex),
+        cascadeMask);
+    if (cascadeMask == 0u)
+        return;
+
+    for (uint localRootIndex = 0u;
+         localRootIndex < instanceData.hierarchyRootCount;
+         localRootIndex++)
+    {
+        uint rootIndex = instanceData.hierarchyRootOffset + localRootIndex;
+        uint rootGroupIndex = _HierarchyRootGroups[rootIndex];
+        if (rootGroupIndex >= (uint)_HierarchyGroupCount)
+            continue;
+        GpuHierarchyGroup rootGroup = _HierarchyGroups[rootGroupIndex];
+        uint rootCascadeMask = RootGroupVisibleShadowMask(
+            rootGroup,
+            instanceIndex,
+            cascadeMask);
+        if (rootCascadeMask == 0u)
+            continue;
+        uint fineEnd = min(
+            (uint)_HierarchyRefCount,
+            rootGroup.fineClusterStart + rootGroup.fineClusterCount);
+        for (uint refIndex = rootGroup.fineClusterStart + groupThreadId.x;
+             refIndex < fineEnd;
+             refIndex += 64u)
+        {
+            _ShadowSpatialOutputQueue.Append(uint3(instanceIndex, refIndex, rootCascadeMask));
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CSTraverseShadowHierarchy(uint3 id : SV_DispatchThreadID)
+{
+    uint queueIndex = id.x;
+    uint itemCount = _HierarchyDispatchArgs[3];
+    if (queueIndex >= itemCount)
+        return;
+
+    uint3 work = _ShadowSpatialInputQueue[queueIndex];
+    uint instanceIndex = work.x;
+    uint hierarchyRefIndex = work.y;
+    uint requestedMask = work.z;
+    if (instanceIndex >= (uint)_InstanceCount ||
+        hierarchyRefIndex >= (uint)_HierarchyRefCount || requestedMask == 0u)
+        return;
+
+    uint4 selectedRef = _HierarchyClusterRefs[hierarchyRefIndex];
+    uint refinementGroupIndex = selectedRef.w;
+    if (refinementGroupIndex >= (uint)_HierarchyGroupCount)
+    {
+        EmitHierarchySelectedShadowCluster(hierarchyRefIndex, instanceIndex, requestedMask);
+        return;
+    }
+
+    GpuHierarchyGroup group = _HierarchyGroups[refinementGroupIndex];
+    if (group.coarseClusterCount == 0u ||
+        group.coarseClusterStart >= (uint)_HierarchyRefCount)
+    {
+        EmitHierarchySelectedShadowCluster(hierarchyRefIndex, instanceIndex, requestedMask);
+        return;
+    }
+
+    uint4 firstCoarseRef = _HierarchyClusterRefs[group.coarseClusterStart];
+    if (selectedRef.x != firstCoarseRef.x)
+        return;
+
+    float4 groupSphere = TransformSphere(group.boundingSphere, (int)instanceIndex);
+    uint visibleMask = ShadowVisibleCascadeMask(groupSphere, requestedMask);
+    if (visibleMask == 0u)
+        return;
+
+    bool fineResident = HierarchyFineWorkingSetResident(group, instanceIndex, true);
+    uint refineMask = 0u;
+    uint coarseMask = 0u;
+    int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
+    for (int cascadeIndex = 0; cascadeIndex < cascadeCount; cascadeIndex++)
+    {
+        uint bit = 1u << cascadeIndex;
+        if ((visibleMask & bit) == 0u)
+            continue;
+        float lodError = ShadowLodErrorPixels((int)instanceIndex, cascadeIndex);
+        bool refine = fineResident && ShadowHierarchyGroupNeedsRefinement(
+            refinementGroupIndex,
+            (int)instanceIndex,
+            cascadeIndex,
+            lodError);
+        if (refine)
+            refineMask |= bit;
+        else
+            coarseMask |= bit;
+    }
+
+    if (refineMask != 0u)
+    {
+        uint fineEnd = min(
+            (uint)_HierarchyRefCount,
+            group.fineClusterStart + group.fineClusterCount);
+        for (uint refIndex = group.fineClusterStart; refIndex < fineEnd; refIndex++)
+            _ShadowSpatialOutputQueue.Append(uint3(instanceIndex, refIndex, refineMask));
+    }
+    if (coarseMask != 0u)
+    {
+        uint coarseEnd = min(
+            (uint)_HierarchyRefCount,
+            group.coarseClusterStart + group.coarseClusterCount);
+        for (uint refIndex = group.coarseClusterStart; refIndex < coarseEnd; refIndex++)
+            EmitHierarchySelectedShadowCluster(refIndex, instanceIndex, coarseMask);
     }
 }
 
@@ -2147,6 +2733,13 @@ void CSSeedShadowHierarchyPersistent(
         if (rootGroupIndex >= (uint)_HierarchyGroupCount)
             continue;
         GpuHierarchyGroup rootGroup = _HierarchyGroups[rootGroupIndex];
+        // This persistent seed kernel is quarantined and is not dispatched by
+        // the production backend. Keep its root admission group-uniform: the
+        // reserve/publish path below contains group barriers, and evaluating
+        // the dynamic caster-volume loop here makes D3D11 conservatively mark
+        // the surrounding loop as varying flow. The active spatial traversal
+        // applies RootGroupVisibleShadowMask before enqueueing any work.
+        uint rootCascadeMask = cascadeMask;
         uint fineEnd = min(
             (uint)_HierarchyRefCount,
             rootGroup.fineClusterStart + rootGroup.fineClusterCount);
@@ -2167,7 +2760,7 @@ void CSSeedShadowHierarchyPersistent(
                     uint3(
                         instanceIndex,
                         rootGroup.fineClusterStart + localRef,
-                        cascadeMask));
+                        rootCascadeMask));
             }
         }
         AllMemoryBarrierWithGroupSync();
@@ -2237,7 +2830,7 @@ void CSTraverseShadowHierarchyPersistent(uint3 id : SV_DispatchThreadID)
             continue;
         }
 
-        bool fineResident = HierarchyFineWorkingSetResident(group, instanceIndex);
+        bool fineResident = HierarchyFineWorkingSetResident(group, instanceIndex, true);
         uint refineMask = 0u;
         uint coarseMask = 0u;
         int cascadeCount = min(max(_ShadowCascadeCount, 0), 4);
@@ -2247,11 +2840,11 @@ void CSTraverseShadowHierarchyPersistent(uint3 id : SV_DispatchThreadID)
             if ((visibleMask & bit) == 0u)
                 continue;
             float lodError = ShadowLodErrorPixels((int)instanceIndex, cascadeIndex);
-            bool refine = fineResident && !ShadowLodErrorIsImperceptible(
-                group.maxParentLodError,
-                lodError,
+            bool refine = fineResident && ShadowHierarchyGroupNeedsRefinement(
+                refinementGroupIndex,
                 (int)instanceIndex,
-                cascadeIndex);
+                cascadeIndex,
+                lodError);
             if (refine)
                 refineMask |= bit;
             else

@@ -89,8 +89,21 @@ namespace Nanite
     [Serializable]
     public struct NaniteHierarchyGroup
     {
-        public const int CurrentVersion = 1;
+        // V4 matches meshoptimizer's Nanite example attribute metric: normal
+        // contributes to QEM while UV is topology-Protected; tiled UV/tangent
+        // values no longer inflate an object-space projected error.
+        // V3 follows clusterlod's cumulative error merge and requires every
+        // independently simplified producer to preserve its shared boundary
+        // edges. V2 used max(previous,current) without the additive error term,
+        // selecting visibly damaged coarse replacements too close to the camera.
+        // V2 changed the semantic contract of maxParentLodError: it is the
+        // absolute error returned by the attribute-aware simplification that
+        // produced the coarse replacement. V1 assets used a second
+        // position-only solve, so they can select visibly damaged UV/normal
+        // topology while still reporting a sub-pixel error.
+        public const int CurrentVersion = 4;
         public const int RootSetFlag = 1;
+        public const int RobustUvGateFlag = 2;
 
         public Vector4 boundingSphere;
         public float minLodError;
@@ -103,5 +116,6 @@ namespace Nanite
         public int flags;
 
         public bool IsRootSet => (flags & RootSetFlag) != 0;
+        public bool UsesRobustUvGate => (flags & RobustUvGateFlag) != 0;
     }
 }

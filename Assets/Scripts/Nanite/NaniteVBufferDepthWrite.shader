@@ -6,7 +6,7 @@ Shader "Nanite/VBufferDepthWrite"
         Tags { "RenderType"="Opaque" "Queue"="Geometry+49" }
         Pass
         {
-            Cull Back
+            Cull Off
             ZTest LEqual
             ZWrite On
             ColorMask 0
@@ -26,6 +26,7 @@ Shader "Nanite/VBufferDepthWrite"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            StructuredBuffer<uint> _IndexedTrianglePackets;
             #include "NanitePackedPage.hlsl"
             int _VertexStride;
             int _InstanceId;
@@ -33,6 +34,9 @@ Shader "Nanite/VBufferDepthWrite"
             int _UseSceneInstanceBuffer;
             int _UseIndexedClusterRaster;
             int _GeometryVertexCount;
+            int _IndexedTrianglePacketBase;
+            int _IndexedPacketInstanceBits;
+            uint _IndexedPacketInstanceMask;
 
             struct Attributes
             {
@@ -56,16 +60,25 @@ Shader "Nanite/VBufferDepthWrite"
             Varyings vert(Attributes input)
             {
                 Varyings o;
-                if (_UseIndexedClusterRaster != 0 && _GeometryVertexCount > 0)
+                if (_UseIndexedClusterRaster != 0)
                 {
-                    int instanceId = (int)(input.vertexID / (uint)_GeometryVertexCount);
-                    int logicalVertex = (int)(input.vertexID % (uint)_GeometryVertexCount);
+                    uint packet = _IndexedTrianglePackets[
+                        (uint)max(0, _IndexedTrianglePacketBase) + input.vertexID / 3u];
+                    int triId = (int)(packet >> (uint)_IndexedPacketInstanceBits);
+                    int instanceId = (int)(packet & _IndexedPacketInstanceMask);
                     float4x4 indexedLocalToWorld = _InstanceLocalToWorld[instanceId];
+                    int corner = NaniteResolveWindingCorner(input.vertexID, indexedLocalToWorld);
                     float3 indexedPositionOS;
                     if (NaniteUsePackedPageGeometry())
-                        indexedPositionOS = _NaniteResidentVertices[logicalVertex].positionOS;
+                    {
+                        if (!NanitePackedLoadPosition((uint)triId, (uint)corner, indexedPositionOS))
+                            indexedPositionOS = asfloat(0x7FC00000u).xxx;
+                    }
                     else
+                    {
+                        int logicalVertex = _Indices[triId * 3 + corner];
                         indexedPositionOS = DecodePositionOS(logicalVertex);
+                    }
                     float3 indexedPositionWS = mul(indexedLocalToWorld, float4(indexedPositionOS, 1.0)).xyz;
                     o.positionCS = TransformWorldToHClip(indexedPositionWS);
                     return o;

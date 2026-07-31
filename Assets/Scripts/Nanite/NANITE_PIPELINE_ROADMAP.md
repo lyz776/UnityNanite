@@ -154,3 +154,93 @@ direct resident index 已完成运行验收，新 capture 为 `ProfilerCaptures/
 在继续软件光栅、Mesh Shader、RT 或动态 Page fallback 前，先停止扩展功能并完成一次可归因性能审计：Development Player、固定相机/分辨率/阴影，Nanite 与普通 Mesh 各一份 capture，分别记录 CPU Main/Render、GPU VBuffer、Resolve、Shadow 和 cull pass。找到占主导的 pass 后，再决定优化现有热路径、降低 shadow 工作量、建立小模型 indirect fast path，还是继续动态 Page traversal。
 
 现有 2,000 帧 capture 已排除 Nanite CPU 准备/通信为主瓶颈：Render Thread `WaitForGPU` 平均 3.958 ms、Main Thread presentation wait 平均 1.446 ms，而 Nanite 各 CPU marker 均低于 0.1 ms。capture 没有有效 GPU timestamp，故尚不能在 VBuffer、Resolve、Shadow 之间归因；下一步仍需 GPU Profiler Development Player A/B，而不是继续堆 CPU/GPU Scene 基础设施。
+
+## 当前交付路线（2026-07-31，覆盖上面的历史暂停点）
+
+已进入生产验收的模块：GPU Scene 去重、instance/spatial/group GPU traversal、camera/shadow indirect queue、exact triangle-packet hardware raster、四级 shadow 独立队列、NPG1 V3 + NZC1/LZ4、固定 Page Pool / 双缓冲 Page Table / root pin、需求请求与 resident coarse-producer fallback、几何误差 continuous LOD、Page mesh-wide quantization、URP/Lit 多材质/纹理 bin、DX12 能力协商和低提交成本回退。
+
+当前结论与策略：
+
+1. HardwareOnly 是这台 RTX 4500 Ada 的生产默认。forced Hybrid 在 154/432 实例上分别约 415/401 FPS，低于 HardwareOnly 的约 720/496 FPS；这与 NVIDIA `vk_lod_clusters` 对其当前 SW raster “典型场景不快于 mesh shader/hardware” 的说明一致。功能保留并自动探测，不以“存在软光栅”冒充性能收益。
+2. 真实大规模门槛已通过：154 个四 SubMesh/八材质实例，Nanite 约 500 FPS，普通 MeshRenderer 同源对照约 140 FPS；单车则由自动准入优先普通 URP。后续门槛是更多 unique mesh / shader family / streaming working-set，而不是继续调 Toyota 的单一阈值。
+3. 非 URP/Lit shader 采用注册式 resolve family；未注册 shader fail closed 到原生 Renderer。下一步补项目实际 shader family，并以每 family 的像素差与 SetPass 数验收，不继续膨胀一个硬编码 Lit shader。
+4. 受限 Page 池已经在 traversal 后请求 fine working set，并保持完整 resident coarse producer；全 Page 能放入池时一次性常驻以避免无意义 readback/换入。下一步是多 unique mesh、工作集明显大于池容量的长时间 fly-through，验证 IO 峰值、驱逐 fence 和无缺页闪烁。
+5. 交付测试固定为相同 Player、相机、分辨率、四级阴影和材质，只切换 Nanite/MeshRenderer；同时记录正确性图、camera/shadow cluster、resident Pages、CPU Main/Render 和逐 pass GPU timing。任何功能若让代表性大实例档回退超过 10%，必须默认关闭或由成本模型否决。
+
+## 2026-07-31 收口状态
+
+- 流式正确性已进入容量门槛：16 MiB 单资产工作集为 51/75 个实际需求 Page，三次往返 0 eviction，近/远 cut 与 32 MiB 全驻留一致；4 MiB 会持续换页且近端 cut 不稳定，只作为压力测试。
+- 多唯一几何已通过首档验收：3 个不同 Bake、154 实例，GPU Scene 静态 Cluster 为 3,516，虚拟实例 Cluster 为 181,351；Nanite 675 FPS，对照 MeshRenderer 424 FPS。
+- 同一多几何场景的 8 MiB 受限池在普通/近距 framing 分别只需求 7/14 个 Page，均为 0 eviction；截图无缺页孔洞。432 实例移动测试为 32/53 Pages、143 streamed、114 evicted（8.89/s），重复端点 cut 一致且相邻固定帧 0 severe pixels；16 MiB 全驻留参考为 0 churn。该流式门槛已完成。
+- 四级阴影保持独立几何误差 hard bound；4 filtered texel 基线避免把相机 cut 复制到全部 cascade。
+- 自定义 shader family 已补 material-data 和 compatibility-hash 扩展合同；下一验收是接入项目实际 shader，而不是继续向 URP/Lit 分支硬编码属性。
+- 尚未宣称最终完成：仍需多资产工作集超过池容量的长路径流式、项目真实 shader family、正式 Player GPU timestamp/SetPass 门槛和最终交付构建。
+
+## 2026-07-31 delivery delta
+
+- Exact packet arena plus whole-Cluster overflow queue: complete and forced-overflow accepted.
+- Packet memory now scales with the bounded screen-space triangle budget plus actual virtual Cluster count, not instances squared.
+- Production Proxy self-culling is removed from the hot path; RendererFeature owns GPU Scene from its lifecycle start.
+- Next measured closure is not another LOD threshold: consolidate shadow packet preparation only where telemetry shows duplicate cascade work, then run the final multi-geometry, material-family, streaming and Player GPU-timestamp delivery matrix.
+
+## 2026-07-31 delivery-candidate status
+
+- Accepted: deduplicated GPU Scene, GPU instance/spatial/group traversal, exact packet indirect
+  raster, four shadow-frustum queues, continuous geometric-error LOD, NPG1/NZC1 Page format,
+  root-pinned Page Pool/Table, external-file streaming and eviction, URP/Lit multi-material bins,
+  registered heterogeneous shader families, DX12 capability negotiation and native fallback.
+- Accepted but not default: compute software raster. It is pixel-equivalent to hardware after the
+  two-sided contract fix, but is 23% slower in the 432-instance 720p workload on RTX 4500 Ada.
+- Production defaults: HardwareOnly, RG32F VBuffer where RG32UI probe fails, 128 MiB Page Pool,
+  streaming enabled, automatic low-instance native admission, no synchronous GPU readback.
+- Remaining integration work is project-specific rather than another virtual-geometry algorithm:
+  register actual project shader families, choose a Page budget from shipping fly-throughs, and
+  collect platform GPU timestamps/SetPass data in the target build configuration. Mesh Shader and
+  RT reuse are explicitly outside the requested delivery scope.
+
+## Production closure checkpoint (2026-07-31)
+
+Completed in the isolated DX12 Player and synchronized to the main project:
+
+1. Unique-geometry GPU Scene records and direct `(instance, geometry Part/Cluster)` camera queues.
+2. Direct four-cascade spatial shadow leaves; no Page lookup through virtual Clusters.
+3. Large scenes no longer allocate instance-expanded virtual Part/Cluster arrays.
+4. Spatial queues use their exact node-work upper bound; raster/shadow queues use the legal DAG
+   terminal-frontier bound with an automatic full-bound safety rebuild on saturation.
+5. The regression matrix passed for single-instance dolly, 1,000 instances with four cascades,
+   three unique meshes, and four-SubMesh/eight-material content.
+
+Next delivery work is ordered by measured production risk: long-path multi-asset streaming beyond
+pool capacity and fence/churn telemetry; project shader-family adapters and SetPass gates; then
+shipping Player GPU timestamps and build validation. Hybrid software raster remains correct but
+cost-gated off on RTX 4500 Ada. Mesh Shader and RT reuse remain outside the requested scope.
+
+## Hybrid r3 clean closure delta (2026-07-31)
+
+- Fixed explicit Hybrid HW-queue admission: indexed packet construction no longer consults
+  readiness stamps owned by the unrelated implicit compact queue.
+- Shared async Hybrid camera workspace now has one internal owner; secondary cameras take the
+  complete HW route instead of mutating the owner's queue/view snapshot.
+- A diagnostic-free Unity 6000.3.10f1 DX12 rebuild passed 52-frame HardwareOnly/Hybrid A/B:
+  fixed-camera temporal MAE stayed below `0.000566/255`, all close frames had zero pixels over
+  8 levels, and the all-frame HW/Hybrid worst MAE was `0.001908/255`.
+- Remaining release gate is operational: after the active main Editor session is released,
+  re-Bake the main Toyota, run the hierarchy audit, and build/run the main DX12 Player. Do not
+  substitute the isolated smoke asset for that project-owned Bake.
+- The gate is required by current evidence, not bookkeeping: the main serialized asset still
+  audits as 320 groups / one root with `componentGrowth=3`, `componentLoss=134` and
+  `uvStretchOutlier=7`; the isolated r3 Bake is 307 groups / 21 roots with all three counters at
+  zero. `Tools/Nanite/Invoke-NaniteDeliveryAcceptance.ps1` refuses an open project and enforces
+  the zero-fatal Bake/Audit plus clean HW/Hybrid Player contracts after the Editor is released.
+
+## Main-project gate closed (2026-07-31)
+
+- Project-owned Bake now passes: 5,122 Clusters, 316 groups, 69/69 compressed Pages, six roots,
+  no oversized/split group and zero fatal DAG/component/UV counters.
+- Clean DX12 HW/Hybrid acceptance passes temporal stability, visual parity, residency and runtime
+  error gates. The former close-camera Hybrid silhouette is not present.
+- 432-instance measurements establish the current honest performance envelope: HardwareOnly
+  277 FPS without shadows and 71 FPS with four cascades; Hybrid 63 FPS with four cascades.
+- Delivery status is approximately 90% for the requested Windows DX12 scope. Remaining optimization
+  is shadow root-floor reduction/cascade reuse without sacrificing disconnected-component coverage;
+  it is not a release correctness blocker. HardwareOnly remains the shipping default.

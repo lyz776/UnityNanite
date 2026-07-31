@@ -19,7 +19,10 @@ float NanitePackDepth01(float4 positionCS)
 
 float2 NaniteScreenUvFromPositionCS(float4 positionCS, float2 viewInvSize)
 {
-    return (positionCS.xy + 0.5) * viewInvSize;
+    // In a fragment shader SV_POSITION.xy already is the render-target pixel
+    // centre. GetNormalizedScreenSpaceUV applies _ScaleBiasRt and belongs to
+    // URP screen-texture sampling, not to an integer Texture.Load address.
+    return positionCS.xy * viewInvSize;
 }
 
 float2 NaniteScreenUvFromPixelCoord(int2 pixelCoord, float2 viewInvSize)
@@ -75,6 +78,40 @@ NaniteDecodedVBufferIds NaniteDecodeCompactVBufferIds(
         decoded.valid = 1;
     }
 
+    return decoded;
+}
+
+// Portable 64-bit VBuffer fallback. Integer render-target loads are not
+// reliable on every DX12/Unity driver combination, while two FP32 channels
+// preserve these normalized IDs exactly for the packet address domain.
+float2 NaniteEncodeFloat2VBufferIds(
+    int instanceId,
+    int triangleId,
+    int instanceCount,
+    int triangleCount)
+{
+    return float2(
+        ((float)max(0, instanceId) + 1.0) / ((float)max(1, instanceCount) + 1.0),
+        ((float)max(0, triangleId) + 1.0) / ((float)max(1, triangleCount) + 1.0));
+}
+
+NaniteDecodedVBufferIds NaniteDecodeFloat2VBufferIds(
+    float2 encoded,
+    int instanceCount,
+    int triangleCount)
+{
+    NaniteDecodedVBufferIds decoded;
+    decoded.instanceId = -1;
+    decoded.triangleId = -1;
+    decoded.valid = 0;
+    if (encoded.x <= 0.0 || encoded.y <= 0.0)
+        return decoded;
+
+    decoded.instanceId = (int)round(encoded.x * ((float)max(1, instanceCount) + 1.0)) - 1;
+    decoded.triangleId = (int)round(encoded.y * ((float)max(1, triangleCount) + 1.0)) - 1;
+    if (decoded.instanceId >= 0 && decoded.instanceId < instanceCount &&
+        decoded.triangleId >= 0 && decoded.triangleId < triangleCount)
+        decoded.valid = 1;
     return decoded;
 }
 
@@ -265,7 +302,36 @@ NaniteBarycentrics CalculateTriangleBarycentrics(
 bool NaniteBarycentricsValid(NaniteBarycentrics bary, float tolerance)
 {
     float sum = bary.value.x + bary.value.y + bary.value.z;
-    return all(bary.value >= -tolerance) && abs(sum - 1.0) <= tolerance * 3.0;
+    return all(bary.value >= -tolerance) &&
+           all(bary.value <= 1.0 + tolerance) &&
+           abs(sum - 1.0) <= tolerance * 3.0;
+}
+
+// Hardware coverage, temporal jitter and a fullscreen resolve do not always
+// evaluate the same sample position. A fixed barycentric epsilon becomes far too
+// small for sub-pixel triangles and creates resolve holes even though the VBuffer
+// contains a valid triangle. Convert a bounded pixel-space allowance through the
+// analytic barycentric gradients, then project only near-edge samples back onto
+// the triangle. A genuinely unrelated triangle remains rejected.
+bool NaniteRepairCoveredBarycentrics(
+    inout NaniteBarycentrics bary,
+    float baseTolerance,
+    float pixelTolerance)
+{
+    float3 gradientPerPixel = float3(
+        length(float2(bary.valueDx.x, bary.valueDy.x)),
+        length(float2(bary.valueDx.y, bary.valueDy.y)),
+        length(float2(bary.valueDx.z, bary.valueDy.z)));
+    float3 tolerance = max(baseTolerance.xxx, gradientPerPixel * pixelTolerance);
+    if (any(bary.value < -tolerance) || any(bary.value > 1.0.xxx + tolerance))
+        return false;
+
+    bary.value = saturate(bary.value);
+    float repairedSum = bary.value.x + bary.value.y + bary.value.z;
+    if (repairedSum < 1e-6)
+        return false;
+    bary.value /= repairedSum;
+    return true;
 }
 
 #endif

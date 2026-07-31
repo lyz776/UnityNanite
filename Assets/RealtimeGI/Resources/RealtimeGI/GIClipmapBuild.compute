@@ -1,0 +1,256 @@
+#pragma kernel ClearBricks
+#pragma kernel VoxelizeInstance
+#pragma kernel InitializeDistance
+#pragma kernel PropagateDistance
+#pragma target 5.0
+
+// Geometry, conservative distance, and cache invalidation build kernels.
+
+#include "../../Shaders/GISceneCommon.hlsl"
+#include "../../Shaders/GIClipmapCommon.hlsl"
+
+StructuredBuffer<uint> _GIDirtyBricks;
+RWStructuredBuffer<uint> _GIOccupancy;
+RWStructuredBuffer<uint> _GISurface;
+RWStructuredBuffer<uint> _GISurfaceUV;
+RWStructuredBuffer<uint> _GIDistance;
+RWStructuredBuffer<uint> _GIRadiance;
+RWStructuredBuffer<uint> _GIValidity;
+
+StructuredBuffer<GIInstanceData> _GIInstances;
+StructuredBuffer<GIMaterialBindingData> _GIMaterialBindings;
+StructuredBuffer<GIGeometryStreamData> _GIGeometryRanges;
+StructuredBuffer<float3> _GIVertices;
+StructuredBuffer<float2> _GIUVs;
+StructuredBuffer<uint> _GIIndices;
+StructuredBuffer<uint> _GITriangleSubMeshes;
+StructuredBuffer<GIClipmapLevelData> _GIClipmapLevels;
+StructuredBuffer<int> _GIPageTable;
+
+uint _GIDirtyBrickCount;
+uint _GIInstanceIndex;
+uint _GITriangleBase;
+uint _GIMaxCellsPerTriangle;
+uint _GIPropagationStep;
+
+[numthreads(128, 1, 1)]
+void ClearBricks(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIDirtyBricks[groupId.x];
+    for (uint surfaceWord = threadId.x; surfaceWord < GI_SURFACE_WORDS_PER_BRICK; surfaceWord += 128u)
+    {
+        _GISurface[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
+        _GISurfaceUV[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
+    }
+    if (threadId.x < GI_OCCUPANCY_WORDS_PER_BRICK)
+        _GIOccupancy[physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + threadId.x] = 0u;
+    for (uint cell = threadId.x; cell < GI_CELLS_PER_BRICK; cell += 128u)
+    {
+        _GIDistance[physicalBrick * GI_DISTANCE_WORDS_PER_BRICK + cell] = 255u;
+        _GIValidity[physicalBrick * GI_CELLS_PER_BRICK + cell] = 0u;
+    }
+    for (uint word = threadId.x; word < GI_RADIANCE_WORDS_PER_BRICK; word += 128u)
+        _GIRadiance[physicalBrick * GI_RADIANCE_WORDS_PER_BRICK + word] = 0u;
+}
+
+float3 GIClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c)
+{
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) return a + ab * (d1 / max(d1 - d3, 1e-8));
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) return a + ac * (d2 / max(d2 - d6, 1e-8));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+        return b + (c - b) * ((d4 - d3) / max((d4 - d3) + (d5 - d6), 1e-8));
+    float denom = rcp(max(va + vb + vc, 1e-8));
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+uint GIPackOctNormal(float3 normal)
+{
+    normal /= max(abs(normal.x) + abs(normal.y) + abs(normal.z), 1e-6);
+    float2 oct = normal.xy;
+    if (normal.z < 0.0)
+    {
+        float2 signNotZero = float2(oct.x >= 0.0 ? 1.0 : -1.0, oct.y >= 0.0 ? 1.0 : -1.0);
+        oct = (1.0 - abs(oct.yx)) * signNotZero;
+    }
+    uint2 packed = (uint2)round(saturate(oct * 0.5 + 0.5) * 255.0);
+    return packed.x | (packed.y << 8u);
+}
+
+uint GIPackHalf2(float2 value)
+{
+    return f32tof16(value.x) | (f32tof16(value.y) << 16u);
+}
+
+float3 GIBarycentric(float3 samplePosition, float3 a, float3 b, float3 c)
+{
+    float3 v0 = b - a;
+    float3 v1 = c - a;
+    float3 v2 = samplePosition - a;
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+    float denominator = max(d00 * d11 - d01 * d01, 1e-12);
+    float v = (d11 * d20 - d01 * d21) / denominator;
+    float w = (d00 * d21 - d01 * d20) / denominator;
+    return float3(1.0 - v - w, v, w);
+}
+
+void GIWriteCell(uint levelIndex, int3 worldCell, uint packedSurface, uint packedUv)
+{
+    GIClipmapLevelData level = _GIClipmapLevels[levelIndex];
+    int physicalBrick;
+    uint localCell;
+    if (!GIResolvePhysicalBrick(level, _GIPageTable, worldCell, physicalBrick, localCell))
+        return;
+    uint occupancyAddress = (uint)physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u;
+    InterlockedOr(_GIOccupancy[occupancyAddress], 1u << (localCell & 31u));
+    uint surfaceAddress = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
+    uint previous;
+    InterlockedCompareExchange(_GISurface[surfaceAddress], 0u, packedSurface, previous);
+    if (previous == 0u)
+        _GISurfaceUV[surfaceAddress] = packedUv;
+}
+
+[numthreads(64, 1, 1)]
+void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
+{
+    GIInstanceData instance = _GIInstances[_GIInstanceIndex];
+    GIGeometryStreamData range = _GIGeometryRanges[instance.geometryIndex];
+    uint triangleIndex = _GITriangleBase + dispatchId.x;
+    if (triangleIndex >= range.triangleCount)
+        return;
+
+    uint firstIndex = range.indexOffset + triangleIndex * 3u;
+    uint vertex0 = _GIIndices[firstIndex];
+    uint vertex1 = _GIIndices[firstIndex + 1u];
+    uint vertex2 = _GIIndices[firstIndex + 2u];
+    float3 p0 = mul(instance.localToWorld, float4(_GIVertices[vertex0], 1.0)).xyz;
+    float3 p1 = mul(instance.localToWorld, float4(_GIVertices[vertex1], 1.0)).xyz;
+    float3 p2 = mul(instance.localToWorld, float4(_GIVertices[vertex2], 1.0)).xyz;
+    float2 uv0 = _GIUVs[vertex0];
+    float2 uv1 = _GIUVs[vertex1];
+    float2 uv2 = _GIUVs[vertex2];
+    float3 triangleCross = cross(p1 - p0, p2 - p0);
+    float normalLengthSq = dot(triangleCross, triangleCross);
+    if (normalLengthSq < 1e-12)
+        return;
+    float3 triangleNormal = triangleCross * rsqrt(normalLengthSq);
+
+    uint subMesh = _GITriangleSubMeshes[range.triangleOffset + triangleIndex];
+    uint bindingOffset = min(subMesh, max(1u, instance.materialBindingCount) - 1u);
+    uint materialIndex = _GIMaterialBindings[instance.firstMaterialBinding + bindingOffset].materialIndex;
+    uint packedSurface = 0x80000000u | ((materialIndex & 0x7fffu) << 16u) |
+                         GIPackOctNormal(triangleNormal);
+
+    [unroll]
+    for (uint levelIndex = 0u; levelIndex < GI_CLIPMAP_LEVEL_COUNT; levelIndex++)
+    {
+        GIClipmapLevelData level = _GIClipmapLevels[levelIndex];
+        int3 clipMin = level.originBrick * GI_BRICK_SIZE;
+        int3 clipMax = clipMin + (GI_CLIPMAP_RESOLUTION - 1);
+        int3 cellMin = max(clipMin, (int3)floor(min(p0, min(p1, p2)) / level.cellSize) - 1);
+        int3 cellMax = min(clipMax, (int3)floor(max(p0, max(p1, p2)) / level.cellSize) + 1);
+        int3 extent = max(0, cellMax - cellMin + 1);
+        uint candidateCount = (uint)extent.x * (uint)extent.y * (uint)extent.z;
+        if (candidateCount == 0u)
+            continue;
+        if (candidateCount > _GIMaxCellsPerTriangle)
+        {
+            GIWriteCell(levelIndex, (int3)floor(p0 / level.cellSize), packedSurface, GIPackHalf2(uv0));
+            GIWriteCell(levelIndex, (int3)floor(p1 / level.cellSize), packedSurface, GIPackHalf2(uv1));
+            GIWriteCell(levelIndex, (int3)floor(p2 / level.cellSize), packedSurface, GIPackHalf2(uv2));
+            GIWriteCell(levelIndex, (int3)floor(((p0 + p1 + p2) / 3.0) / level.cellSize),
+                        packedSurface, GIPackHalf2((uv0 + uv1 + uv2) / 3.0));
+            continue;
+        }
+        float threshold = level.cellSize * 0.9;
+        float thresholdSq = threshold * threshold;
+        for (int z = cellMin.z; z <= cellMax.z; z++)
+        for (int y = cellMin.y; y <= cellMax.y; y++)
+        for (int x = cellMin.x; x <= cellMax.x; x++)
+        {
+            int3 cell = int3(x, y, z);
+            float3 center = (float3(cell) + 0.5) * level.cellSize;
+            float3 closest = GIClosestPointOnTriangle(center, p0, p1, p2);
+            if (dot(center - closest, center - closest) <= thresholdSq)
+            {
+                float3 barycentric = GIBarycentric(closest, p0, p1, p2);
+                GIWriteCell(levelIndex, cell, packedSurface,
+                            GIPackHalf2(uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z));
+            }
+        }
+    }
+}
+
+uint GILocalCellIndex(uint3 cell)
+{
+    return cell.x + cell.y * GI_BRICK_SIZE + cell.z * GI_BRICK_SIZE * GI_BRICK_SIZE;
+}
+
+bool GIPhysicalCellOccupied(uint physicalBrick, uint localCell)
+{
+    uint word = _GIOccupancy[physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u];
+    return (word & (1u << (localCell & 31u))) != 0u;
+}
+
+[numthreads(8, 8, 8)]
+void InitializeDistance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIDirtyBricks[groupId.x];
+    uint localCell = GILocalCellIndex(threadId);
+    _GIDistance[physicalBrick * GI_DISTANCE_WORDS_PER_BRICK + localCell] =
+        GIPhysicalCellOccupied(physicalBrick, localCell) ? 0u : 255u;
+}
+
+[numthreads(8, 8, 8)]
+void PropagateDistance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIDirtyBricks[groupId.x];
+    uint localCell = GILocalCellIndex(threadId);
+    uint address = physicalBrick * GI_DISTANCE_WORDS_PER_BRICK + localCell;
+    uint best = _GIDistance[address];
+    int stepSize = (int)max(1u, _GIPropagationStep);
+    [unroll]
+    for (int z = -1; z <= 1; z++)
+    [unroll]
+    for (int y = -1; y <= 1; y++)
+    [unroll]
+    for (int x = -1; x <= 1; x++)
+    {
+        if (x == 0 && y == 0 && z == 0)
+            continue;
+        int3 neighbour = (int3)threadId + int3(x, y, z) * stepSize;
+        if (any(neighbour < 0) || any(neighbour >= GI_BRICK_SIZE))
+            continue;
+        uint neighbourCell = GILocalCellIndex((uint3)neighbour);
+        uint neighbourDistance = _GIDistance[
+            physicalBrick * GI_DISTANCE_WORDS_PER_BRICK + neighbourCell];
+        best = min(best, neighbourDistance + (uint)stepSize);
+    }
+    _GIDistance[address] = min(best, 255u);
+}

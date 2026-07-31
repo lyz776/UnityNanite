@@ -2,7 +2,8 @@
     "name": "Nanite.Editor",
     "rootNamespace": "Nanite.Editor",
     "references": [
-        "Nanite"
+        "Nanite",
+        "Unity.RenderPipelines.Core.Runtime"
     ],
     "includePlatforms": [
         "Editor"

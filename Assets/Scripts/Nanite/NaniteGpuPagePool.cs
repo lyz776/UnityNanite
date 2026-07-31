@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -16,6 +18,10 @@ namespace Nanite
     /// </summary>
     public sealed class NaniteGpuPagePool : IDisposable
     {
+        // NVIDIA's streaming path unloads by age after traversal has stopped
+        // touching a group. A non-zero grace period prevents a fixed camera from
+        // cycling a working set larger than the physical cache every readback.
+        const int EvictionGraceFrames = 30;
         public const int SlotBytes = 256 * 1024;
         public const int PageDecodeEntryBytes = 64;
         public const int ResidentPageEntryBytes = 32;
@@ -103,36 +109,62 @@ namespace Nanite
         {
             public readonly int pageId;
             public readonly uint generation;
+            public readonly uint priority;
             public readonly byte[] bulk;
-            public readonly int offset;
+            public readonly string filePath;
+            public readonly long offset;
             public readonly int length;
 
             public PageDecodeWork(
                 int pageId,
                 uint generation,
+                uint priority,
                 byte[] bulk,
-                int offset,
+                long offset,
                 int length)
             {
                 this.pageId = pageId;
                 this.generation = generation;
+                this.priority = priority;
                 this.bulk = bulk;
+                this.filePath = null;
                 this.offset = offset;
                 this.length = length;
             }
+
+            public PageDecodeWork(
+                int pageId,
+                uint generation,
+                uint priority,
+                string filePath,
+                long offset,
+                int length)
+            {
+                this.pageId = pageId;
+                this.generation = generation;
+                this.priority = priority;
+                this.bulk = null;
+                this.filePath = filePath;
+                this.offset = offset;
+                this.length = length;
+            }
+
+            public bool UsesFileRange => !string.IsNullOrEmpty(filePath);
         }
 
         readonly struct DecodedPage
         {
             public readonly int pageId;
             public readonly uint generation;
+            public readonly uint priority;
             public readonly byte[] packedPage;
             public readonly string error;
 
-            public DecodedPage(int pageId, uint generation, byte[] packedPage, string error)
+            public DecodedPage(int pageId, uint generation, uint priority, byte[] packedPage, string error)
             {
                 this.pageId = pageId;
                 this.generation = generation;
+                this.priority = priority;
                 this.packedPage = packedPage;
                 this.error = error;
             }
@@ -186,6 +218,7 @@ namespace Nanite
             public bool resident;
             public bool residentGeometryReady;
             public int lastTouchedFrame;
+            public uint lastRequestPriority;
         }
 
         struct RetiredAllocation
@@ -200,125 +233,12 @@ namespace Nanite
             public bool hasFence;
         }
 
-        sealed class GpuRangeAllocator
-        {
-            struct Range
-            {
-                public int offset;
-                public int count;
-            }
-
-            readonly List<Range> freeRanges = new List<Range>(64);
-
-            public int Capacity { get; private set; }
-            public int FreeCount { get; private set; }
-
-            public void Reset(int capacity)
-            {
-                Capacity = Mathf.Max(0, capacity);
-                FreeCount = Capacity;
-                freeRanges.Clear();
-                if (Capacity > 0)
-                    freeRanges.Add(new Range { offset = 0, count = Capacity });
-            }
-
-            public bool TryAllocate(int count, out int offset)
-            {
-                offset = -1;
-                if (count <= 0)
-                    return true;
-
-                int bestIndex = -1;
-                int bestWaste = int.MaxValue;
-                for (int i = 0; i < freeRanges.Count; i++)
-                {
-                    Range range = freeRanges[i];
-                    if (range.count < count)
-                        continue;
-                    int waste = range.count - count;
-                    if (waste >= bestWaste)
-                        continue;
-                    bestWaste = waste;
-                    bestIndex = i;
-                    if (waste == 0)
-                        break;
-                }
-
-                if (bestIndex < 0)
-                    return false;
-                Range selected = freeRanges[bestIndex];
-                offset = selected.offset;
-                if (selected.count == count)
-                {
-                    freeRanges.RemoveAt(bestIndex);
-                }
-                else
-                {
-                    selected.offset += count;
-                    selected.count -= count;
-                    freeRanges[bestIndex] = selected;
-                }
-                FreeCount -= count;
-                return true;
-            }
-
-            public void Free(int offset, int count)
-            {
-                if (count <= 0)
-                    return;
-                if (offset < 0 || offset > Capacity - count)
-                    throw new ArgumentOutOfRangeException(
-                        nameof(offset),
-                        $"GPU range [{offset}, {offset + count}) exceeds capacity {Capacity}.");
-
-                int insertIndex = 0;
-                while (insertIndex < freeRanges.Count && freeRanges[insertIndex].offset < offset)
-                    insertIndex++;
-                if (insertIndex > 0)
-                {
-                    Range previous = freeRanges[insertIndex - 1];
-                    if (previous.offset + previous.count > offset)
-                        throw new InvalidOperationException("GPU range allocator detected an overlapping free.");
-                }
-                if (insertIndex < freeRanges.Count && offset + count > freeRanges[insertIndex].offset)
-                    throw new InvalidOperationException("GPU range allocator detected an overlapping free.");
-
-                freeRanges.Insert(insertIndex, new Range { offset = offset, count = count });
-                FreeCount += count;
-
-                if (insertIndex > 0)
-                {
-                    Range previous = freeRanges[insertIndex - 1];
-                    Range current = freeRanges[insertIndex];
-                    if (previous.offset + previous.count == current.offset)
-                    {
-                        previous.count += current.count;
-                        freeRanges[insertIndex - 1] = previous;
-                        freeRanges.RemoveAt(insertIndex);
-                        insertIndex--;
-                    }
-                }
-                if (insertIndex + 1 < freeRanges.Count)
-                {
-                    Range current = freeRanges[insertIndex];
-                    Range next = freeRanges[insertIndex + 1];
-                    if (current.offset + current.count == next.offset)
-                    {
-                        current.count += next.count;
-                        freeRanges[insertIndex] = current;
-                        freeRanges.RemoveAt(insertIndex + 1);
-                    }
-                }
-            }
-        }
-
         readonly List<CpuPageRecord> pages = new List<CpuPageRecord>(256);
         readonly Dictionary<PageKey, int> pageIdByKey = new Dictionary<PageKey, int>(256);
         readonly Dictionary<int, byte[]> bulkPayloadBytesByAssetId = new Dictionary<int, byte[]>(32);
         readonly Stack<int> freeSlots = new Stack<int>(256);
+        readonly HashSet<int> desiredPageIds = new HashSet<int>();
         readonly List<RetiredAllocation> retiredAllocations = new List<RetiredAllocation>(32);
-        readonly GpuRangeAllocator residentVertexAllocator = new GpuRangeAllocator();
-        readonly GpuRangeAllocator residentIndexAllocator = new GpuRangeAllocator();
 
         GraphicsBuffer packedPoolBuffer;
         GraphicsBuffer residentVertexBuffer;
@@ -365,6 +285,11 @@ namespace Nanite
         bool loggedFirstStreamUpload;
         ComputeShader residentTranscodeShader;
         bool dynamicResidentRanges;
+        int residentVerticesPerSlot;
+        int residentIndicesPerSlot;
+        long totalStorageBytesRead;
+        int totalStorageReadOperations;
+        int streamingFilePageCount;
 
         public int PageCount => pages.Count;
         public int SlotCount { get; private set; }
@@ -374,9 +299,16 @@ namespace Nanite
         public int LastRequestedPageCount { get; private set; }
         public int LastQueuedPageCount { get; private set; }
         public uint LastMaxRequestPriority { get; private set; }
+        public int TotalStreamedPageCount { get; private set; }
+        public int TotalEvictedPageCount { get; private set; }
+        public int TotalRecycledAllocationCount { get; private set; }
+        public int RetiredAllocationCount => retiredAllocations.Count;
         public int ResidentBytes { get; private set; }
         public int PoolBytes => SlotCount * SlotBytes;
         public long ResidentGeometryBytes { get; private set; }
+        public long TotalStorageBytesRead => Interlocked.Read(ref totalStorageBytesRead);
+        public int TotalStorageReadOperations => Volatile.Read(ref totalStorageReadOperations);
+        public int StreamingFilePageCount => streamingFilePageCount;
         public bool NeedsRetirementFence
         {
             get
@@ -498,9 +430,10 @@ namespace Nanite
             (uint)pageId < (uint)pages.Count && pages[pageId].pinned;
 
         /// <summary>
-        /// Transitional packed-raster admission. Until residency-aware parent fallback is wired
-        /// into traversal, direct Page consumers may only run when the complete Page set fits in
-        /// the pool. Uploads happen once during a scene rebuild; no per-frame readback is used.
+        /// Fast admission for scenes whose complete virtual Page set fits in the pool.
+        /// Constrained pools use the separate demand-streaming path: traversal requests the
+        /// fine working set and remains on an atomically complete resident coarse producer.
+        /// This method avoids request/readback churn when residency is trivially complete.
         /// </summary>
         public bool EnsureAllPagesResidentForPackedRaster(
             ComputeShader transcodeShader,
@@ -632,12 +565,13 @@ namespace Nanite
             return true;
         }
 
-        public void Touch(int pageId, int frameIndex)
+        public void Touch(int pageId, int frameIndex, uint priority)
         {
             if ((uint)pageId >= (uint)pages.Count)
                 return;
             CpuPageRecord record = pages[pageId];
             record.lastTouchedFrame = frameIndex;
+            record.lastRequestPriority = priority;
             pages[pageId] = record;
         }
 
@@ -671,9 +605,8 @@ namespace Nanite
             pageIdByKey.Clear();
             bulkPayloadBytesByAssetId.Clear();
             freeSlots.Clear();
+            desiredPageIds.Clear();
             retiredAllocations.Clear();
-            residentVertexAllocator.Reset(0);
-            residentIndexAllocator.Reset(0);
             pageTableCpu = Array.Empty<GpuPageTableEntry>();
             pageDecodeCpu = Array.Empty<GpuPageDecodeEntry>();
             residentPageTableCpu = Array.Empty<GpuResidentPageEntry>();
@@ -698,6 +631,11 @@ namespace Nanite
             loggedFirstStreamUpload = false;
             residentTranscodeShader = null;
             dynamicResidentRanges = false;
+            residentVerticesPerSlot = 0;
+            residentIndicesPerSlot = 0;
+            Interlocked.Exchange(ref totalStorageBytesRead, 0L);
+            Interlocked.Exchange(ref totalStorageReadOperations, 0);
+            streamingFilePageCount = 0;
             SlotCount = 0;
             ResidentPageCount = 0;
             PinnedPageCount = 0;
@@ -705,6 +643,9 @@ namespace Nanite
             LastRequestedPageCount = 0;
             LastQueuedPageCount = 0;
             LastMaxRequestPriority = 0u;
+            TotalStreamedPageCount = 0;
+            TotalEvictedPageCount = 0;
+            TotalRecycledAllocationCount = 0;
             ResidentBytes = 0;
             ResidentGeometryBytes = 0;
         }
@@ -729,6 +670,9 @@ namespace Nanite
                     if (page == null)
                         continue;
 
+                    if (page.HasStreamingPayload)
+                        streamingFilePageCount++;
+
                     bool root = ResolveRootPage(mesh, page, localPageIndex);
                     ResolvePackedGeometryCounts(page, out int vertexCount, out int indexCount);
                     int pageId = pages.Count;
@@ -750,7 +694,8 @@ namespace Nanite
                         pinned = root,
                         resident = false,
                         residentGeometryReady = false,
-                        lastTouchedFrame = root ? int.MaxValue : -1
+                        lastTouchedFrame = root ? int.MaxValue : -1,
+                        lastRequestPriority = root ? uint.MaxValue : 0u
                     });
                     pageIdByKey[new PageKey(mesh.GetInstanceID(), localPageIndex)] = pageId;
                     if (root)
@@ -816,27 +761,20 @@ namespace Nanite
             long totalResidentIndices = 0;
             if (dynamicResidentRanges)
             {
-                // Size the decoded working set independently for vertices and indices. Taking
-                // the largest SlotCount ranges guarantees that any SlotCount resident Pages fit,
-                // while avoiding a decoded allocation for the entire virtual Page set.
-                var vertexCounts = new int[pages.Count];
-                var indexCounts = new int[pages.Count];
+                // Packed and decoded data share one physical Page-slot lifetime. A fixed
+                // decoded stride per slot prevents variable-range fragmentation and makes
+                // one retirement fence sufficient to recycle the complete Page address.
                 for (int pageId = 0; pageId < pages.Count; pageId++)
                 {
                     CpuPageRecord record = pages[pageId];
-                    vertexCounts[pageId] = Mathf.Max(0, record.vertexCount);
-                    indexCounts[pageId] = Mathf.Max(0, record.indexCount);
+                    residentVerticesPerSlot = Mathf.Max(residentVerticesPerSlot, record.vertexCount);
+                    residentIndicesPerSlot = Mathf.Max(residentIndicesPerSlot, record.indexCount);
                     record.residentVertexBase = -1;
                     record.residentIndexBase = -1;
                     pages[pageId] = record;
                 }
-                Array.Sort(vertexCounts);
-                Array.Sort(indexCounts);
-                for (int i = 0; i < SlotCount; i++)
-                {
-                    totalResidentVertices += vertexCounts[vertexCounts.Length - 1 - i];
-                    totalResidentIndices += indexCounts[indexCounts.Length - 1 - i];
-                }
+                totalResidentVertices = (long)residentVerticesPerSlot * SlotCount;
+                totalResidentIndices = (long)residentIndicesPerSlot * SlotCount;
             }
             else
             {
@@ -857,8 +795,6 @@ namespace Nanite
                 Dispose();
                 return false;
             }
-            residentVertexAllocator.Reset(dynamicResidentRanges ? (int)totalResidentVertices : 0);
-            residentIndexAllocator.Reset(dynamicResidentRanges ? (int)totalResidentIndices : 0);
             residentVertexBuffer = new GraphicsBuffer(
                 GraphicsBuffer.Target.Structured,
                 Mathf.Max(1, (int)totalResidentVertices),
@@ -975,7 +911,8 @@ namespace Nanite
                 $"resident={ResidentPageCount}, pinned={PinnedPageCount}, " +
                 $"pool={PoolBytes / (1024f * 1024f):F2} MiB/{SlotCount} slots, " +
                 $"residentCache={ResidentGeometryBytes / (1024f * 1024f):F2} MiB, " +
-                $"rootPayload={ResidentBytes / 1024f:F1} KiB, slot={SlotBytes / 1024} KiB.");
+                $"rootPayload={ResidentBytes / 1024f:F1} KiB, slot={SlotBytes / 1024} KiB, " +
+                $"fileRanges={streamingFilePageCount}/{PageCount}, io={TotalStorageBytesRead / 1024f:F1} KiB/{TotalStorageReadOperations} reads.");
             return true;
         }
 
@@ -1067,21 +1004,8 @@ namespace Nanite
             int residentIndexBase = record.residentIndexBase;
             if (dynamicResidentRanges)
             {
-                if (!residentVertexAllocator.TryAllocate(record.vertexCount, out residentVertexBase))
-                {
-                    error =
-                        $"No contiguous resident vertex range for {record.vertexCount} vertices " +
-                        $"({residentVertexAllocator.FreeCount}/{residentVertexAllocator.Capacity} free).";
-                    return false;
-                }
-                if (!residentIndexAllocator.TryAllocate(record.indexCount, out residentIndexBase))
-                {
-                    residentVertexAllocator.Free(residentVertexBase, record.vertexCount);
-                    error =
-                        $"No contiguous resident index range for {record.indexCount} indices " +
-                        $"({residentIndexAllocator.FreeCount}/{residentIndexAllocator.Capacity} free).";
-                    return false;
-                }
+                residentVertexBase = checked(slotIndex * residentVerticesPerSlot);
+                residentIndexBase = checked(slotIndex * residentIndicesPerSlot);
             }
             freeSlots.Pop();
             int wordCount = (blob.Length + 3) / 4;
@@ -1137,10 +1061,24 @@ namespace Nanite
             out string error)
         {
             packedPage = null;
-            if (page == null || page.BinaryPayload == null)
+            if (page == null || !page.HasBinaryPayload)
             {
                 error = "Missing binary Page payload.";
                 return false;
+            }
+
+            if (page.HasStreamingPayload)
+            {
+                if (!page.TryGetStoragePayload(out byte[] storagePayload, out error))
+                    return false;
+                Interlocked.Add(ref totalStorageBytesRead, storagePayload.Length);
+                Interlocked.Increment(ref totalStorageReadOperations);
+                return NanitePageStorageCodec.TryUnpack(
+                    storagePayload,
+                    0,
+                    storagePayload.Length,
+                    out packedPage,
+                    out error);
             }
 
             TextAsset payload = page.BinaryPayload;
@@ -1162,8 +1100,8 @@ namespace Nanite
 
         /// <summary>
         /// Polls the GPU request mask without a synchronous readback. V1 payloads are currently
-        /// TextAssets, so the callback uploads already-imported bytes; chunk IO replaces that
-        /// source in the next streaming stage without changing the GPU table ABI.
+        /// New payloads are read as exact StreamingAssets file ranges on a worker; legacy
+        /// TextAssets remain a compatibility source without changing the GPU table ABI.
         /// </summary>
         public void UpdateStreaming(
             int frameIndex,
@@ -1211,10 +1149,8 @@ namespace Nanite
                 }
 
                 var priorities = request.GetData<uint>();
-                var requested = new List<PrioritizedPageRequest>(Mathf.Min(priorities.Length, 256));
+                var demanded = new List<PrioritizedPageRequest>(Mathf.Min(priorities.Length, 256));
                 uint maxPriority = 0u;
-                // Resident entries are usage touches; missing entries are load requests.
-                // Touch the complete current working set before selecting an LRU victim.
                 int requestCount = Mathf.Min(priorities.Length, pages.Count);
                 for (int pageId = 0; pageId < requestCount; pageId++)
                 {
@@ -1222,16 +1158,79 @@ namespace Nanite
                     if (priority == 0u)
                         continue;
                     maxPriority = Math.Max(maxPriority, priority);
-                    if (pages[pageId].resident)
-                        Touch(pageId, frameIndex);
-                    else
-                        requested.Add(new PrioritizedPageRequest(pageId, priority));
+                    if (!pages[pageId].pinned)
+                        demanded.Add(new PrioritizedPageRequest(pageId, priority));
                 }
-                requested.Sort((a, b) =>
+                demanded.Sort((a, b) =>
                 {
                     int byPriority = b.priority.CompareTo(a.priority);
                     return byPriority != 0 ? byPriority : a.pageId.CompareTo(b.pageId);
                 });
+
+                // Keep the previous desired set while it remains relevant, then
+                // admit a challenger only when it is at least 25% more important
+                // than the weakest member. A raw top-N changes around the cutoff
+                // on almost every camera step and turns streaming into flicker.
+                var previousDesired = new List<int>(desiredPageIds);
+                desiredPageIds.Clear();
+                int desiredBudget = Mathf.Max(0, SlotCount - PinnedPageCount);
+                for (int index = 0; index < previousDesired.Count && desiredPageIds.Count < desiredBudget; index++)
+                {
+                    int pageId = previousDesired[index];
+                    if ((uint)pageId < (uint)requestCount && priorities[pageId] > 0u && !pages[pageId].pinned)
+                        desiredPageIds.Add(pageId);
+                }
+                for (int demandIndex = 0;
+                    demandIndex < demanded.Count && desiredPageIds.Count < desiredBudget;
+                    demandIndex++)
+                    desiredPageIds.Add(demanded[demandIndex].pageId);
+                if (desiredPageIds.Count >= desiredBudget && desiredBudget > 0)
+                {
+                    for (int demandIndex = 0; demandIndex < demanded.Count; demandIndex++)
+                    {
+                        PrioritizedPageRequest demand = demanded[demandIndex];
+                        if (desiredPageIds.Contains(demand.pageId))
+                            continue;
+                        int weakestPageId = -1;
+                        uint weakestPriority = uint.MaxValue;
+                        foreach (int selectedPageId in desiredPageIds)
+                        {
+                            uint selectedPriority = priorities[selectedPageId];
+                            if (selectedPriority < weakestPriority ||
+                                (selectedPriority == weakestPriority && selectedPageId > weakestPageId))
+                            {
+                                weakestPageId = selectedPageId;
+                                weakestPriority = selectedPriority;
+                            }
+                        }
+                        if ((ulong)demand.priority * 4ul <= (ulong)weakestPriority * 5ul)
+                            break;
+                        desiredPageIds.Remove(weakestPageId);
+                        desiredPageIds.Add(demand.pageId);
+                    }
+                }
+
+                var requested = new List<PrioritizedPageRequest>(Mathf.Min(desiredBudget, demanded.Count));
+                for (int demandIndex = 0; demandIndex < demanded.Count; demandIndex++)
+                {
+                    PrioritizedPageRequest demand = demanded[demandIndex];
+                    if (!desiredPageIds.Contains(demand.pageId))
+                        continue;
+                    if (pages[demand.pageId].resident)
+                        Touch(demand.pageId, frameIndex, demand.priority);
+                    else
+                        requested.Add(demand);
+                }
+                int forcedStaleFrame = frameIndex - EvictionGraceFrames - 1;
+                for (int pageId = 0; pageId < pages.Count; pageId++)
+                {
+                    CpuPageRecord record = pages[pageId];
+                    if (!record.resident || record.pinned || desiredPageIds.Contains(pageId))
+                        continue;
+                    record.lastRequestPriority = 0u;
+                    record.lastTouchedFrame = Math.Min(record.lastTouchedFrame, forcedStaleFrame);
+                    pages[pageId] = record;
+                }
 
                 LastRequestedPageCount = requested.Count;
                 LastMaxRequestPriority = maxPriority;
@@ -1248,7 +1247,12 @@ namespace Nanite
                          pendingGeneration == capturedGeneration))
                         continue;
 
-                    if (!TryCreateDecodeWork(pageId, capturedGeneration, out PageDecodeWork work, out string error))
+                    if (!TryCreateDecodeWork(
+                        pageId,
+                        capturedGeneration,
+                        requested[requestIndex].priority,
+                        out PageDecodeWork work,
+                        out string error))
                     {
                         Debug.LogWarning(
                             $"[Nanite][PagePool] Page {pageId} request could not be queued: {error}");
@@ -1266,6 +1270,7 @@ namespace Nanite
         bool TryCreateDecodeWork(
             int pageId,
             uint workGeneration,
+            uint priority,
             out PageDecodeWork work,
             out string error)
         {
@@ -1278,12 +1283,47 @@ namespace Nanite
             }
 
             NaniteMeshPage page = pages[pageId].page;
-            TextAsset payload = page != null ? page.BinaryPayload : null;
-            if (payload == null)
+            if (page == null || !page.HasBinaryPayload)
             {
                 error = "Missing binary Page payload.";
                 return false;
             }
+            if (page.HasStreamingPayload)
+            {
+                if (!page.TryResolveStreamingFilePath(out string filePath, out error))
+                    return false;
+                int streamOffset = page.BinaryPayloadOffset;
+                int streamSize = page.BinaryPayloadSize;
+                if (streamOffset < 0 || streamSize <= 0)
+                {
+                    error = $"Invalid StreamingAssets Page range [{streamOffset}, {(long)streamOffset + streamSize}).";
+                    return false;
+                }
+                try
+                {
+                    long fileLength = new FileInfo(filePath).Length;
+                    if ((long)streamOffset + streamSize > fileLength)
+                    {
+                        error = $"Page range [{streamOffset}, {(long)streamOffset + streamSize}) exceeds '{filePath}' ({fileLength} bytes).";
+                        return false;
+                    }
+                }
+                catch (Exception exception)
+                {
+                    error = $"Could not inspect Page stream '{filePath}': {exception.Message}";
+                    return false;
+                }
+                work = new PageDecodeWork(
+                    pageId,
+                    workGeneration,
+                    priority,
+                    filePath,
+                    streamOffset,
+                    streamSize);
+                return true;
+            }
+
+            TextAsset payload = page.BinaryPayload;
             int assetId = payload.GetInstanceID();
             if (!bulkPayloadBytesByAssetId.TryGetValue(assetId, out byte[] bulk) || bulk == null)
             {
@@ -1294,7 +1334,7 @@ namespace Nanite
             }
             if (!page.TryResolveStorageRange(bulk, out int offset, out int size, out error))
                 return false;
-            work = new PageDecodeWork(pageId, workGeneration, bulk, offset, size);
+            work = new PageDecodeWork(pageId, workGeneration, priority, bulk, offset, size);
             return true;
         }
 
@@ -1302,7 +1342,7 @@ namespace Nanite
         {
             if (batch == null || batch.Length == 0)
                 return;
-            _ = Task.Run(() =>
+            _ = Task.Run(async () =>
             {
                 for (int i = 0; i < batch.Length; i++)
                 {
@@ -1312,9 +1352,21 @@ namespace Nanite
                     string error;
                     try
                     {
+                        byte[] storage = work.bulk;
+                        int storageOffset = checked((int)work.offset);
+                        if (work.UsesFileRange)
+                        {
+                            storage = await ReadFileRangeAsync(
+                                work.filePath,
+                                work.offset,
+                                work.length).ConfigureAwait(false);
+                            storageOffset = 0;
+                            Interlocked.Add(ref totalStorageBytesRead, work.length);
+                            Interlocked.Increment(ref totalStorageReadOperations);
+                        }
                         ok = NanitePageStorageCodec.TryUnpack(
-                            work.bulk,
-                            work.offset,
+                            storage,
+                            storageOffset,
                             work.length,
                             out packedPage,
                             out error);
@@ -1328,10 +1380,41 @@ namespace Nanite
                     decodedCompletionQueue.Enqueue(new DecodedPage(
                         work.pageId,
                         work.generation,
+                        work.priority,
                         ok ? packedPage : null,
                         ok ? null : error));
                 }
             });
+        }
+
+        static async Task<byte[]> ReadFileRangeAsync(string filePath, long offset, int length)
+        {
+            if (string.IsNullOrEmpty(filePath) || offset < 0 || length <= 0)
+                throw new ArgumentOutOfRangeException(nameof(length), "Page file range is invalid.");
+
+            using var stream = new FileStream(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                64 * 1024,
+                FileOptions.Asynchronous | FileOptions.RandomAccess);
+            if (offset + length > stream.Length)
+                throw new EndOfStreamException(
+                    $"Page range [{offset}, {offset + length}) exceeds '{filePath}' ({stream.Length} bytes).");
+
+            stream.Seek(offset, SeekOrigin.Begin);
+            var bytes = new byte[length];
+            int read = 0;
+            while (read < length)
+            {
+                int count = await stream.ReadAsync(bytes, read, length - read).ConfigureAwait(false);
+                if (count <= 0)
+                    throw new EndOfStreamException(
+                        $"Unexpected EOF in '{filePath}' after {read}/{length} bytes.");
+                read += count;
+            }
+            return bytes;
         }
 
         void DrainDecodedPages(int frameIndex, int pageBudget, int byteBudget)
@@ -1346,6 +1429,12 @@ namespace Nanite
             {
                 DecodedPage decoded = decodedUploadQueue.Peek();
                 if (decoded.generation != generation || !IsReady)
+                {
+                    decodedUploadQueue.Dequeue();
+                    RemovePendingDecode(decoded.pageId, decoded.generation);
+                    continue;
+                }
+                if (RequiresEviction && !desiredPageIds.Contains(decoded.pageId))
                 {
                     decodedUploadQueue.Dequeue();
                     RemovePendingDecode(decoded.pageId, decoded.generation);
@@ -1369,7 +1458,10 @@ namespace Nanite
                 }
                 if (freeSlots.Count == 0)
                 {
-                    if (TryRetireLruPage(frameIndex, out int retiredPageId))
+                    if (TryRetireLruPage(
+                        frameIndex,
+                        decoded.priority,
+                        out int retiredPageId))
                     {
                         tableChanged = true;
                         if (!loggedPoolFull)
@@ -1406,6 +1498,10 @@ namespace Nanite
                 decodedUploadQueue.Dequeue();
                 RemovePendingDecode(decoded.pageId, decoded.generation);
                 uploads++;
+                TotalStreamedPageCount++;
+                CpuPageRecord uploadedRecord = pages[decoded.pageId];
+                uploadedRecord.lastRequestPriority = decoded.priority;
+                pages[decoded.pageId] = uploadedRecord;
                 uploadedBytes += decoded.packedPage.Length;
                 tableChanged = true;
             }
@@ -1448,22 +1544,41 @@ namespace Nanite
             }
         }
 
-        bool TryRetireLruPage(int frameIndex, out int pageId)
+        bool TryRetireLruPage(
+            int frameIndex,
+            uint incomingPriority,
+            out int pageId)
         {
             pageId = -1;
             int oldestFrame = int.MaxValue;
+            uint lowestPriority = uint.MaxValue;
             for (int i = 0; i < pages.Count; i++)
             {
                 CpuPageRecord candidate = pages[i];
                 if (!candidate.resident || candidate.pinned)
                     continue;
-                // Pages touched by this readback are the current working set. Until
-                // residency-aware parent fallback supplies a priority signal, prefer
-                // stability over cycling equally visible pages.
-                if (candidate.lastTouchedFrame >= frameIndex)
+                // Only pages absent from traversal for a sustained interval are
+                // evictable. Missing higher-detail pages continue to render through
+                // their complete resident ancestor instead of causing cache churn.
+                bool oldEnough = candidate.lastTouchedFrame + EvictionGraceFrames < frameIndex;
+                // Active pages are replaced only for a material priority gain.
+                // Without hysteresis, continuously changing projected error can
+                // exchange equal-value pages every readback and create visible
+                // residency flicker. Stale pages still follow the age fallback.
+                bool preferredReplacement =
+                    (ulong)incomingPriority * 4ul >
+                    (ulong)candidate.lastRequestPriority * 5ul;
+                if (!oldEnough && !preferredReplacement)
                     continue;
-                if (candidate.lastTouchedFrame >= oldestFrame)
+                if (candidate.lastRequestPriority > lowestPriority)
                     continue;
+                if (candidate.lastRequestPriority == lowestPriority &&
+                    candidate.lastTouchedFrame > oldestFrame)
+                    continue;
+                if (candidate.lastRequestPriority == lowestPriority &&
+                    candidate.lastTouchedFrame == oldestFrame && i < pageId)
+                    continue;
+                lowestPriority = candidate.lastRequestPriority;
                 oldestFrame = candidate.lastTouchedFrame;
                 pageId = i;
             }
@@ -1473,8 +1588,6 @@ namespace Nanite
 
             CpuPageRecord record = pages[pageId];
             int retiredSlot = record.slotIndex;
-            int retiredVertexBase = record.residentVertexBase;
-            int retiredIndexBase = record.residentIndexBase;
             record.slotIndex = -1;
             if (dynamicResidentRanges)
             {
@@ -1509,6 +1622,7 @@ namespace Nanite
             MarkPageDirty(pageId);
             MarkResidencyWordDirty(pageId >> 5);
             ResidentPageCount = Mathf.Max(0, ResidentPageCount - 1);
+            TotalEvictedPageCount++;
             ResidentBytes = Mathf.Max(0, ResidentBytes - record.packedBytes);
 
             // PublishTables is called by the request callback before any of these ranges can
@@ -1517,10 +1631,10 @@ namespace Nanite
             retiredAllocations.Add(new RetiredAllocation
             {
                 slotIndex = retiredSlot,
-                vertexBase = dynamicResidentRanges ? retiredVertexBase : -1,
-                vertexCount = dynamicResidentRanges ? record.vertexCount : 0,
-                indexBase = dynamicResidentRanges ? retiredIndexBase : -1,
-                indexCount = dynamicResidentRanges ? record.indexCount : 0,
+                vertexBase = -1,
+                vertexCount = 0,
+                indexBase = -1,
+                indexCount = 0,
                 fallbackReusableFrame = frameIndex + 4,
                 hasFence = false
             });
@@ -1552,11 +1666,8 @@ namespace Nanite
                     continue;
 
                 freeSlots.Push(retired.slotIndex);
-                if (retired.vertexCount > 0)
-                    residentVertexAllocator.Free(retired.vertexBase, retired.vertexCount);
-                if (retired.indexCount > 0)
-                    residentIndexAllocator.Free(retired.indexBase, retired.indexCount);
                 retiredAllocations.RemoveAt(i);
+                TotalRecycledAllocationCount++;
             }
         }
 

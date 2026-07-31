@@ -21,6 +21,9 @@ namespace Nanite
             public int clusterCount;
             public int instanceIndex;
             public uint lodFlags;
+            // Group whose fine side owns this Part. Runtime resolves this from
+            // hierarchy refs once per unique mesh; it is not serialized per Page.
+            public uint consumerGroupIndex;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -57,6 +60,11 @@ namespace Nanite
             // Batched GPU Scene hierarchy addressing. The legacy single-instance backend
             // leaves these at zero and continues to use the Part/Cluster path.
             public uint clusterOffset;
+            // Direct queues index immutable geometry once per unique mesh, while the
+            // compatibility offsets above address optional per-instance virtual refs.
+            // Keep these fields ABI-aligned with NaniteRuntimeCulling.compute.
+            public uint geometryPartOffset;
+            public uint geometryClusterOffset;
             public uint hierarchyRootOffset;
             public uint hierarchyRootCount;
             public uint hierarchyFlags;
@@ -647,7 +655,8 @@ namespace Nanite
                         clusterStart = clusterBase + part.clusterStart,
                         clusterCount = part.clusterCount,
                         instanceIndex = 0,
-                        lodFlags = terminalPart[pi] ? TerminalDisappearLodFlag : 0u
+                        lodFlags = terminalPart[pi] ? TerminalDisappearLodFlag : 0u,
+                        consumerGroupIndex = uint.MaxValue
                     });
                 }
 
@@ -776,7 +785,8 @@ namespace Nanite
                         clusterStart = clusterBase + part.clusterStart,
                         clusterCount = part.clusterCount,
                         instanceIndex = instanceIndex,
-                        lodFlags = terminalPart[pi] ? TerminalDisappearLodFlag : 0u
+                        lodFlags = terminalPart[pi] ? TerminalDisappearLodFlag : 0u,
+                        consumerGroupIndex = uint.MaxValue
                     });
                 }
 

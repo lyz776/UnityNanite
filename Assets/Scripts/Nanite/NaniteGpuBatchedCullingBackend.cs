@@ -34,6 +34,7 @@ namespace Nanite
             public int clusterOffset;
             public int partCount;
             public int clusterCount;
+            public int maxCutClusterCount;
             public int[] pagePartBase;
             public int[] pagePartCount;
             public Vector4 bounds;
@@ -45,6 +46,7 @@ namespace Nanite
             public int hierarchyGroupCount;
             public int spatialRootOffset;
             public int spatialRootCount;
+            public int spatialNodeCount;
             public int spatialMaxDepth;
             public bool hasSpatialHierarchy;
         }
@@ -79,6 +81,11 @@ namespace Nanite
             public uint coarseClusterCount;
             public uint mipLevel;
             public uint flags;
+            // Geometric error protects shape quality; these counts stop traversal
+            // once the current cut is already at micropolygon density.
+            public uint fineTriangleCount;
+            public uint coarseTriangleCount;
+            public float fineSurfaceArea;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -125,14 +132,21 @@ namespace Nanite
 
         const int kThreadGroupSize = 64;
         const int kMaxShadowCascades = 4;
-        const int kGpuLayoutVersion = 15;
+        const int kMaxShadowCasterPlanesPerCascade = 10;
+        const int kGpuLayoutVersion = 17;
         // The scalar persistent protocol is quarantined after two runtime failures
         // (wave deadlock and early-worker exit). Re-admission requires a cooperative
         // group/wave scheduler, not a user-facing toggle.
         const bool kEnableUnsafePersistentTraversal = false;
-        // Atomic producer-group replacement is incompatible with the regrouped DAG used
-        // by meshoptimizer/NVIDIA continuous LOD. Production uses the independent
-        // generating/self-group cut until the per-level spatial hierarchy lands.
+        // clusterlod/UE-style regrouping produces a DAG, not a tree.  The former
+        // root-to-leaf producer replacement path canonicalized a producer on its
+        // first coarse cluster; sibling coarse clusters can belong to different
+        // later groups, so that traversal dropped the rest of the producer and
+        // made it reappear at another distance.  Production therefore uses the
+        // spatial Part queue followed by the official per-cluster two-boundary
+        // predicate (consumer error > threshold && producer error <= threshold).
+        // Re-enable hierarchy acceleration only after it is rebuilt as a BVH over
+        // groups/levels, never as a recursive producer tree.
         const bool kEnableAtomicHierarchyTraversal = false;
         static readonly int[] kShadowVisibleDrawCountArgsIds =
         {
@@ -158,6 +172,48 @@ namespace Nanite
             Pass2CandidatesHzb = 2
         }
 
+        public readonly struct HzbViewParameters
+        {
+            public readonly bool valid;
+            public readonly Matrix4x4 worldToClip;
+            public readonly Vector3 cameraPosition;
+            public readonly Vector3 cameraForward;
+            public readonly Vector2 projectionNdcScale;
+            public readonly float zNear;
+
+            public HzbViewParameters(
+                Matrix4x4 worldToClip,
+                Vector3 cameraPosition,
+                Vector3 cameraForward,
+                Vector2 projectionNdcScale,
+                float zNear)
+            {
+                valid = true;
+                this.worldToClip = worldToClip;
+                this.cameraPosition = cameraPosition;
+                this.cameraForward = cameraForward.sqrMagnitude > 1e-12f
+                    ? cameraForward.normalized
+                    : Vector3.forward;
+                this.projectionNdcScale = new Vector2(
+                    Mathf.Max(1e-6f, Mathf.Abs(projectionNdcScale.x)),
+                    Mathf.Max(1e-6f, Mathf.Abs(projectionNdcScale.y)));
+                this.zNear = Mathf.Max(1e-3f, zNear);
+            }
+
+            public static HzbViewParameters FromCamera(Camera camera)
+            {
+                if (camera == null)
+                    return default;
+                Matrix4x4 projection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
+                return new HzbViewParameters(
+                    projection * camera.worldToCameraMatrix,
+                    camera.transform.position,
+                    camera.transform.forward,
+                    new Vector2(Mathf.Abs(projection.m00), Mathf.Abs(projection.m11)),
+                    camera.nearClipPlane);
+            }
+        }
+
         ComputeShader shader;
         int kernelPartCull = -1;
         int kernelClusterCull = -1;
@@ -177,6 +233,8 @@ namespace Nanite
         int kernelTraverseHierarchyPersistent = -1;
         int kernelSeedShadowHierarchyPersistent = -1;
         int kernelTraverseShadowHierarchyPersistent = -1;
+        int kernelSeedShadowHierarchyRoots = -1;
+        int kernelTraverseShadowHierarchy = -1;
         int kernelShadowCullMultiCascadeByPart = -1;
         int kernelSeedShadowSpatialRoots = -1;
         int kernelTraverseShadowSpatialNodes = -1;
@@ -186,6 +244,7 @@ namespace Nanite
         int kernelClearCullStats = -1;
         int kernelOrMasksToVisible = -1;
         int kernelFinalizeRasterBinArgs = -1;
+        int kernelRecoverHzbRejectedClusters = -1;
 
         ComputeBuffer partsBuffer;
         ComputeBuffer clustersBuffer;
@@ -199,6 +258,8 @@ namespace Nanite
         ComputeBuffer spatialPartRefsBuffer;
         ComputeBuffer visibleDrawClusterAppendBuffer;
         ComputeBuffer visibleDrawCountArgsBuffer;
+        ComputeBuffer hzbRejectedClusterAppendBuffer;
+        ComputeBuffer hzbRejectedDispatchArgsBuffer;
         ComputeBuffer hardwareRasterClusterAppendBuffer;
         ComputeBuffer softwareRasterClusterAppendBuffer;
         ComputeBuffer hardwareRasterCountArgsBuffer;
@@ -223,6 +284,7 @@ namespace Nanite
         ComputeBuffer visibleCountBuffer;
         ComputeBuffer clusterCandidateBuffer;
         ComputeBuffer clusterSceneIndexBuffer;
+        ComputeBuffer geometryClusterPageIndexBuffer;
         ComputeBuffer sceneClusterFirstTriBuffer;
         ComputeBuffer sceneClusterTriCountBuffer;
         ComputeBuffer scenePageResidencyBuffer;
@@ -260,8 +322,11 @@ namespace Nanite
         readonly List<int> bvhStack = new List<int>(256);
         readonly Plane[] frustumPlaneObjects = new Plane[6];
         readonly Vector4[] frustumPlanes = new Vector4[6];
-        readonly Vector4[] shadowBatchFrustumPlanes = new Vector4[kMaxShadowCascades * 6];
+        readonly Vector4[] shadowBatchCasterPlanes =
+            new Vector4[kMaxShadowCascades * kMaxShadowCasterPlanesPerCascade];
         Vector4 shadowBatchProjectionScales;
+        Vector4 shadowBatchCasterPlaneCounts;
+        readonly Vector4[] shadowBatchCullingSpheres = new Vector4[kMaxShadowCascades];
         readonly Dictionary<int, List<NaniteVisibleClusterRef>> visibleScratch = new Dictionary<int, List<NaniteVisibleClusterRef>>();
 
         NaniteGpuCullingBackend.GpuPartData[] partDataCpu;
@@ -271,6 +336,7 @@ namespace Nanite
         uint[] partVisibleCpu;
         uint[] clusterCandidatesCpu;
         uint[] clusterSceneIndexCpu;
+        uint[] geometryClusterPageIndexCpu;
         uint[] visibleCountCpu = new uint[1];
         // 复用读回缓冲，避免每帧 new[] 触发 GC。
         GpuVisibleRef[] visibleRefsScratch = Array.Empty<GpuVisibleRef>();
@@ -280,9 +346,13 @@ namespace Nanite
         int geometryClusterCount;
         int clusterCandidateCount;
         int instanceCount;
+        bool virtualRefsExpanded;
         int hierarchyTraversalPassCount;
         int hierarchyPersistentCapacity;
         int spatialTraversalPassCount;
+        int spatialQueueCapacity;
+        int drawQueueCapacity;
+        bool forceFullDrawQueueCapacity;
         bool spatialReady;
         bool hierarchyReady;
         uint hierarchyPersistentEpoch;
@@ -307,12 +377,15 @@ namespace Nanite
             clustersBuffer != null &&
             virtualPartsBuffer != null &&
             virtualClustersBuffer != null &&
+            geometryClusterPageIndexBuffer != null &&
             visiblePartAppendBuffer != null &&
             visiblePartDispatchArgsBuffer != null &&
             visibleInstanceAppendBuffer != null &&
             visibleInstancePartDispatchArgsBuffer != null &&
             visibleDrawClusterAppendBuffer != null &&
             visibleDrawCountArgsBuffer != null &&
+            hzbRejectedClusterAppendBuffer != null &&
+            hzbRejectedDispatchArgsBuffer != null &&
             hardwareRasterClusterAppendBuffer != null &&
             softwareRasterClusterAppendBuffer != null &&
             hardwareRasterCountArgsBuffer != null &&
@@ -358,9 +431,12 @@ namespace Nanite
             kernelTraverseHierarchyPersistent = -1;
             kernelSeedShadowHierarchyPersistent = -1;
             kernelTraverseShadowHierarchyPersistent = -1;
+            kernelSeedShadowHierarchyRoots = -1;
+            kernelTraverseShadowHierarchy = -1;
             kernelShadowCullMultiCascadeByPart = -1;
             kernelSeedShadowSpatialRoots = -1;
             kernelTraverseShadowSpatialNodes = -1;
+            kernelRecoverHzbRejectedClusters = -1;
             slots.Clear();
             geometrySlots.Clear();
             geometryIndexByMeshId.Clear();
@@ -389,10 +465,13 @@ namespace Nanite
             geometryClusterCount = 0;
             clusterCandidateCount = 0;
             instanceCount = 0;
+            virtualRefsExpanded = false;
             hierarchyTraversalPassCount = 0;
             hierarchyPersistentCapacity = 0;
             hierarchyReady = false;
             spatialTraversalPassCount = 0;
+            spatialQueueCapacity = 0;
+            drawQueueCapacity = 0;
             spatialReady = false;
             hierarchyPersistentEpoch = 0u;
             lastTransformUpdateFrame = -1;
@@ -428,7 +507,7 @@ namespace Nanite
         public bool EnsureClusterSceneIndex(NaniteSceneVisibilityBufferBackend scene)
         {
             if (!IsReady || scene == null || !scene.IsReady || clusterDataCpu == null ||
-                virtualClusterRefsCpu == null || slots.Count == 0)
+                slots.Count == 0)
                 return false;
 
             sceneClusterFirstTriBuffer = scene.ClusterFirstTriBuffer;
@@ -453,36 +532,58 @@ namespace Nanite
                 scenePageCount * 13);
             if (clusterSceneIndexBuffer != null &&
                 clusterSceneIndexCpu != null &&
-                clusterSceneIndexCpu.Length == clusterCount &&
+                clusterSceneIndexCpu.Length == geometryClusterCount &&
                 sceneIndexSignature == sig &&
                 sceneClusterCountMapped == scene.ClusterCount)
                 return true;
 
-            clusterSceneIndexCpu = new uint[Mathf.Max(1, clusterCount)];
+            clusterSceneIndexCpu = new uint[Mathf.Max(1, geometryClusterCount)];
+            geometryClusterPageIndexCpu = new uint[Mathf.Max(1, geometryClusterCount)];
+            Array.Fill(clusterSceneIndexCpu, uint.MaxValue);
+            Array.Fill(geometryClusterPageIndexCpu, uint.MaxValue);
             int mapped = 0;
-            for (int i = 0; i < clusterCount; i++)
+            for (int geometryIndex = 0; geometryIndex < geometrySlots.Count; geometryIndex++)
             {
-                var virtualCluster = virtualClusterRefsCpu[i];
-                int inst = (int)virtualCluster.instanceIndex;
-                uint sceneIndex = 0xFFFFFFFFu;
-                if ((uint)inst < (uint)slots.Count && virtualCluster.clusterIndex < (uint)clusterDataCpu.Length)
+                int representativeProxyId = 0;
+                for (int slotIndex = 0; slotIndex < slots.Count; slotIndex++)
                 {
-                    var c = clusterDataCpu[virtualCluster.clusterIndex];
-                    int proxyId = slots[inst].proxyId;
-                    if (scene.TryGetGlobalClusterIndex(proxyId, c.pageIndex, c.clusterIndex, out int gi) && gi >= 0)
+                    if (slots[slotIndex].geometryIndex == geometryIndex)
                     {
-                        sceneIndex = (uint)gi;
+                        representativeProxyId = slots[slotIndex].proxyId;
+                        break;
+                    }
+                }
+                if (representativeProxyId == 0)
+                    continue;
+
+                GeometrySlot geometry = geometrySlots[geometryIndex];
+                int end = Mathf.Min(
+                    clusterDataCpu.Length,
+                    geometry.clusterOffset + geometry.clusterCount);
+                for (int geometryClusterIndex = geometry.clusterOffset;
+                     geometryClusterIndex < end;
+                     geometryClusterIndex++)
+                {
+                    var cluster = clusterDataCpu[geometryClusterIndex];
+                    if (scene.TryGetGlobalClusterIndex(
+                            representativeProxyId,
+                            cluster.pageIndex,
+                            cluster.clusterIndex,
+                            out int sceneIndex) &&
+                        sceneIndex >= 0)
+                    {
+                        clusterSceneIndexCpu[geometryClusterIndex] = (uint)sceneIndex;
                         mapped++;
                     }
-                    virtualCluster.reserved =
-                        scene.TryGetGlobalPageId(proxyId, c.pageIndex, out int globalPageId) &&
-                        globalPageId >= 0
-                            ? (uint)globalPageId
-                            : uint.MaxValue;
-                    virtualClusterRefsCpu[i] = virtualCluster;
+                    if (scene.TryGetGlobalPageId(
+                            representativeProxyId,
+                            cluster.pageIndex,
+                            out int globalPageId) &&
+                        globalPageId >= 0)
+                    {
+                        geometryClusterPageIndexCpu[geometryClusterIndex] = (uint)globalPageId;
+                    }
                 }
-
-                clusterSceneIndexCpu[i] = sceneIndex;
             }
 
             if (mapped <= 0)
@@ -491,7 +592,7 @@ namespace Nanite
             clusterSceneIndexBuffer?.Release();
             clusterSceneIndexBuffer = new ComputeBuffer(clusterSceneIndexCpu.Length, sizeof(uint), ComputeBufferType.Structured);
             clusterSceneIndexBuffer.SetData(clusterSceneIndexCpu);
-            virtualClustersBuffer.SetData(virtualClusterRefsCpu);
+            geometryClusterPageIndexBuffer.SetData(geometryClusterPageIndexCpu);
             sceneIndexSignature = sig;
             sceneClusterCountMapped = scene.ClusterCount;
             return true;
@@ -560,6 +661,7 @@ namespace Nanite
                 hzbTexture,
                 hzbMipCount,
                 useHzb,
+                HzbViewParameters.FromCamera(camera),
                 clusterVisible,
                 sceneClusterCount,
                 clearMask,
@@ -576,6 +678,7 @@ namespace Nanite
             Texture hzbTexture,
             int hzbMipCount,
             bool useHzb,
+            HzbViewParameters hzbView,
             ComputeBuffer clusterVisible,
             int sceneClusterCount,
             bool clearMask,
@@ -596,6 +699,7 @@ namespace Nanite
                     hzbTexture,
                     hzbMipCount,
                     useHzb,
+                    hzbView,
                     enableVisibleAppend: false,
                     enableClusterVisibleWrite: true,
                     clusterVisible,
@@ -677,6 +781,23 @@ namespace Nanite
             bool useHzb,
             Dictionary<int, NaniteRuntimeSelection> outputsByProxyId)
         {
+            return Run(
+                camera,
+                hzbTexture,
+                hzbMipCount,
+                useHzb,
+                HzbViewParameters.FromCamera(camera),
+                outputsByProxyId);
+        }
+
+        public bool Run(
+            Camera camera,
+            Texture hzbTexture,
+            int hzbMipCount,
+            bool useHzb,
+            HzbViewParameters hzbView,
+            Dictionary<int, NaniteRuntimeSelection> outputsByProxyId)
+        {
             if (!IsReady || camera == null || outputsByProxyId == null)
                 return false;
 
@@ -690,6 +811,7 @@ namespace Nanite
                     hzbTexture,
                     hzbMipCount,
                     useHzb,
+                    hzbView,
                     enableVisibleAppend: true,
                     enableClusterVisibleWrite: false,
                     clusterVisible: null,
@@ -763,6 +885,7 @@ namespace Nanite
             Texture hzbTexture,
             int hzbMipCount,
             bool useHzb,
+            HzbViewParameters hzbView,
             bool enableVisibleAppend,
             bool enableClusterVisibleWrite,
             ComputeBuffer clusterVisible,
@@ -803,12 +926,15 @@ namespace Nanite
                              hzbMipCount > 0;
             SetSharedParams(
                 cameraPos,
+                camera.transform.forward,
+                new Vector2(Mathf.Abs(gpuProj.m00), Mathf.Abs(gpuProj.m11)),
                 projectionScale,
                 zNear,
                 worldToClip,
                 camera.pixelWidth,
                 camera.pixelHeight,
-                enableHzb);
+                enableHzb,
+                hzbView);
             shader.SetInt("_UseGpuSceneRefs", 1);
             shader.SetInt("_HizMipCount", enableHzb ? Mathf.Max(1, hzbMipCount) : 1);
             Texture boundHzbTexture = enableHzb ? hzbTexture : GetFallbackHzbTexture();
@@ -836,6 +962,9 @@ namespace Nanite
             ComputeBuffer secondBuf = secondPassCandidates != null ? secondPassCandidates : GetFallbackSecondPassBuffer();
             ComputeBuffer pass2Buf = pass2Drawn != null ? pass2Drawn : GetFallbackPass2DrawnBuffer();
             EnsureCullStatsBuffer();
+
+            if (cullPassMode == CullPassMode.Pass1PrevVisible)
+                hzbRejectedClusterAppendBuffer.SetCounterValue(0);
 
             // 仅 Pass1/Legacy 清零；Pass2 追加 cull2Drawn，保留 cull1 计数。
             if (enableCullStats &&
@@ -874,6 +1003,23 @@ namespace Nanite
             bool enableVisibleDrawQueue = enableClusterVisibleWrite &&
                                           sceneClusterFirstTriBuffer != null &&
                                           sceneClusterTriCountBuffer != null;
+            if (cullPassMode == CullPassMode.Pass2CandidatesHzb &&
+                enableVisibleDrawQueue &&
+                DispatchHzbRejectedRecovery(
+                    camera,
+                    boundHzbTexture,
+                    visibleCountParam,
+                    pass2Buf,
+                    enableCullStats))
+            {
+                LastUsedCpuCandidates = false;
+                LastUsedPartDrivenClusterCull = false;
+                LastUsedVisiblePartQueue = false;
+                LastUsedVisibleInstanceQueue = false;
+                LastUsedHierarchyQueue = false;
+                LastUsedSpatialHierarchy = false;
+                return true;
+            }
             bool useHierarchyQueue = kEnableAtomicHierarchyTraversal &&
                                      !hasCpuCandidates &&
                                      enableVisibleDrawQueue &&
@@ -908,6 +1054,12 @@ namespace Nanite
                                            (useHierarchyQueue || useSpatialQueue ||
                                             instanceCount >= Mathf.Max(1, InstanceQueueMinInstances));
 
+            // A compact large-scene build deliberately owns no instance-expanded
+            // compatibility refs. Never fall through to a kernel that interprets
+            // the one-element placeholder as a virtual Part/Cluster array.
+            if (!virtualRefsExpanded && !useSpatialQueue && !useHierarchyQueue)
+                return false;
+
             if (hasCpuCandidates)
             {
                 partVisibleBuffer.SetData(partVisibleCpu);
@@ -936,11 +1088,17 @@ namespace Nanite
                         visibleInstancePartDispatchArgsBuffer,
                         0);
 
+                // Every direct cut consumes the same atomic producer residency
+                // contract. Populate it even when the cost model skips the spatial
+                // queue (for example a single instance), otherwise the fallback
+                // reads stale zeros and can select overlapping hierarchy levels.
+                if (!sceneAllPagesResident)
+                    DispatchHierarchyGroupResidency();
+
                 if (!useHierarchyQueue)
                 {
                     if (useSpatialQueue)
                     {
-                        DispatchHierarchyGroupResidency();
                         DispatchSpatialTraversal(boundHzbTexture);
                     }
                     else
@@ -968,6 +1126,9 @@ namespace Nanite
                                 visibleInstancePartDispatchArgsBuffer);
                         }
                         BindGpuSceneRefs(activePartKernel);
+                        // Part admission evaluates the same hierarchy group
+                        // error-or-density predicate as cluster selection.
+                        BindResidencyHierarchy(activePartKernel);
                         BindCullSharedBuffers(activePartKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
                         BindInstanceBuffers(activePartKernel);
                         BindHzbTexture(activePartKernel, boundHzbTexture);
@@ -1016,6 +1177,7 @@ namespace Nanite
             shader.SetInt("_EnableRasterBins", enableVisibleDrawQueue && EnableTraversalRasterBins ? 1 : 0);
             shader.SetFloat("_SoftwareRasterThresholdPixels", Mathf.Max(1f, SoftwareRasterThresholdPixels));
             shader.SetInt("_EnableClusterVisibleWrite", enableClusterVisibleWrite ? 1 : 0);
+            shader.SetInt("_EnableClusterBackfaceCull", EnableClusterBackfaceCulling ? 1 : 0);
             shader.SetInt("_SceneClusterCount", visibleCountParam);
             shader.SetInt("_CullPassMode", (int)cullPassMode);
             shader.SetInt("_HasPrevVisible", hasPrevVisible ? 1 : 0);
@@ -1062,6 +1224,7 @@ namespace Nanite
                 BindPageStreamingBuffers(activeClusterKernel);
                 BindResidencyHierarchy(activeClusterKernel);
                 BindCullSharedBuffers(activeClusterKernel, visibleTarget, sceneIndexBuf, prevBuf, secondBuf, pass2Buf);
+                BindHzbRejectedOutput(activeClusterKernel);
                 BindInstanceBuffers(activeClusterKernel);
                 BindHzbTexture(activeClusterKernel, boundHzbTexture);
 
@@ -1081,6 +1244,18 @@ namespace Nanite
 
             if (enableVisibleDrawQueue)
             {
+                if (cullPassMode == CullPassMode.Pass1PrevVisible)
+                {
+                    ComputeBuffer.CopyCount(
+                        hzbRejectedClusterAppendBuffer,
+                        hzbRejectedDispatchArgsBuffer,
+                        0);
+                    shader.SetBuffer(
+                        kernelFinalizeHierarchyDispatch,
+                        "_HierarchyDispatchArgsWrite",
+                        hzbRejectedDispatchArgsBuffer);
+                    shader.Dispatch(kernelFinalizeHierarchyDispatch, 1, 1, 1);
+                }
                 ComputeBuffer.CopyCount(visibleDrawClusterAppendBuffer, visibleDrawCountArgsBuffer, 0);
                 ComputeBuffer.CopyCount(hardwareRasterClusterAppendBuffer, hardwareRasterCountArgsBuffer, 0);
                 ComputeBuffer.CopyCount(softwareRasterClusterAppendBuffer, softwareRasterCountArgsBuffer, 0);
@@ -1181,12 +1356,34 @@ namespace Nanite
 
                 var drawCountArgs = new uint[4];
                 visibleDrawCountArgsBuffer.GetData(drawCountArgs);
+                var partDispatchArgs = new uint[4];
+                visiblePartDispatchArgsBuffer.GetData(partDispatchArgs);
+                int partQueueSampleCount = Mathf.Min(8, (int)partDispatchArgs[3]);
+                var partQueueSample = new Vector2Int[partQueueSampleCount];
+                if (partQueueSampleCount > 0)
+                    visiblePartAppendBuffer.GetData(partQueueSample, 0, 0, partQueueSampleCount);
+
+                if (!forceFullDrawQueueCapacity && drawCountArgs[0] >= (uint)drawQueueCapacity)
+                {
+                    // A valid replacement DAG cannot produce a frontier larger
+                    // than its terminal leaves. Reaching the bound is treated as
+                    // ambiguous metadata and schedules a full geometry-bound
+                    // rebuild instead of allowing a silent append overflow.
+                    forceFullDrawQueueCapacity = true;
+                    rebuildSignature = -1;
+                    registryRevision = -1;
+                    Debug.LogError(
+                        $"[Nanite][QueueCapacity] selected cut reached compact capacity " +
+                        $"{drawCountArgs[0]}/{drawQueueCapacity}; scheduling full-bound rebuild.");
+                }
 
                 Debug.Log(
                     "[Nanite][CullDiag] settled camera cull: " +
                     $"instanceVisible={CountNonZero(instanceVisible)}/{instanceReadCount}, " +
                     $"partVisible={CountNonZero(partVisible)}/{partReadCount}, " +
                     $"clusterVisible={CountNonZero(clusterMask)}/{clusterReadCount}, " +
+                    $"visiblePartQueue={partDispatchArgs[3]}, " +
+                    $"partHead={string.Join(";", partQueueSample)}, " +
                     $"drawQueue={drawCountArgs[0]}, " +
                     $"cpuCandidates={usedCpuCandidates}:{clusterCandidateCount}, " +
                     $"partDriven={usedPartDriven}, " +
@@ -1223,6 +1420,7 @@ namespace Nanite
         {
             shader.SetBuffer(kernel, "_VirtualParts", virtualPartsBuffer);
             shader.SetBuffer(kernel, "_VirtualClusters", virtualClustersBuffer);
+            shader.SetBuffer(kernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
         }
 
         void BindPageStreamingBuffers(int kernel)
@@ -1269,6 +1467,12 @@ namespace Nanite
             BindGpuSceneRefs(kernel);
             BindInstanceBuffers(kernel);
             BindPageStreamingBuffers(kernel);
+            // HierarchyFineWorkingSetResident validates geometry-local cluster
+            // indices against the immutable GPU Scene cluster table before it
+            // reads the global Page address.  This kernel is normally skipped by
+            // all-resident runs, so the missing SRV only surfaced in constrained
+            // streaming pools.
+            shader.SetBuffer(kernel, "_Clusters", clustersBuffer);
             shader.SetInt("_HierarchyGroupCount", hierarchyGroups.Count);
             shader.SetInt("_HierarchyRefCount", hierarchyClusterRefs.Count);
             shader.SetInt("_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
@@ -1300,6 +1504,64 @@ namespace Nanite
                 shader.SetBuffer(kernel, "_Parts", partsBuffer);
             if (clustersBuffer != null)
                 shader.SetBuffer(kernel, "_Clusters", clustersBuffer);
+        }
+
+        void BindHzbRejectedOutput(int kernel)
+        {
+            shader.SetBuffer(kernel, "_HzbRejectedClustersOut", hzbRejectedClusterAppendBuffer);
+        }
+
+        bool DispatchHzbRejectedRecovery(
+            Camera camera,
+            Texture hzbTexture,
+            int sceneClusterCount,
+            ComputeBuffer pass2Drawn,
+            bool enableCullStats)
+        {
+            if (camera == null || hzbTexture == null ||
+                kernelRecoverHzbRejectedClusters < 0 ||
+                kernelFinalizeRasterBinArgs < 0 ||
+                hzbRejectedClusterAppendBuffer == null ||
+                hzbRejectedDispatchArgsBuffer == null)
+                return false;
+
+            int kernel = kernelRecoverHzbRejectedClusters;
+            shader.SetInt("_ClusterCount", clusterCount);
+            shader.SetInt("_SceneClusterCount", sceneClusterCount);
+            shader.SetInt("_EnableVisibleDrawAppend", 1);
+            shader.SetInt("_EnableRasterBins", EnableTraversalRasterBins ? 1 : 0);
+            shader.SetFloat("_SoftwareRasterThresholdPixels", Mathf.Max(1f, SoftwareRasterThresholdPixels));
+            shader.SetInt("_EnableCullStats", enableCullStats ? 1 : 0);
+            shader.SetBuffer(kernel, "_HzbRejectedClusters", hzbRejectedClusterAppendBuffer);
+            shader.SetBuffer(kernel, "_HzbRejectedDispatchArgs", hzbRejectedDispatchArgsBuffer);
+            shader.SetBuffer(kernel, "_Clusters", clustersBuffer);
+            shader.SetBuffer(kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
+            shader.SetBuffer(kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+            shader.SetBuffer(kernel, "_VisibleDrawClusters", visibleDrawClusterAppendBuffer);
+            shader.SetBuffer(kernel, "_Pass2Drawn", pass2Drawn);
+            shader.SetBuffer(kernel, "_CullStats", cullStatsBuffer);
+            BindRasterBinOutputs(kernel);
+            BindInstanceBuffers(kernel);
+            BindHzbTexture(kernel, hzbTexture);
+            shader.DispatchIndirect(kernel, hzbRejectedDispatchArgsBuffer, 0);
+
+            ComputeBuffer.CopyCount(visibleDrawClusterAppendBuffer, visibleDrawCountArgsBuffer, 0);
+            ComputeBuffer.CopyCount(hardwareRasterClusterAppendBuffer, hardwareRasterCountArgsBuffer, 0);
+            ComputeBuffer.CopyCount(softwareRasterClusterAppendBuffer, softwareRasterCountArgsBuffer, 0);
+            shader.SetInt("_RasterDispatchGroupsX", 65535);
+            shader.SetBuffer(
+                kernelFinalizeRasterBinArgs,
+                "_SoftwareRasterCountArgs",
+                softwareRasterCountArgsBuffer);
+            shader.SetBuffer(
+                kernelFinalizeRasterBinArgs,
+                "_SoftwareRasterDispatchArgs",
+                softwareRasterDispatchArgsBuffer);
+            shader.Dispatch(kernelFinalizeRasterBinArgs, 1, 1, 1);
+
+            lastVisibleDrawQueueFrame = Time.frameCount;
+            lastVisibleDrawCameraId = camera.GetInstanceID();
+            return true;
         }
 
         ComputeBuffer GetFallbackClusterVisibleBuffer()
@@ -1381,14 +1643,20 @@ namespace Nanite
                     continue;
 
                 Transform proxyTransform = proxy.transform;
+                var current = instanceData[s];
+                float lodErr = LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels;
+                if (!proxyTransform.hasChanged &&
+                    Mathf.Approximately(current.lodErrorPixels, lodErr))
+                {
+                    continue;
+                }
+
                 Matrix4x4 m = proxyTransform.localToWorldMatrix;
                 Vector3 lossyScale = proxyTransform.lossyScale;
                 float maxScale = Mathf.Max(
                     Mathf.Abs(lossyScale.x),
                     Mathf.Abs(lossyScale.y),
                     Mathf.Abs(lossyScale.z));
-                float lodErr = LodErrorPixelsOverride > 0f ? LodErrorPixelsOverride : proxy.lodErrorPixels;
-                var current = instanceData[s];
                 if (current.localToWorld != m ||
                     !Mathf.Approximately(current.maxScale, maxScale) ||
                     !Mathf.Approximately(current.lodErrorPixels, lodErr))
@@ -1399,6 +1667,7 @@ namespace Nanite
                     instanceData[s] = current;
                     dirtyInstanceDataIndices.Add(s);
                 }
+                proxyTransform.hasChanged = false;
             }
 
             if (dirtyInstanceDataIndices.Count == 0)
@@ -1456,7 +1725,25 @@ namespace Nanite
             int maxHierarchyMip = 0;
             bool allGeometryHasSpatialHierarchy = true;
             int maxSpatialDepth = 0;
+            int totalSpatialWorkCapacity = 0;
             int virtualHierarchyRefCapacity = 0;
+            int logicalPartCount = 0;
+            int logicalClusterCount = 0;
+            int totalDrawQueueCapacity = 0;
+            int estimatedPartRefs = 0;
+            for (int proxyIndex = 0; proxyIndex < proxies.Count; proxyIndex++)
+            {
+                NaniteRuntimeProxy candidate = proxies[proxyIndex];
+                if (!IsBatchableProxy(candidate))
+                    continue;
+                estimatedPartRefs = checked(
+                    estimatedPartRefs + CountMeshParts(candidate.naniteMesh));
+            }
+            // Small scenes retain the compatibility refs used by CPU/readback
+            // tools. Large scenes commit to the NVIDIA-style direct spatial
+            // queue and never materialize instance x geometry references.
+            virtualRefsExpanded =
+                estimatedPartRefs < Mathf.Max(1, PartQueueMinVirtualParts);
 
             for (int i = 0; i < proxies.Count; i++)
             {
@@ -1515,13 +1802,52 @@ namespace Nanite
                             cluster.refinementGroupIndex = (uint)(hierarchyGroupOffset + clusterRef.refinementGroupIndex);
                             mergedClusters[mergedClusterIndex] = cluster;
                         }
+
+                        // Parts are Bake-aligned to one consumer group. Publish
+                        // that immutable relation once so the direct spatial cut
+                        // can evaluate the same group predicate on both sides of
+                        // a DAG replacement edge. This avoids density heuristics
+                        // independently dropping fine clusters and opening holes.
+                        for (int groupIndex = 0; groupIndex < mesh.hierarchyGroups.Length; groupIndex++)
+                        {
+                            NaniteHierarchyGroup group = mesh.hierarchyGroups[groupIndex];
+                            int fineEnd = group.fineClusterStart + group.fineClusterCount;
+                            for (int refIndex = group.fineClusterStart; refIndex < fineEnd; refIndex++)
+                            {
+                                NaniteHierarchyClusterRef clusterRef = mesh.hierarchyClusterRefs[refIndex];
+                                if ((uint)clusterRef.geometryClusterIndex >= (uint)geometryClusters)
+                                    continue;
+                                int mergedClusterIndex = geometryClusterOffset + clusterRef.geometryClusterIndex;
+                                int mergedPartIndex = mergedClusters[mergedClusterIndex].partIndex;
+                                if ((uint)mergedPartIndex >= (uint)mergedParts.Count)
+                                    continue;
+                                NaniteGpuCullingBackend.GpuPartData part = mergedParts[mergedPartIndex];
+                                uint globalGroupIndex = (uint)(hierarchyGroupOffset + groupIndex);
+                                if (part.consumerGroupIndex != uint.MaxValue &&
+                                    part.consumerGroupIndex != globalGroupIndex)
+                                {
+                                    throw new InvalidOperationException(
+                                        $"Nanite Part {mergedPartIndex} crosses consumer groups " +
+                                        $"{part.consumerGroupIndex} and {globalGroupIndex}.");
+                                }
+                                part.consumerGroupIndex = globalGroupIndex;
+                                mergedParts[mergedPartIndex] = part;
+                            }
+                        }
                     }
+                    int spatialNodeStart = spatialNodes.Count;
                     bool hasSpatialHierarchy = TryAppendGeometrySpatialHierarchy(
                         geometryPartOffset,
                         geometryParts,
                         out int spatialRootOffset,
                         out int spatialRootCount,
                         out int spatialMaxDepth);
+                    int maxCutClusterCount = hasGpuHierarchy
+                        ? CountTerminalGeometryClusters(
+                            mergedClusters,
+                            geometryClusterOffset,
+                            geometryClusters)
+                        : geometryClusters;
 
                     var geometry = new GeometrySlot
                     {
@@ -1530,6 +1856,7 @@ namespace Nanite
                         clusterOffset = geometryClusterOffset,
                         partCount = geometryParts,
                         clusterCount = geometryClusters,
+                        maxCutClusterCount = Mathf.Max(1, maxCutClusterCount),
                         pagePartBase = geometryPagePartBase,
                         pagePartCount = geometryPagePartCount,
                         bounds = ResolveMeshBounds(mesh, geometryPartOffset, geometryParts),
@@ -1541,6 +1868,9 @@ namespace Nanite
                         hierarchyGroupCount = hierarchyGroupCount,
                         spatialRootOffset = spatialRootOffset,
                         spatialRootCount = spatialRootCount,
+                        spatialNodeCount = hasSpatialHierarchy
+                            ? spatialNodes.Count - spatialNodeStart
+                            : 0,
                         spatialMaxDepth = spatialMaxDepth,
                         hasSpatialHierarchy = hasSpatialHierarchy
                     };
@@ -1553,6 +1883,8 @@ namespace Nanite
                 allGeometryHasHierarchy &= geometrySlot.hasGpuHierarchy;
                 maxHierarchyMip = Mathf.Max(maxHierarchyMip, geometrySlot.hierarchyMaxMip);
                 allGeometryHasSpatialHierarchy &= geometrySlot.hasSpatialHierarchy;
+                totalSpatialWorkCapacity = checked(
+                    totalSpatialWorkCapacity + geometrySlot.spatialNodeCount);
                 maxSpatialDepth = Mathf.Max(maxSpatialDepth, geometrySlot.spatialMaxDepth);
                 if (geometrySlot.hasGpuHierarchy && geometrySlot.mesh?.hierarchyClusterRefs != null)
                 {
@@ -1560,8 +1892,12 @@ namespace Nanite
                         virtualHierarchyRefCapacity + geometrySlot.mesh.hierarchyClusterRefs.Length);
                 }
                 int instanceIndex = slots.Count;
-                int virtualPartOffset = virtualParts.Count;
-                int virtualClusterOffset = virtualClusters.Count;
+                int virtualPartOffset = logicalPartCount;
+                int virtualClusterOffset = logicalClusterCount;
+                logicalPartCount = checked(logicalPartCount + geometrySlot.partCount);
+                logicalClusterCount = checked(logicalClusterCount + geometrySlot.clusterCount);
+                totalDrawQueueCapacity = checked(
+                    totalDrawQueueCapacity + geometrySlot.maxCutClusterCount);
                 int hierarchyResidencyOffset = hierarchyResidencyRefs.Count;
                 for (int localGroup = 0; localGroup < geometrySlot.hierarchyGroupCount; localGroup++)
                 {
@@ -1572,40 +1908,43 @@ namespace Nanite
                     });
                 }
 
-                for (int localCluster = 0; localCluster < geometrySlot.clusterCount; localCluster++)
+                if (virtualRefsExpanded)
                 {
-                    int geometryClusterIndex = geometrySlot.clusterOffset + localCluster;
-                    int geometryPartIndex = mergedClusters[geometryClusterIndex].partIndex;
-                    int localPart = geometryPartIndex - geometrySlot.partOffset;
-                    uint virtualPartIndex = (uint)localPart < (uint)geometrySlot.partCount
-                        ? (uint)(virtualPartOffset + localPart)
-                        : uint.MaxValue;
-                    virtualClusters.Add(new GpuVirtualClusterRef
+                    for (int localCluster = 0; localCluster < geometrySlot.clusterCount; localCluster++)
                     {
-                        instanceIndex = (uint)instanceIndex,
-                        clusterIndex = (uint)geometryClusterIndex,
-                        partIndex = virtualPartIndex,
-                        reserved = 0u
-                    });
-                }
+                        int geometryClusterIndex = geometrySlot.clusterOffset + localCluster;
+                        int geometryPartIndex = mergedClusters[geometryClusterIndex].partIndex;
+                        int localPart = geometryPartIndex - geometrySlot.partOffset;
+                        uint virtualPartIndex = (uint)localPart < (uint)geometrySlot.partCount
+                            ? (uint)(virtualPartOffset + localPart)
+                            : uint.MaxValue;
+                        virtualClusters.Add(new GpuVirtualClusterRef
+                        {
+                            instanceIndex = (uint)instanceIndex,
+                            clusterIndex = (uint)geometryClusterIndex,
+                            partIndex = virtualPartIndex,
+                            reserved = 0u
+                        });
+                    }
 
-                for (int localPart = 0; localPart < geometrySlot.partCount; localPart++)
-                {
-                    int geometryPartIndex = geometrySlot.partOffset + localPart;
-                    var part = mergedParts[geometryPartIndex];
-                    int localClusterStart = part.clusterStart - geometrySlot.clusterOffset;
-                    int safeClusterStart = Mathf.Clamp(localClusterStart, 0, geometrySlot.clusterCount);
-                    int safeClusterCount = Mathf.Clamp(
-                        part.clusterCount,
-                        0,
-                        geometrySlot.clusterCount - safeClusterStart);
-                    virtualParts.Add(new GpuVirtualPartRef
+                    for (int localPart = 0; localPart < geometrySlot.partCount; localPart++)
                     {
-                        instanceIndex = (uint)instanceIndex,
-                        partIndex = (uint)geometryPartIndex,
-                        clusterStart = (uint)(virtualClusterOffset + safeClusterStart),
-                        clusterCount = (uint)safeClusterCount
-                    });
+                        int geometryPartIndex = geometrySlot.partOffset + localPart;
+                        var part = mergedParts[geometryPartIndex];
+                        int localClusterStart = part.clusterStart - geometrySlot.clusterOffset;
+                        int safeClusterStart = Mathf.Clamp(localClusterStart, 0, geometrySlot.clusterCount);
+                        int safeClusterCount = Mathf.Clamp(
+                            part.clusterCount,
+                            0,
+                            geometrySlot.clusterCount - safeClusterStart);
+                        virtualParts.Add(new GpuVirtualPartRef
+                        {
+                            instanceIndex = (uint)instanceIndex,
+                            partIndex = (uint)geometryPartIndex,
+                            clusterStart = (uint)(virtualClusterOffset + safeClusterStart),
+                            clusterCount = (uint)safeClusterCount
+                        });
+                    }
                 }
 
                 int[] pagePartBase = new int[geometrySlot.pagePartBase.Length];
@@ -1643,6 +1982,8 @@ namespace Nanite
                     partOffset = (uint)virtualPartOffset,
                     partCount = (uint)geometrySlot.partCount,
                     clusterOffset = (uint)virtualClusterOffset,
+                    geometryPartOffset = (uint)geometrySlot.partOffset,
+                    geometryClusterOffset = (uint)geometrySlot.clusterOffset,
                     hierarchyRootOffset = (uint)Mathf.Max(0, geometrySlot.hierarchyRootOffset),
                     hierarchyRootCount = (uint)Mathf.Max(0, geometrySlot.hierarchyRootCount),
                     hierarchyFlags = geometrySlot.hasGpuHierarchy ? 1u : 0u,
@@ -1658,8 +1999,8 @@ namespace Nanite
 
             geometryPartCount = mergedParts.Count;
             geometryClusterCount = mergedClusters.Count;
-            partCount = virtualParts.Count;
-            clusterCount = virtualClusters.Count;
+            partCount = logicalPartCount;
+            clusterCount = logicalClusterCount;
             instanceCount = slots.Count;
             hierarchyReady = allGeometryHasHierarchy &&
                              hierarchyGroups.Count > 0 &&
@@ -1679,24 +2020,40 @@ namespace Nanite
             spatialTraversalPassCount = spatialReady
                 ? Mathf.Clamp(maxSpatialDepth, 1, 32)
                 : 0;
+            spatialQueueCapacity = spatialReady
+                ? Mathf.Max(1, totalSpatialWorkCapacity)
+                : Mathf.Max(1, clusterCount);
+            drawQueueCapacity = Mathf.Max(
+                1,
+                forceFullDrawQueueCapacity ? clusterCount : totalDrawQueueCapacity);
             if (geometryPartCount == 0 || geometryClusterCount == 0 ||
                 partCount == 0 || clusterCount == 0 || instanceCount == 0)
                 return false;
 
             partDataCpu = mergedParts.ToArray();
             clusterDataCpu = mergedClusters.ToArray();
-            virtualPartRefsCpu = virtualParts.ToArray();
-            virtualClusterRefsCpu = virtualClusters.ToArray();
-            partVisibleCpu = new uint[partCount];
-            clusterCandidatesCpu = new uint[clusterCount];
+            virtualPartRefsCpu = virtualRefsExpanded
+                ? virtualParts.ToArray()
+                : new GpuVirtualPartRef[1];
+            virtualClusterRefsCpu = virtualRefsExpanded
+                ? virtualClusters.ToArray()
+                : new GpuVirtualClusterRef[1];
+            partVisibleCpu = new uint[virtualRefsExpanded ? partCount : 1];
+            clusterCandidatesCpu = new uint[virtualRefsExpanded ? clusterCount : 1];
             clusterSceneIndexCpu = null;
+            geometryClusterPageIndexCpu = new uint[Mathf.Max(1, geometryClusterCount)];
+            Array.Fill(geometryClusterPageIndexCpu, uint.MaxValue);
             sceneIndexSignature = 0;
             sceneClusterCountMapped = 0;
 
             partsBuffer = new ComputeBuffer(geometryPartCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuPartData>());
             clustersBuffer = new ComputeBuffer(geometryClusterCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuClusterData>());
-            virtualPartsBuffer = new ComputeBuffer(partCount, Marshal.SizeOf<GpuVirtualPartRef>());
-            virtualClustersBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<GpuVirtualClusterRef>());
+            virtualPartsBuffer = new ComputeBuffer(virtualPartRefsCpu.Length, Marshal.SizeOf<GpuVirtualPartRef>());
+            virtualClustersBuffer = new ComputeBuffer(virtualClusterRefsCpu.Length, Marshal.SizeOf<GpuVirtualClusterRef>());
+            geometryClusterPageIndexBuffer = new ComputeBuffer(
+                Mathf.Max(1, geometryClusterCount),
+                sizeof(uint),
+                ComputeBufferType.Structured);
             if (spatialReady)
             {
                 spatialNodesBuffer = new ComputeBuffer(
@@ -1726,6 +2083,9 @@ namespace Nanite
                 hierarchyRootGroupsBuffer = new ComputeBuffer(
                     hierarchyRootGroups.Count,
                     sizeof(uint));
+            }
+            if (hierarchyReady && kEnableUnsafePersistentTraversal)
+            {
                 // Eight state words followed by 16-byte task records. viewMask is
                 // unused for camera traversal and carries four cascade bits for shadows.
                 // includes independent reserved/published frontiers; do not fold
@@ -1747,7 +2107,7 @@ namespace Nanite
                 for (int queueIndex = 0; queueIndex < 2; queueIndex++)
                 {
                     hierarchyQueues[queueIndex] = new ComputeBuffer(
-                        clusterCount,
+                        spatialReady ? spatialQueueCapacity : clusterCount,
                         sizeof(uint) * 2,
                         ComputeBufferType.Append);
                     hierarchyDispatchArgs[queueIndex] = new ComputeBuffer(
@@ -1756,12 +2116,12 @@ namespace Nanite
                         ComputeBufferType.IndirectArguments);
                 }
             }
-            if (spatialReady)
+            if (spatialReady || hierarchyReady)
             {
                 for (int queueIndex = 0; queueIndex < 2; queueIndex++)
                 {
                     shadowSpatialQueues[queueIndex] = new ComputeBuffer(
-                        clusterCount,
+                        spatialReady ? spatialQueueCapacity : clusterCount,
                         sizeof(uint) * 3,
                         ComputeBufferType.Append);
                     shadowSpatialDispatchArgs[queueIndex] = new ComputeBuffer(
@@ -1770,21 +2130,23 @@ namespace Nanite
                         ComputeBufferType.IndirectArguments);
                 }
             }
-            visiblePartAppendBuffer = new ComputeBuffer(partCount, sizeof(uint), ComputeBufferType.Append);
+            visiblePartAppendBuffer = new ComputeBuffer(partCount, sizeof(uint) * 2, ComputeBufferType.Append);
             visiblePartDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             visibleInstanceAppendBuffer = new ComputeBuffer(instanceCount, sizeof(uint), ComputeBufferType.Append);
             visibleInstancePartDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
-            visibleDrawClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+            visibleDrawClusterAppendBuffer = new ComputeBuffer(drawQueueCapacity, sizeof(uint) * 3, ComputeBufferType.Append);
             visibleDrawCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
-            hardwareRasterClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
-            softwareRasterClusterAppendBuffer = new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+            hzbRejectedClusterAppendBuffer = new ComputeBuffer(drawQueueCapacity, sizeof(uint) * 3, ComputeBufferType.Append);
+            hzbRejectedDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            hardwareRasterClusterAppendBuffer = new ComputeBuffer(drawQueueCapacity, sizeof(uint) * 3, ComputeBufferType.Append);
+            softwareRasterClusterAppendBuffer = new ComputeBuffer(drawQueueCapacity, sizeof(uint) * 3, ComputeBufferType.Append);
             hardwareRasterCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             softwareRasterCountArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             softwareRasterDispatchArgsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
             for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
             {
                 shadowDrawClusterAppendBuffers[cascadeIndex] =
-                    new ComputeBuffer(clusterCount, sizeof(uint) * 3, ComputeBufferType.Append);
+                    new ComputeBuffer(drawQueueCapacity, sizeof(uint) * 3, ComputeBufferType.Append);
                 shadowDrawCountArgsBuffers[cascadeIndex] =
                     new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
                 shadowDrawArgsBuffers[cascadeIndex] = new GraphicsBuffer(
@@ -1792,16 +2154,17 @@ namespace Nanite
                     4,
                     sizeof(uint));
             }
-            partVisibleBuffer = new ComputeBuffer(partCount, sizeof(uint));
-            visibleClusterAppendBuffer = new ComputeBuffer(clusterCount, Marshal.SizeOf<GpuVisibleRef>(), ComputeBufferType.Append);
+            partVisibleBuffer = new ComputeBuffer(virtualRefsExpanded ? partCount : 1, sizeof(uint));
+            visibleClusterAppendBuffer = new ComputeBuffer(virtualRefsExpanded ? clusterCount : 1, Marshal.SizeOf<GpuVisibleRef>(), ComputeBufferType.Append);
             visibleCountBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Raw);
-            clusterCandidateBuffer = new ComputeBuffer(clusterCount, sizeof(uint));
+            clusterCandidateBuffer = new ComputeBuffer(virtualRefsExpanded ? clusterCount : 1, sizeof(uint));
             instanceDataBuffer = new ComputeBuffer(instanceCount, Marshal.SizeOf<NaniteGpuCullingBackend.GpuInstanceData>());
             instanceVisibleBuffer = new ComputeBuffer(instanceCount, sizeof(uint));
             partsBuffer.SetData(partDataCpu);
             clustersBuffer.SetData(clusterDataCpu);
             virtualPartsBuffer.SetData(virtualPartRefsCpu);
             virtualClustersBuffer.SetData(virtualClusterRefsCpu);
+            geometryClusterPageIndexBuffer.SetData(geometryClusterPageIndexCpu);
             if (spatialReady)
             {
                 spatialNodesBuffer.SetData(spatialNodes);
@@ -1845,6 +2208,8 @@ namespace Nanite
             visibleInstancePartDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
             visibleDrawClusterAppendBuffer.SetCounterValue(0);
             visibleDrawCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
+            hzbRejectedClusterAppendBuffer.SetCounterValue(0);
+            hzbRejectedDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
             hardwareRasterClusterAppendBuffer.SetCounterValue(0);
             softwareRasterClusterAppendBuffer.SetCounterValue(0);
             hardwareRasterCountArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u });
@@ -1939,6 +2304,7 @@ namespace Nanite
                 shader.SetBuffer(kernel, "_PartVisibleWrite", partVisibleBuffer);
                 shader.SetBuffer(kernel, "_VisiblePartsOut", visiblePartAppendBuffer);
                 BindGpuSceneRefs(kernel);
+                BindResidencyHierarchy(kernel);
                 BindInstanceBuffers(kernel);
                 BindHzbTexture(kernel, hzbTexture);
                 shader.DispatchIndirect(kernel, hierarchyDispatchArgs[inputQueueIndex], 0);
@@ -2027,6 +2393,7 @@ namespace Nanite
                     prevVisible,
                     secondPassCandidates,
                     pass2Drawn);
+                BindHzbRejectedOutput(kernel);
                 BindInstanceBuffers(kernel);
                 BindHzbTexture(kernel, hzbTexture);
                 shader.DispatchIndirect(kernel, hierarchyDispatchArgs[inputQueueIndex], 0);
@@ -2088,6 +2455,7 @@ namespace Nanite
                 prevVisible,
                 secondPassCandidates,
                 pass2Drawn);
+            BindHzbRejectedOutput(kernel);
             BindInstanceBuffers(kernel);
             BindHzbTexture(kernel, hzbTexture);
             // Nyx uses vendor-tuned persistent group counts (512-1024 at 32 lanes).
@@ -2331,6 +2699,12 @@ namespace Nanite
             int groupBase = hierarchyGroups.Count;
             groupOffset = groupBase;
             int refBase = hierarchyClusterRefs.Count;
+            uint[] geometryClusterTriangleCounts = BuildGeometryClusterTriangleCounts(
+                mesh,
+                geometryClusterCountInMesh);
+            float[] geometryClusterSurfaceArea = BuildGeometryClusterSurfaceArea(
+                mesh,
+                geometryClusterCountInMesh);
             for (int groupIndex = 0; groupIndex < mesh.hierarchyGroups.Length; groupIndex++)
             {
                 NaniteHierarchyGroup group = mesh.hierarchyGroups[groupIndex];
@@ -2364,6 +2738,21 @@ namespace Nanite
             for (int groupIndex = 0; groupIndex < mesh.hierarchyGroups.Length; groupIndex++)
             {
                 NaniteHierarchyGroup group = mesh.hierarchyGroups[groupIndex];
+                uint fineTriangleCount = SumHierarchyTriangleCount(
+                    mesh.hierarchyClusterRefs,
+                    group.fineClusterStart,
+                    group.fineClusterCount,
+                    geometryClusterTriangleCounts);
+                uint coarseTriangleCount = SumHierarchyTriangleCount(
+                    mesh.hierarchyClusterRefs,
+                    group.coarseClusterStart,
+                    group.coarseClusterCount,
+                    geometryClusterTriangleCounts);
+                float fineSurfaceArea = SumHierarchySurfaceArea(
+                    mesh.hierarchyClusterRefs,
+                    group.fineClusterStart,
+                    group.fineClusterCount,
+                    geometryClusterSurfaceArea);
                 hierarchyGroups.Add(new GpuHierarchyGroup
                 {
                     boundingSphere = group.boundingSphere,
@@ -2374,7 +2763,10 @@ namespace Nanite
                     coarseClusterStart = (uint)(refBase + group.coarseClusterStart),
                     coarseClusterCount = (uint)group.coarseClusterCount,
                     mipLevel = (uint)Mathf.Max(0, group.mipLevel),
-                    flags = (uint)group.flags
+                    flags = (uint)group.flags,
+                    fineTriangleCount = fineTriangleCount,
+                    coarseTriangleCount = coarseTriangleCount,
+                    fineSurfaceArea = fineSurfaceArea
                 });
                 maxMip = Mathf.Max(maxMip, group.mipLevel);
             }
@@ -2397,6 +2789,106 @@ namespace Nanite
                 hierarchyRootGroups.Add((uint)(groupBase + mesh.hierarchyRootGroups[rootIndex]));
             rootCount = mesh.hierarchyRootGroups.Length;
             return true;
+        }
+
+        static uint[] BuildGeometryClusterTriangleCounts(NaniteMesh mesh, int expectedClusterCount)
+        {
+            var counts = new uint[Mathf.Max(0, expectedClusterCount)];
+            if (mesh?.pageArray == null)
+                return counts;
+
+            int geometryClusterIndex = 0;
+            for (int pageIndex = 0; pageIndex < mesh.pageArray.Length; pageIndex++)
+            {
+                NaniteMeshPage page = mesh.pageArray[pageIndex];
+                if (page?.clusterArray == null)
+                    continue;
+                for (int clusterIndex = 0;
+                     clusterIndex < page.clusterArray.Length && geometryClusterIndex < counts.Length;
+                     clusterIndex++, geometryClusterIndex++)
+                {
+                    counts[geometryClusterIndex] =
+                        (uint)Mathf.Max(0, page.clusterArray[clusterIndex].indiceCount / 3);
+                }
+            }
+            return counts;
+        }
+
+        static uint SumHierarchyTriangleCount(
+            NaniteHierarchyClusterRef[] refs,
+            int start,
+            int count,
+            uint[] geometryClusterTriangleCounts)
+        {
+            if (refs == null || geometryClusterTriangleCounts == null || count <= 0)
+                return 0u;
+
+            ulong sum = 0u;
+            int end = Mathf.Min(refs.Length, start + count);
+            for (int refIndex = Mathf.Max(0, start); refIndex < end; refIndex++)
+            {
+                int geometryClusterIndex = refs[refIndex].geometryClusterIndex;
+                if ((uint)geometryClusterIndex < (uint)geometryClusterTriangleCounts.Length)
+                    sum += geometryClusterTriangleCounts[geometryClusterIndex];
+            }
+            return (uint)Math.Min(sum, uint.MaxValue);
+        }
+
+        static float[] BuildGeometryClusterSurfaceArea(NaniteMesh mesh, int expectedClusterCount)
+        {
+            var result = new float[Mathf.Max(0, expectedClusterCount)];
+            if (mesh?.pageArray == null)
+                return result;
+            int geometryClusterIndex = 0;
+            for (int pageIndex = 0; pageIndex < mesh.pageArray.Length; pageIndex++)
+            {
+                NaniteMeshPage page = mesh.pageArray[pageIndex];
+                if (page?.clusterArray == null)
+                    continue;
+                for (int clusterIndex = 0;
+                     clusterIndex < page.clusterArray.Length && geometryClusterIndex < result.Length;
+                     clusterIndex++, geometryClusterIndex++)
+                {
+                    NaniteCluster cluster = page.clusterArray[clusterIndex];
+                    int stride = Mathf.Max(3, page.vertexStride);
+                    int[] indices = page.indiceArray; float[] vertices = page.vertexData;
+                    if (indices == null || vertices == null) continue;
+                    int indexEnd = Mathf.Min(indices.Length, cluster.indiceIndex + cluster.indiceCount);
+                    double area = 0.0;
+                    for (int index = Mathf.Max(0, cluster.indiceIndex); index + 2 < indexEnd; index += 3)
+                    {
+                        int v0 = (indices[index] + cluster.vertexOffset) * stride;
+                        int v1 = (indices[index + 1] + cluster.vertexOffset) * stride;
+                        int v2 = (indices[index + 2] + cluster.vertexOffset) * stride;
+                        if (v0 < 0 || v1 < 0 || v2 < 0 || v0 + 2 >= vertices.Length || v1 + 2 >= vertices.Length || v2 + 2 >= vertices.Length) continue;
+                        Vector3 p0 = new Vector3(vertices[v0], vertices[v0 + 1], vertices[v0 + 2]);
+                        Vector3 p1 = new Vector3(vertices[v1], vertices[v1 + 1], vertices[v1 + 2]);
+                        Vector3 p2 = new Vector3(vertices[v2], vertices[v2 + 1], vertices[v2 + 2]);
+                        area += 0.5 * Vector3.Cross(p1 - p0, p2 - p0).magnitude;
+                    }
+                    result[geometryClusterIndex] = (float)Math.Min(area, float.MaxValue);
+                }
+            }
+            return result;
+        }
+
+        static float SumHierarchySurfaceArea(
+            NaniteHierarchyClusterRef[] refs,
+            int start,
+            int count,
+            float[] geometryClusterSurfaceArea)
+        {
+            if (refs == null || geometryClusterSurfaceArea == null || count <= 0)
+                return 0f;
+            double sum = 0.0;
+            int end = Mathf.Min(refs.Length, start + count);
+            for (int refIndex = Mathf.Max(0, start); refIndex < end; refIndex++)
+            {
+                int geometryClusterIndex = refs[refIndex].geometryClusterIndex;
+                if ((uint)geometryClusterIndex < (uint)geometryClusterSurfaceArea.Length)
+                    sum += geometryClusterSurfaceArea[geometryClusterIndex];
+            }
+            return (float)Math.Min(sum, float.MaxValue);
         }
 
         Vector4 ResolveMeshBounds(NaniteMesh mesh, int partOffset, int partCountInMesh)
@@ -2434,6 +2926,34 @@ namespace Nanite
                    proxy.naniteMesh != null;
         }
 
+        static int CountMeshParts(NaniteMesh mesh)
+        {
+            if (mesh?.pageArray == null)
+                return 0;
+            int count = 0;
+            for (int pageIndex = 0; pageIndex < mesh.pageArray.Length; pageIndex++)
+                count = checked(count + (mesh.pageArray[pageIndex]?.parts?.Length ?? 0));
+            return count;
+        }
+
+        static int CountTerminalGeometryClusters(
+            List<NaniteGpuCullingBackend.GpuClusterData> clusters,
+            int start,
+            int count)
+        {
+            int end = Mathf.Min(clusters.Count, checked(start + count));
+            int terminals = 0;
+            for (int clusterIndex = Mathf.Max(0, start); clusterIndex < end; clusterIndex++)
+            {
+                if (clusters[clusterIndex].refinementGroupIndex == uint.MaxValue)
+                    terminals++;
+            }
+            // A valid replacement DAG maps every frontier cluster to at least
+            // one terminal producer. If malformed metadata has no terminal,
+            // retain the full geometry bound instead of under-allocating.
+            return terminals > 0 ? terminals : count;
+        }
+
         public bool RecordShadowCull(
             UnsafeCommandBuffer cmd,
             Camera camera,
@@ -2444,6 +2964,7 @@ namespace Nanite
             Vector3 shadowRayDirection)
         {
             if (cmd == null || camera == null || !SupportsGpuVisibleMask ||
+                !virtualRefsExpanded ||
                 kernelInstanceCull < 0 || kernelPartCull < 0 || kernelClusterCullByPart < 0 ||
                 cascadeIndex < 0 || cascadeIndex >= kMaxShadowCascades)
                 return false;
@@ -2589,6 +3110,9 @@ namespace Nanite
             Matrix4x4[] shadowViewMatrices,
             Matrix4x4[] shadowProjectionMatrices,
             int[] shadowResolutions,
+            Vector4[] shadowCasterPlanes,
+            int[] shadowCasterPlaneCounts,
+            Vector4[] shadowCullingSpheres,
             Vector3 shadowRayDirection)
         {
             int activeCascadeCount = Mathf.Clamp(cascadeCount, 0, kMaxShadowCascades);
@@ -2598,7 +3122,13 @@ namespace Nanite
                 shadowViewMatrices == null || shadowProjectionMatrices == null || shadowResolutions == null ||
                 shadowViewMatrices.Length < activeCascadeCount ||
                 shadowProjectionMatrices.Length < activeCascadeCount ||
-                shadowResolutions.Length < activeCascadeCount)
+                shadowResolutions.Length < activeCascadeCount ||
+                shadowCasterPlanes == null ||
+                shadowCasterPlanes.Length < activeCascadeCount * kMaxShadowCasterPlanesPerCascade ||
+                shadowCasterPlaneCounts == null ||
+                shadowCasterPlaneCounts.Length < activeCascadeCount ||
+                shadowCullingSpheres == null ||
+                shadowCullingSpheres.Length < activeCascadeCount)
                 return false;
 
             for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
@@ -2611,21 +3141,29 @@ namespace Nanite
             }
 
             shadowBatchProjectionScales = Vector4.zero;
+            shadowBatchCasterPlaneCounts = Vector4.zero;
             for (int cascadeIndex = 0; cascadeIndex < activeCascadeCount; cascadeIndex++)
             {
-                GeometryUtility.CalculateFrustumPlanes(
-                    shadowProjectionMatrices[cascadeIndex] * shadowViewMatrices[cascadeIndex],
-                    frustumPlaneObjects);
-                int planeBase = cascadeIndex * 6;
-                for (int planeIndex = 0; planeIndex < 6; planeIndex++)
-                {
-                    Plane plane = frustumPlaneObjects[planeIndex];
-                    shadowBatchFrustumPlanes[planeBase + planeIndex] = new Vector4(
-                        plane.normal.x,
-                        plane.normal.y,
-                        plane.normal.z,
-                        plane.distance);
-                }
+                int planeCount = Mathf.Clamp(
+                    shadowCasterPlaneCounts[cascadeIndex],
+                    0,
+                    kMaxShadowCasterPlanesPerCascade);
+                int planeBase = cascadeIndex * kMaxShadowCasterPlanesPerCascade;
+                Array.Copy(
+                    shadowCasterPlanes,
+                    planeBase,
+                    shadowBatchCasterPlanes,
+                    planeBase,
+                    kMaxShadowCasterPlanesPerCascade);
+                if (cascadeIndex == 0)
+                    shadowBatchCasterPlaneCounts.x = planeCount;
+                else if (cascadeIndex == 1)
+                    shadowBatchCasterPlaneCounts.y = planeCount;
+                else if (cascadeIndex == 2)
+                    shadowBatchCasterPlaneCounts.z = planeCount;
+                else
+                    shadowBatchCasterPlaneCounts.w = planeCount;
+                shadowBatchCullingSpheres[cascadeIndex] = shadowCullingSpheres[cascadeIndex];
 
                 float scale = ComputeShadowProjectionScale(
                     shadowProjectionMatrices[cascadeIndex],
@@ -2653,7 +3191,10 @@ namespace Nanite
             cmd.SetComputeFloatParam(shader, "_ProjectionScale", projectionScale);
             cmd.SetComputeFloatParam(shader, "_ZNear", Mathf.Max(1e-3f, camera.nearClipPlane));
             cmd.SetComputeIntParam(shader, "_ShadowCascadeCount", activeCascadeCount);
-            cmd.SetComputeVectorArrayParam(shader, "_ShadowFrustumPlanes", shadowBatchFrustumPlanes);
+            cmd.SetComputeFloatParam(shader, "_ShadowLodMinTexels", Mathf.Max(1f, ShadowLodMinTexels));
+            cmd.SetComputeVectorArrayParam(shader, "_ShadowCasterPlanes", shadowBatchCasterPlanes);
+            cmd.SetComputeVectorParam(shader, "_ShadowCasterPlaneCounts", shadowBatchCasterPlaneCounts);
+            cmd.SetComputeVectorArrayParam(shader, "_ShadowCullingSpheres", shadowBatchCullingSpheres);
             cmd.SetComputeVectorParam(shader, "_ShadowProjectionScales", shadowBatchProjectionScales);
             Vector3 normalizedShadowRay = shadowRayDirection.sqrMagnitude > 1e-12f
                 ? shadowRayDirection.normalized
@@ -2682,6 +3223,37 @@ namespace Nanite
                 pageRequestsEnabled && sceneTrackPageUsage ? 1 : 0);
 
             ComputeBuffer fallback = GetFallbackClusterVisibleBuffer();
+            if (pageRequestsEnabled && !sceneAllPagesResident)
+                RecordHierarchyGroupResidency(cmd, true, fallback);
+            bool useBoundedHierarchyShadow = kEnableAtomicHierarchyTraversal &&
+                                             hierarchyReady &&
+                                             kernelSeedShadowHierarchyRoots >= 0 &&
+                                             kernelTraverseShadowHierarchy >= 0 &&
+                                             kernelFinalizeHierarchyDispatch >= 0 &&
+                                             shadowSpatialQueues[0] != null &&
+                                             shadowSpatialQueues[1] != null;
+            if (useBoundedHierarchyShadow)
+            {
+                RecordShadowHierarchyTraversal(cmd, pageRequestsEnabled, fallback);
+                for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
+                {
+                    cmd.CopyCounterValue(
+                        shadowDrawClusterAppendBuffers[cascadeIndex],
+                        shadowDrawCountArgsBuffers[cascadeIndex],
+                        0u);
+                }
+
+                lastShadowDrawQueueFrame = Time.frameCount;
+                lastShadowDrawCameraId = camera.GetInstanceID();
+                lastShadowDrawCascadeMask = (1 << activeCascadeCount) - 1;
+                LastShadowUsedFusedBatch = true;
+                LastShadowUsedHierarchyQueue = true;
+                LastShadowUsedSpatialHierarchy = false;
+                LastShadowUsedVisiblePartQueue = false;
+                LastShadowUsedVisibleInstanceQueue = false;
+                return true;
+            }
+
             bool useSpatialShadow = spatialReady &&
                                     kernelSeedShadowSpatialRoots >= 0 &&
                                     kernelTraverseShadowSpatialNodes >= 0 &&
@@ -2690,7 +3262,6 @@ namespace Nanite
                                     shadowSpatialQueues[1] != null;
             if (useSpatialShadow)
             {
-                RecordHierarchyGroupResidency(cmd, pageRequestsEnabled, fallback);
                 RecordShadowSpatialTraversal(cmd, pageRequestsEnabled, fallback);
                 for (int cascadeIndex = 0; cascadeIndex < kMaxShadowCascades; cascadeIndex++)
                 {
@@ -2745,6 +3316,7 @@ namespace Nanite
                 cmd.SetComputeBufferParam(shader, traverseKernel, "_HierarchyPersistentWork", shadowHierarchyPersistentWorkBuffer);
                 cmd.SetComputeBufferParam(shader, traverseKernel, "_Clusters", clustersBuffer);
                 cmd.SetComputeBufferParam(shader, traverseKernel, "_VirtualClusters", virtualClustersBuffer);
+                cmd.SetComputeBufferParam(shader, traverseKernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
                 cmd.SetComputeBufferParam(shader, traverseKernel, "_Instances", instanceDataBuffer);
                 cmd.SetComputeBufferParam(shader, traverseKernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
                 cmd.SetComputeBufferParam(shader, traverseKernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
@@ -2784,10 +3356,15 @@ namespace Nanite
                 return true;
             }
 
+            if (!virtualRefsExpanded)
+                return false;
+
             cmd.SetComputeBufferParam(shader, kernel, "_Parts", partsBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
@@ -2909,6 +3486,7 @@ namespace Nanite
                 cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
                 cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
                 cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
                 cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
                 cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
                 cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
@@ -2942,6 +3520,72 @@ namespace Nanite
             }
         }
 
+        void RecordShadowHierarchyTraversal(
+            UnsafeCommandBuffer cmd,
+            bool pageRequestsEnabled,
+            ComputeBuffer fallback)
+        {
+            cmd.SetBufferCounterValue(shadowSpatialQueues[0], 0u);
+            cmd.SetComputeIntParam(shader, "_HierarchyGroupCount", hierarchyGroups.Count);
+            cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
+
+            int seedKernel = kernelSeedShadowHierarchyRoots;
+            cmd.SetComputeBufferParam(shader, seedKernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+            cmd.SetComputeBufferParam(shader, seedKernel, "_HierarchyRootGroups", hierarchyRootGroupsBuffer);
+            cmd.SetComputeBufferParam(shader, seedKernel, "_Instances", instanceDataBuffer);
+            cmd.SetComputeBufferParam(shader, seedKernel, "_ShadowSpatialOutputQueue", shadowSpatialQueues[0]);
+            cmd.DispatchCompute(shader, seedKernel, Mathf.Max(1, instanceCount), 1, 1);
+
+            int inputQueueIndex = 0;
+            for (int passIndex = 0; passIndex < hierarchyTraversalPassCount; passIndex++)
+            {
+                int outputQueueIndex = 1 - inputQueueIndex;
+                cmd.SetBufferCounterValue(shadowSpatialQueues[outputQueueIndex], 0u);
+                cmd.CopyCounterValue(
+                    shadowSpatialQueues[inputQueueIndex],
+                    shadowSpatialDispatchArgs[inputQueueIndex],
+                    0u);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernelFinalizeHierarchyDispatch,
+                    "_HierarchyDispatchArgsWrite",
+                    shadowSpatialDispatchArgs[inputQueueIndex]);
+                cmd.DispatchCompute(shader, kernelFinalizeHierarchyDispatch, 1, 1, 1);
+
+                int kernel = kernelTraverseShadowHierarchy;
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowSpatialInputQueue", shadowSpatialQueues[inputQueueIndex]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowSpatialOutputQueue", shadowSpatialQueues[outputQueueIndex]);
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyDispatchArgs", shadowSpatialDispatchArgs[inputQueueIndex]);
+                cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_ClusterSceneIndex", clusterSceneIndexBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterFirstTri", sceneClusterFirstTriBuffer);
+                cmd.SetComputeBufferParam(shader, kernel, "_SceneClusterTriCount", sceneClusterTriCountBuffer);
+                cmd.SetComputeIntParam(shader, "_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
+                cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroupResidency", hierarchyGroupResidencyBuffer);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_PageResidency",
+                    pageRequestsEnabled ? scenePageResidencyBuffer : fallback);
+                cmd.SetComputeBufferParam(
+                    shader,
+                    kernel,
+                    "_PageRequests",
+                    pageRequestsEnabled ? scenePageRequestBuffer : fallback);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters0", shadowDrawClusterAppendBuffers[0]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters1", shadowDrawClusterAppendBuffers[1]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters2", shadowDrawClusterAppendBuffers[2]);
+                cmd.SetComputeBufferParam(shader, kernel, "_ShadowVisibleDrawClusters3", shadowDrawClusterAppendBuffers[3]);
+                cmd.DispatchCompute(shader, kernel, shadowSpatialDispatchArgs[inputQueueIndex], 0u);
+                inputQueueIndex = outputQueueIndex;
+            }
+        }
+
         void RecordHierarchyGroupResidency(
             UnsafeCommandBuffer cmd,
             bool pageRequestsEnabled,
@@ -2957,6 +3601,7 @@ namespace Nanite
             cmd.SetComputeIntParam(shader, "_HierarchyRefCount", hierarchyClusterRefs.Count);
             cmd.SetComputeIntParam(shader, "_HierarchyGroupResidencyCount", HierarchyGroupResidencyCount);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_HierarchyGroups", hierarchyGroupsBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_HierarchyClusterRefs", hierarchyClusterRefsBuffer);
@@ -3024,6 +3669,12 @@ namespace Nanite
                 0f));
             cmd.SetComputeFloatParam(shader, "_ProjectionScale", projectionScale);
             cmd.SetComputeFloatParam(shader, "_OrthographicLodScale", projectionScale);
+            cmd.SetComputeFloatParam(shader, "_ShadowLodMinTexels", Mathf.Max(1f, ShadowLodMinTexels));
+            // Legacy single-cascade callers do not receive Unity's native
+            // ShadowSplitData planes; retain the conservative correctness path.
+            cmd.SetComputeVectorParam(shader, "_ShadowCasterPlaneCounts", Vector4.zero);
+            Array.Clear(shadowBatchCullingSpheres, 0, shadowBatchCullingSpheres.Length);
+            cmd.SetComputeVectorArrayParam(shader, "_ShadowCullingSpheres", shadowBatchCullingSpheres);
             cmd.SetComputeIntParam(shader, "_UseOrthographicLod", 1);
             cmd.SetComputeFloatParam(shader, "_ZNear", zNear);
             cmd.SetComputeMatrixParam(shader, "_WorldToClip", shadowWorldToClip);
@@ -3116,6 +3767,7 @@ namespace Nanite
             cmd.SetComputeBufferParam(shader, kernel, "_Clusters", clustersBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualParts", virtualPartsBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_VirtualClusters", virtualClustersBuffer);
+            cmd.SetComputeBufferParam(shader, kernel, "_GeometryClusterPageIndex", geometryClusterPageIndexBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_PartVisible", partVisibleBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_Instances", instanceDataBuffer);
             cmd.SetComputeBufferParam(shader, kernel, "_InstanceVisible", instanceVisibleBuffer);
@@ -3157,11 +3809,13 @@ namespace Nanite
 
         public float LodErrorPixelsOverride { get; set; }
         public int InstanceCount => instanceCount;
+        public ComputeBuffer VisibleInstanceCountArgsBuffer => visibleInstancePartDispatchArgsBuffer;
         public int UniqueGeometryCount => geometrySlots.Count;
         public int GeometryPartCount => geometryPartCount;
         public int GeometryClusterCount => geometryClusterCount;
         public int VirtualPartCount => partCount;
         public int VirtualClusterCount => clusterCount;
+        public bool UsesExpandedVirtualRefs => virtualRefsExpanded;
         public int HierarchyGroupCount => hierarchyGroups.Count;
         public int HierarchyRefCount => hierarchyClusterRefs.Count;
         public int HierarchyTraversalPassCount =>
@@ -3170,6 +3824,8 @@ namespace Nanite
                 : hierarchyTraversalPassCount;
         public int SpatialNodeCount => spatialNodes.Count;
         public int SpatialTraversalPassCount => spatialTraversalPassCount;
+        public int SpatialQueueCapacity => spatialQueueCapacity;
+        public int DrawQueueCapacity => drawQueueCapacity;
         // Quarantined by default after a D3D12 TDR exposed a wave-level
         // deadlock in the first persistent consumer protocol. The corrected
         // kernel remains available for an explicit GPU-debug validation run;
@@ -3184,7 +3840,9 @@ namespace Nanite
         public bool PreferBvhCandidates { get; set; } = true;
         public bool PreferPartDrivenClusterCull { get; set; } = true;
         public bool EnableTraversalRasterBins { get; set; }
+        public bool EnableClusterBackfaceCulling { get; set; }
         public float SoftwareRasterThresholdPixels { get; set; } = 16f;
+        public float ShadowLodMinTexels { get; set; } = 1f;
         public bool LastUsedCpuCandidates { get; private set; }
         public bool LastUsedPartDrivenClusterCull { get; private set; }
         public bool LastUsedVisiblePartQueue { get; private set; }
@@ -3448,21 +4106,63 @@ namespace Nanite
 
         void SetSharedParams(
             Vector3 cameraPos,
+            Vector3 cameraForward,
+            Vector2 projectionNdcScale,
             float projectionScale,
             float zNear,
             Matrix4x4 worldToClip,
             int screenWidth,
             int screenHeight,
-            bool useHzb)
+            bool useHzb,
+            HzbViewParameters hzbView)
         {
             shader.SetVector("_CameraPos", new Vector4(cameraPos.x, cameraPos.y, cameraPos.z, 0f));
+            Vector3 normalizedForward = cameraForward.sqrMagnitude > 1e-12f
+                ? cameraForward.normalized
+                : Vector3.forward;
+            shader.SetVector("_CameraForward", new Vector4(
+                normalizedForward.x,
+                normalizedForward.y,
+                normalizedForward.z,
+                0f));
+            shader.SetVector("_ProjectionNdcScale", new Vector4(
+                Mathf.Max(1e-6f, projectionNdcScale.x),
+                Mathf.Max(1e-6f, projectionNdcScale.y),
+                0f,
+                0f));
             shader.SetFloat("_ProjectionScale", projectionScale);
             shader.SetFloat("_OrthographicLodScale", 0f);
             shader.SetInt("_UseOrthographicLod", 0);
             shader.SetFloat("_ZNear", zNear);
             shader.SetMatrix("_WorldToClip", worldToClip);
+            HzbViewParameters resolvedHzbView = hzbView.valid
+                ? hzbView
+                : new HzbViewParameters(
+                    worldToClip,
+                    cameraPos,
+                    normalizedForward,
+                    projectionNdcScale,
+                    zNear);
+            shader.SetVector("_HzbCameraPos", new Vector4(
+                resolvedHzbView.cameraPosition.x,
+                resolvedHzbView.cameraPosition.y,
+                resolvedHzbView.cameraPosition.z,
+                0f));
+            shader.SetVector("_HzbCameraForward", new Vector4(
+                resolvedHzbView.cameraForward.x,
+                resolvedHzbView.cameraForward.y,
+                resolvedHzbView.cameraForward.z,
+                0f));
+            shader.SetVector("_HzbProjectionNdcScale", new Vector4(
+                resolvedHzbView.projectionNdcScale.x,
+                resolvedHzbView.projectionNdcScale.y,
+                0f,
+                0f));
+            shader.SetFloat("_HzbZNear", resolvedHzbView.zNear);
+            shader.SetMatrix("_HzbWorldToClip", resolvedHzbView.worldToClip);
             shader.SetVector("_ScreenSize", new Vector4(Mathf.Max(1, screenWidth), Mathf.Max(1, screenHeight), 1f / Mathf.Max(1, screenWidth), 1f / Mathf.Max(1, screenHeight)));
             shader.SetInt("_UseHzb", useHzb ? 1 : 0);
+            shader.SetInt("_EnableClusterBackfaceCull", EnableClusterBackfaceCulling ? 1 : 0);
             shader.SetInt("_ReversedZ", SystemInfo.usesReversedZBuffer ? 1 : 0);
             shader.SetVectorArray("_FrustumPlanes", frustumPlanes);
         }
@@ -3504,6 +4204,8 @@ namespace Nanite
                 kernelTraverseHierarchyPersistent = shader.FindKernel("CSTraverseHierarchyPersistent");
                 kernelSeedShadowHierarchyPersistent = shader.FindKernel("CSSeedShadowHierarchyPersistent");
                 kernelTraverseShadowHierarchyPersistent = shader.FindKernel("CSTraverseShadowHierarchyPersistent");
+                kernelSeedShadowHierarchyRoots = shader.FindKernel("CSSeedShadowHierarchyRoots");
+                kernelTraverseShadowHierarchy = shader.FindKernel("CSTraverseShadowHierarchy");
                 try { kernelShadowCullMultiCascadeByPart = shader.FindKernel("CSShadowCullMultiCascadeByPart"); }
                 catch { kernelShadowCullMultiCascadeByPart = -1; }
                 try { kernelSeedShadowSpatialRoots = shader.FindKernel("CSSeedShadowSpatialRoots"); }
@@ -3525,6 +4227,8 @@ namespace Nanite
                 catch { kernelCopyUintBuffer = -1; }
                 try { kernelFinalizeRasterBinArgs = shader.FindKernel("CSFinalizeRasterBinArgs"); }
                 catch { kernelFinalizeRasterBinArgs = -1; }
+                try { kernelRecoverHzbRejectedClusters = shader.FindKernel("CSRecoverHzbRejectedClusters"); }
+                catch { kernelRecoverHzbRejectedClusters = -1; }
                 try { kernelClearCullStats = shader.FindKernel("CSClearCullStats"); }
                 catch { kernelClearCullStats = -1; }
                 try { kernelOrMasksToVisible = shader.FindKernel("CSOrMasksToVisible"); }
@@ -3546,6 +4250,7 @@ namespace Nanite
             clustersBuffer?.Release();
             virtualPartsBuffer?.Release();
             virtualClustersBuffer?.Release();
+            geometryClusterPageIndexBuffer?.Release();
             spatialNodesBuffer?.Release();
             spatialPartRefsBuffer?.Release();
             hierarchyGroupsBuffer?.Release();
@@ -3575,6 +4280,8 @@ namespace Nanite
             visibleInstancePartDispatchArgsBuffer?.Release();
             visibleDrawClusterAppendBuffer?.Release();
             visibleDrawCountArgsBuffer?.Release();
+            hzbRejectedClusterAppendBuffer?.Release();
+            hzbRejectedDispatchArgsBuffer?.Release();
             hardwareRasterClusterAppendBuffer?.Release();
             softwareRasterClusterAppendBuffer?.Release();
             hardwareRasterCountArgsBuffer?.Release();
@@ -3606,6 +4313,7 @@ namespace Nanite
             clustersBuffer = null;
             virtualPartsBuffer = null;
             virtualClustersBuffer = null;
+            geometryClusterPageIndexBuffer = null;
             spatialNodesBuffer = null;
             spatialPartRefsBuffer = null;
             hierarchyGroupsBuffer = null;
@@ -3621,6 +4329,8 @@ namespace Nanite
             visibleInstancePartDispatchArgsBuffer = null;
             visibleDrawClusterAppendBuffer = null;
             visibleDrawCountArgsBuffer = null;
+            hzbRejectedClusterAppendBuffer = null;
+            hzbRejectedDispatchArgsBuffer = null;
             hardwareRasterClusterAppendBuffer = null;
             softwareRasterClusterAppendBuffer = null;
             hardwareRasterCountArgsBuffer = null;
@@ -3631,6 +4341,7 @@ namespace Nanite
             visibleCountBuffer = null;
             clusterCandidateBuffer = null;
             clusterSceneIndexBuffer = null;
+            geometryClusterPageIndexCpu = null;
             sceneClusterFirstTriBuffer = null;
             sceneClusterTriCountBuffer = null;
             scenePageResidencyBuffer = null;
@@ -3651,6 +4362,8 @@ namespace Nanite
             hierarchyPersistentCapacity = 0;
             spatialReady = false;
             spatialTraversalPassCount = 0;
+            spatialQueueCapacity = 0;
+            drawQueueCapacity = 0;
             lastShadowDrawQueueFrame = -1;
             lastShadowDrawCameraId = 0;
             lastShadowDrawCascadeMask = 0;
@@ -3729,7 +4442,7 @@ namespace Nanite
             var center = new Vector3(sphere.x, sphere.y, sphere.z);
             float distance = Vector3.Distance(center, cameraPosition) - sphere.w;
             distance = Mathf.Max(distance, zNear);
-            return (2f * error * projectionScale) / distance;
+            return (error * projectionScale) / distance;
         }
     }
 }

@@ -6,6 +6,8 @@
 #pragma kernel CSFinalizeVisibleDrawQueueArgs4
 #pragma kernel CSPrepareIndexedDrawQueue
 #pragma kernel CSBuildIndexedDrawQueue
+#pragma kernel CSPrepareIndexedDrawQueueAppend
+#pragma kernel CSBuildIndexedDrawQueueAppend
 #pragma kernel CSPrepareIndexedShadowDrawQueue
 #pragma kernel CSBuildIndexedShadowDrawQueue
 #pragma kernel CSPrepareHybridDispatch
@@ -14,6 +16,11 @@
 #pragma kernel CSBuildHybridTileWork
 #pragma kernel CSSoftwareRasterTiles
 #pragma kernel CSClassifyHybridClusters
+#pragma kernel CSCaptureHybridView
+#pragma kernel CSPrepareRuntimeTelemetry
+#pragma kernel CSAccumulateRuntimeTelemetry
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
 // 把可见 cluster 压实为 (firstTriangle, triangleCount, instance)；VS 再按固定槽位展开。
 // _DrawArgs 使用 GraphicsBuffer(IndirectArguments|Structured)，可被 compute UAV 写入并直接给 DrawProceduralIndirect。
@@ -37,6 +44,24 @@ RWStructuredBuffer<uint> _DrawArgs0;
 RWStructuredBuffer<uint> _DrawArgs1;
 RWStructuredBuffer<uint> _DrawArgs2;
 RWStructuredBuffer<uint> _DrawArgs3;
+
+// Smoke/CI-only workload reduction. The production renderer never dispatches
+// these kernels. Counts and triangle totals remain on GPU until one 48-byte
+// block is read asynchronously.
+StructuredBuffer<uint3> _TelemetryCameraClusters;
+StructuredBuffer<uint3> _TelemetryShadowClusters0;
+StructuredBuffer<uint3> _TelemetryShadowClusters1;
+StructuredBuffer<uint3> _TelemetryShadowClusters2;
+StructuredBuffer<uint3> _TelemetryShadowClusters3;
+StructuredBuffer<uint> _TelemetryCameraCountArgs;
+StructuredBuffer<uint> _TelemetryShadowCountArgs0;
+StructuredBuffer<uint> _TelemetryShadowCountArgs1;
+StructuredBuffer<uint> _TelemetryShadowCountArgs2;
+StructuredBuffer<uint> _TelemetryShadowCountArgs3;
+StructuredBuffer<uint> _TelemetryHardwareCountArgs;
+StructuredBuffer<uint> _TelemetrySoftwareCountArgs;
+RWStructuredBuffer<uint> _RuntimeTelemetryStats;
+RWStructuredBuffer<uint> _RuntimeTelemetryDispatchArgs;
 
 // Indexed cluster raster keeps the current visible-cluster ABI, but expands the
 // selected clusters into a transient hardware index buffer.  The encoded index
@@ -66,66 +91,47 @@ StructuredBuffer<uint2> _TrianglePageRefs;
 StructuredBuffer<NaniteGpuResidentPageEntry> _NaniteResidentPageTable;
 StructuredBuffer<NaniteResidentVertex> _NaniteResidentVertices;
 StructuredBuffer<uint> _NaniteResidentIndices;
-RWByteAddressBuffer _IndexedDrawIndices;
-RWStructuredBuffer<uint> _IndexedDrawArgs;          // 5 uint indexed arguments
+// Exact procedural packet ABI: one 4-byte record per admitted triangle.
+// This replaces the old 3x uint index stream + uint primitive-id stream.
+// Raster expands the three corners from SV_VertexID and decodes geometry only
+// when the fixed-function pipeline actually consumes the triangle.
+RWStructuredBuffer<uint> _IndexedTrianglePackets;   // triangleId << instanceBits | instanceId
+RWStructuredBuffer<uint> _IndexedDrawArgs;          // 4 uint procedural arguments
+StructuredBuffer<uint> _IndexedDrawArgsRead;
+RWStructuredBuffer<uint> _IndexedAppendDrawArgs;    // Pass2-only procedural arguments
 RWStructuredBuffer<uint> _IndexedFallbackDrawArgs;  // 4 uint procedural arguments
+AppendStructuredBuffer<uint> _IndexedOverflowClusterIndices;
 RWStructuredBuffer<uint> _IndexedBuildDispatchArgs;
-uint _GeometryVertexCount;
+RWStructuredBuffer<uint> _IndexedCameraBaseCount;
+StructuredBuffer<uint> _IndexedCameraBaseCountRead;
+RWStructuredBuffer<uint> _IndexedCameraPacketSlice; // basePacket, baseClusters, appendClusters, reserved
+StructuredBuffer<uint> _IndexedCameraPacketSliceRead;
 uint _UsePackedPageGeometry;
 uint _IndexedDrawBaseIndex;
 uint _IndexedDrawCapacityClusters;
 uint _IndexedDrawClusterOffset;
 uint _IndexedAllowProceduralFallback;
 uint _IndexedDispatchGroupsX;
+uint _IndexedPacketInstanceBits;
+uint _IndexedPacketInstanceMask;
+uint _IndexedTrianglePacketCapacity;
 StructuredBuffer<uint> _IndexedShadowVisibleDrawCountArgs0;
 StructuredBuffer<uint> _IndexedShadowVisibleDrawCountArgs1;
 StructuredBuffer<uint> _IndexedShadowVisibleDrawCountArgs2;
 StructuredBuffer<uint> _IndexedShadowVisibleDrawCountArgs3;
-RWStructuredBuffer<uint2> _IndexedShadowSliceData;
+RWStructuredBuffer<uint4> _IndexedShadowSliceData;  // packetBase, admittedClusters, reserved, reserved
 RWStructuredBuffer<uint> _IndexedShadowBuildDispatchArgs;
 uint _IndexedShadowCascadeIndex;
 uint _IndexedDrawTotalCapacityClusters;
 uint _IndexedShadowReuseScratch;
-groupshared uint IndexedShadowGroupOutputBaseIndex;
+groupshared uint IndexedShadowGroupOutputBasePacket;
 groupshared uint IndexedShadowGroupTriangleCount;
+groupshared uint IndexedGroupOutputBasePacket;
+groupshared uint IndexedGroupTriangleCount;
+groupshared uint IndexedGroupAdmitted;
 
 static const uint NANITE_PAGE_INVALID = 0xFFFFFFFFu;
 static const uint NANITE_RESIDENT_GEOMETRY_READY = 1u << 0u;
-
-bool BuildIndexedVertex(
-    uint triangleId,
-    uint corner,
-    uint instanceId,
-    out uint encodedVertex)
-{
-    encodedVertex = 0u;
-    if (_GeometryVertexCount == 0u)
-        return false;
-
-    if (_UsePackedPageGeometry != 0u)
-    {
-        uint2 triangleRef = _TrianglePageRefs[triangleId];
-        if (triangleRef.x == NANITE_PAGE_INVALID ||
-            triangleRef.y == NANITE_PAGE_INVALID)
-            return false;
-        NaniteGpuResidentPageEntry page = _NaniteResidentPageTable[triangleRef.y];
-        uint localIndex = triangleRef.x + min(corner, 2u);
-        if ((page.flags & NANITE_RESIDENT_GEOMETRY_READY) == 0u ||
-            page.indexBase == NANITE_PAGE_INVALID ||
-            localIndex >= page.indexCount)
-            return false;
-        uint residentVertex = _NaniteResidentIndices[page.indexBase + localIndex];
-        if (residentVertex >= _GeometryVertexCount)
-            return false;
-        encodedVertex = instanceId * _GeometryVertexCount + residentVertex;
-        return true;
-    }
-
-    uint sourceIndex = triangleId * 3u + min(corner, 2u);
-    encodedVertex = instanceId * _GeometryVertexCount +
-        (uint)max(0, _Indices[sourceIndex]);
-    return true;
-}
 
 // Unreal Nanite-style hybrid raster compatibility backend. Unity ShaderLab does
 // not expose SM 6.6 64-bit typed UAV atomics, so software and hardware raster
@@ -144,6 +150,9 @@ StructuredBuffer<float4x4> _HybridInstanceLocalToWorld;
 StructuredBuffer<int> _HybridTriangleCluster;
 StructuredBuffer<float4> _HybridClusterBounds;
 StructuredBuffer<float> _HybridClusterLongestEdge;
+StructuredBuffer<int> _HybridTriangleSubMesh;
+StructuredBuffer<float4x4> _HybridViewConstants;
+RWStructuredBuffer<float4x4> _HybridViewConstantsWrite;
 RWTexture2D<uint> _HybridSoftwareDepth;
 RWTexture2D<uint> _HybridSoftwareWinner;
 RWStructuredBuffer<uint> _HybridSoftwareTileHeads;
@@ -166,6 +175,9 @@ float _HybridSoftwareMaxEdgePixels;
 uint _HybridReversedZ;
 uint _HybridDepthOnly;
 uint _HybridShadowMode;
+uint _HybridTelemetryEnabled;
+uint _HybridMaxSubMeshCount;
+uint _HybridUseCapturedView;
 float4 _HybridShadowLightDirection;
 float4 _HybridShadowBias;
 StructuredBuffer<uint> _HybridPrepareCountArgs;
@@ -264,7 +276,10 @@ bool HybridTransformVertex(
         positionWS += lightDirection * _HybridShadowBias.x;
         positionWS += normalWS * (invNdotL * _HybridShadowBias.y);
     }
-    positionCS = mul(_HybridWorldToClip, float4(positionWS, 1.0));
+    float4x4 worldToClip = (_HybridShadowMode != 0u || _HybridUseCapturedView == 0u)
+        ? _HybridWorldToClip
+        : _HybridViewConstants[0];
+    positionCS = mul(worldToClip, float4(positionWS, 1.0));
     return true;
 }
 
@@ -303,12 +318,16 @@ float HybridMaxEdgePixels(float4 p0, float4 p1, float4 p2)
 
 float HybridMaxScale(float4x4 localToWorld)
 {
-    // Frobenius norm is a conservative upper bound for the largest singular
-    // value and remains valid for rotation, non-uniform scale and shear.
-    return sqrt(
-        dot(localToWorld[0].xyz, localToWorld[0].xyz) +
-        dot(localToWorld[1].xyz, localToWorld[1].xyz) +
-        dot(localToWorld[2].xyz, localToWorld[2].xyz));
+    // Match the transform scale used by NVIDIA's cluster traversal. The old
+    // Frobenius norm evaluates to sqrt(3) even for a pure rotation, inflating
+    // every projected edge and effectively preventing the software queue from
+    // ever receiving work. Unity scene transforms use the first three columns
+    // as the transformed object axes; their maximum length is the appropriate
+    // no-shear scale used by the rest of the Nanite LOD path.
+    float3 axisX = float3(localToWorld[0].x, localToWorld[1].x, localToWorld[2].x);
+    float3 axisY = float3(localToWorld[0].y, localToWorld[1].y, localToWorld[2].y);
+    float3 axisZ = float3(localToWorld[0].z, localToWorld[1].z, localToWorld[2].z);
+    return max(length(axisX), max(length(axisY), length(axisZ)));
 }
 
 bool HybridClusterFitsSoftware(uint3 draw)
@@ -321,11 +340,14 @@ bool HybridClusterFitsSoftware(uint3 draw)
     float4x4 localToWorld = _HybridInstanceLocalToWorld[draw.z];
     float3 centerWS = mul(localToWorld, float4(localSphere.xyz, 1.0)).xyz;
     float radiusWS = max(0.0, localSphere.w) * HybridMaxScale(localToWorld);
-    float4 centerCS = mul(_HybridWorldToClip, float4(centerWS, 1.0));
-    float4 row0 = _HybridWorldToClip[0];
-    float4 row1 = _HybridWorldToClip[1];
-    float4 row2 = _HybridWorldToClip[2];
-    float4 row3 = _HybridWorldToClip[3];
+    float4x4 worldToClip = (_HybridShadowMode != 0u || _HybridUseCapturedView == 0u)
+        ? _HybridWorldToClip
+        : _HybridViewConstants[0];
+    float4 centerCS = mul(worldToClip, float4(centerWS, 1.0));
+    float4 row0 = worldToClip[0];
+    float4 row1 = worldToClip[1];
+    float4 row2 = worldToClip[2];
+    float4 row3 = worldToClip[3];
 
     // The sphere must be fully inside the homogeneous clip volume. Anything
     // touching a clip plane remains on fixed-function raster, preserving exact
@@ -348,15 +370,12 @@ bool HybridClusterFitsSoftware(uint3 draw)
     float longestEdgePixels = localSphere.w > 1e-8
         ? diameterPixels * longestEdgeObject / (2.0 * localSphere.w)
         : diameterPixels;
-    // V3 Pages provide the actual object-space longest edge. Keep the
-    // compatibility SW backend on the side of the measured crossover:
-    // unlike UE's native 64-bit atomic path, this implementation also pays for
-    // sparse clear/merge and two 32-bit raster passes.  A cluster is therefore
-    // admitted only when its conservative projected coverage is at most one
-    // pixel per triangle, in addition to the clip-safe diameter limit.
-    float coverageUpperBound = 0.78539816339 * diameterPixels * diameterPixels;
-    return longestEdgePixels <= max(1.0, _HybridSoftwareMaxEdgePixels) &&
-           coverageUpperBound <= (float)max(1u, draw.y);
+    // NVIDIA vk_lod_clusters bins a clip-safe cluster to software raster from
+    // its baked longest edge relative to the projected cluster bounds. Do not
+    // add a coverage/triangle-density gate here: it rejected the exact small-
+    // triangle workload software raster is intended to absorb and left forced
+    // Hybrid frames with an empty SW queue.
+    return longestEdgePixels <= max(1.0, _HybridSoftwareMaxEdgePixels);
 }
 
 int HybridEdge(int2 a, int2 b, int2 p)
@@ -385,7 +404,12 @@ void HybridAppendTriangleTileWork(
     int2 f0 = (int2)round(HybridClipToPixel(p0) * 256.0);
     int2 f1 = (int2)round(HybridClipToPixel(p1) * 256.0);
     int2 f2 = (int2)round(HybridClipToPixel(p2) * 256.0);
-    if (HybridEdge(f0, f1, f2) <= 0)
+    // The production hardware correctness path is Cull Off. Mirror that
+    // contract in software: either signed area is a valid surface and only a
+    // degenerate triangle is rejected. Choosing one sign here selected the
+    // opposite shell of closed meshes on part of the screen, yielding valid
+    // IDs but back-face normals/material attributes at resolve time.
+    if (HybridEdge(f0, f1, f2) == 0)
         return;
 
     int2 minPixel = max(
@@ -531,19 +555,19 @@ void CSPrepareIndexedDrawQueue(uint3 id : SV_DispatchThreadID)
     uint remaining = visibleClusters > _IndexedDrawClusterOffset
         ? visibleClusters - _IndexedDrawClusterOffset
         : 0u;
+    // Every visible cluster is dispatched. Packet admission is based on its
+    // exact triangle count in the build kernel; whole clusters that do not fit
+    // are appended to the explicit overflow queue.
     uint indexedClusters = min(remaining, _IndexedDrawCapacityClusters);
-    bool valid = _GeometryVertexCount > 0u;
-    uint indexCount = indexedClusters * slots * 3u;
-
-    _IndexedDrawArgs[0] = valid ? indexCount : 0u;
+    _IndexedCameraBaseCount[0] = indexedClusters;
+    _IndexedDrawArgs[0] = 0u;
     _IndexedDrawArgs[1] = 1u;
-    _IndexedDrawArgs[2] = _IndexedDrawBaseIndex;
+    _IndexedDrawArgs[2] = 0u;
     _IndexedDrawArgs[3] = 0u;
-    _IndexedDrawArgs[4] = 0u;
     // The final recorded chunk owns a procedural tail. Its shader uses an
     // explicit compact-cluster offset, so correctness does not depend on Unity's
     // startVertex -> SV_VertexID behaviour.
-    uint fallbackClusters = (_IndexedAllowProceduralFallback != 0u && valid)
+    uint fallbackClusters = _IndexedAllowProceduralFallback != 0u
         ? remaining - indexedClusters
         : 0u;
     _IndexedFallbackDrawArgs[0] = fallbackClusters * slots * 3u;
@@ -556,6 +580,112 @@ void CSPrepareIndexedDrawQueue(uint3 id : SV_DispatchThreadID)
         ? (indexedClusters + groupsX - 1u) / groupsX
         : 0u;
     _IndexedBuildDispatchArgs[2] = 1u;
+    _IndexedBuildDispatchArgs[3] = 0u;
+}
+
+float HybridApplyDeterministicDepthTieBreak(float depth, uint triangleId)
+{
+    int subMesh = max(0, _HybridTriangleSubMesh[triangleId]);
+    uint triangleRank = triangleId;
+    triangleRank = (triangleRank ^ 61u) ^ (triangleRank >> 16u);
+    triangleRank *= 9u;
+    triangleRank ^= triangleRank >> 4u;
+    triangleRank *= 0x27d4eb2du;
+    triangleRank ^= triangleRank >> 15u;
+    triangleRank &= 1023u;
+    float materialRank = ((float)subMesh +
+        ((float)triangleRank + 0.5) / 1024.0) /
+        (float)(max(1u, _HybridMaxSubMeshCount) + 1u);
+    const float kTieBreakDepth = 1.0e-5;
+    return saturate(_HybridReversedZ != 0u
+        ? depth + kTieBreakDepth * materialRank
+        : depth - kTieBreakDepth * materialRank);
+}
+
+[numthreads(1, 1, 1)]
+void CSPrepareRuntimeTelemetry(uint3 id : SV_DispatchThreadID)
+{
+    uint cameraCount = _TelemetryCameraCountArgs[0];
+    uint shadow0 = _TelemetryShadowCountArgs0[0];
+    uint shadow1 = _TelemetryShadowCountArgs1[0];
+    uint shadow2 = _TelemetryShadowCountArgs2[0];
+    uint shadow3 = _TelemetryShadowCountArgs3[0];
+    uint maximum = max(cameraCount, max(max(shadow0, shadow1), max(shadow2, shadow3)));
+
+    _RuntimeTelemetryStats[0] = cameraCount;
+    _RuntimeTelemetryStats[1] = 0u;
+    _RuntimeTelemetryStats[2] = _TelemetryHardwareCountArgs[0];
+    _RuntimeTelemetryStats[3] = _TelemetrySoftwareCountArgs[0];
+    _RuntimeTelemetryStats[4] = shadow0;
+    _RuntimeTelemetryStats[5] = 0u;
+    _RuntimeTelemetryStats[6] = shadow1;
+    _RuntimeTelemetryStats[7] = 0u;
+    _RuntimeTelemetryStats[8] = shadow2;
+    _RuntimeTelemetryStats[9] = 0u;
+    _RuntimeTelemetryStats[10] = shadow3;
+    _RuntimeTelemetryStats[11] = 0u;
+    _RuntimeTelemetryDispatchArgs[0] = max(1u, (maximum + 63u) / 64u);
+    _RuntimeTelemetryDispatchArgs[1] = 1u;
+    _RuntimeTelemetryDispatchArgs[2] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void CSAccumulateRuntimeTelemetry(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index < _TelemetryCameraCountArgs[0])
+        InterlockedAdd(_RuntimeTelemetryStats[1], _TelemetryCameraClusters[index].y);
+    if (index < _TelemetryShadowCountArgs0[0])
+        InterlockedAdd(_RuntimeTelemetryStats[5], _TelemetryShadowClusters0[index].y);
+    if (index < _TelemetryShadowCountArgs1[0])
+        InterlockedAdd(_RuntimeTelemetryStats[7], _TelemetryShadowClusters1[index].y);
+    if (index < _TelemetryShadowCountArgs2[0])
+        InterlockedAdd(_RuntimeTelemetryStats[9], _TelemetryShadowClusters2[index].y);
+    if (index < _TelemetryShadowCountArgs3[0])
+        InterlockedAdd(_RuntimeTelemetryStats[11], _TelemetryShadowClusters3[index].y);
+}
+
+// The HZB depth pass has already built packets for the Pass1 queue. Pass2 only
+// appends recovered clusters to that same GPU queue, so Formal raster can keep
+// the existing packets/DrawArgs and build the newly appended tail.
+[numthreads(1, 1, 1)]
+void CSPrepareIndexedDrawQueueAppend(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0u)
+        return;
+
+    uint visibleClusters = _VisibleDrawCountArgs[0];
+    uint baseClusters = min(_IndexedCameraBaseCountRead[0], _IndexedDrawCapacityClusters);
+    uint remaining = visibleClusters > baseClusters
+        ? visibleClusters - baseClusters
+        : 0u;
+    uint capacity = _IndexedDrawCapacityClusters - baseClusters;
+    uint appendedClusters = min(remaining, capacity);
+    uint slots = max(1u, _CompactedClusterTriangleSlots);
+    uint basePacket = _IndexedDrawArgsRead[0] / 3u;
+    _IndexedCameraPacketSlice[0] = basePacket;
+    _IndexedCameraPacketSlice[1] = baseClusters;
+    _IndexedCameraPacketSlice[2] = appendedClusters;
+    _IndexedCameraPacketSlice[3] = 0u;
+    _IndexedAppendDrawArgs[0] = 0u;
+    _IndexedAppendDrawArgs[1] = 1u;
+    _IndexedAppendDrawArgs[2] = 0u;
+    _IndexedAppendDrawArgs[3] = 0u;
+    uint fallbackClusters = _IndexedAllowProceduralFallback != 0u
+        ? remaining - appendedClusters
+        : 0u;
+    _IndexedFallbackDrawArgs[0] = fallbackClusters * slots * 3u;
+    _IndexedFallbackDrawArgs[1] = 1u;
+    _IndexedFallbackDrawArgs[2] = 0u;
+    _IndexedFallbackDrawArgs[3] = 0u;
+
+    uint groupsX = min(1024u, appendedClusters);
+    _IndexedBuildDispatchArgs[0] = groupsX;
+    _IndexedBuildDispatchArgs[1] = groupsX > 0u
+        ? (appendedClusters + groupsX - 1u) / groupsX
+        : 0u;
+    _IndexedBuildDispatchArgs[2] = 1u;
+    _IndexedBuildDispatchArgs[3] = 0u;
 }
 
 uint IndexedShadowVisibleCount(uint cascadeIndex)
@@ -574,12 +704,13 @@ void ResolveIndexedShadowSlice(
     out uint baseCluster,
     out uint capacityClusters)
 {
+    baseCluster = 0u;
+    capacityClusters = 0u;
     // The native shadow graph records build(cascade N) immediately before
     // draw(cascade N).  In that ordering every cascade owns the whole scratch
     // allocation and the next cascade can safely overwrite it after raster.
     if (_IndexedShadowReuseScratch != 0u)
     {
-        baseCluster = 0u;
         capacityClusters = min(
             IndexedShadowVisibleCount(cascadeIndex),
             _IndexedDrawTotalCapacityClusters);
@@ -587,7 +718,6 @@ void ResolveIndexedShadowSlice(
     }
 
     uint remaining = _IndexedDrawTotalCapacityClusters;
-    baseCluster = 0u;
     [unroll]
     for (uint prior = 0u; prior < 4u; prior++)
     {
@@ -607,24 +737,22 @@ void CSPrepareIndexedShadowDrawQueue(uint3 id : SV_DispatchThreadID)
         return;
 
     uint cascadeIndex = min(_IndexedShadowCascadeIndex, 3u);
-    uint baseCluster;
-    uint indexedClusters;
+    uint baseCluster = 0u;
+    uint indexedClusters = 0u;
     ResolveIndexedShadowSlice(cascadeIndex, baseCluster, indexedClusters);
     uint visibleClusters = IndexedShadowVisibleCount(cascadeIndex);
     uint slots = max(1u, _CompactedClusterTriangleSlots);
-    bool valid = _GeometryVertexCount > 0u;
 
-    _IndexedShadowSliceData[cascadeIndex] = uint2(baseCluster, indexedClusters);
-    // Shadow fragments do not consume primitive-to-cluster IDs, so the index
-    // stream can be packed to the exact triangle count.  The build kernel
-    // atomically reserves only real triangles instead of rasterizing up to 127
-    // degenerate padding triangles per cluster.
+    uint packetBase = baseCluster * slots;
+    _IndexedShadowSliceData[cascadeIndex] = uint4(packetBase, indexedClusters, 0u, 0u);
+    // The draw is procedural and begins at vertex zero. The shader adds the
+    // packet slice base explicitly, avoiding backend-specific startVertex
+    // semantics while four cascade slices coexist.
     _IndexedDrawArgs[0] = 0u;
     _IndexedDrawArgs[1] = 1u;
-    _IndexedDrawArgs[2] = baseCluster * slots * 3u;
+    _IndexedDrawArgs[2] = 0u;
     _IndexedDrawArgs[3] = 0u;
-    _IndexedDrawArgs[4] = 0u;
-    uint fallbackClusters = valid ? visibleClusters - indexedClusters : 0u;
+    uint fallbackClusters = visibleClusters - indexedClusters;
     _IndexedFallbackDrawArgs[0] = fallbackClusters * slots * 3u;
     _IndexedFallbackDrawArgs[1] = 1u;
     _IndexedFallbackDrawArgs[2] = 0u;
@@ -636,17 +764,17 @@ void CSPrepareIndexedShadowDrawQueue(uint3 id : SV_DispatchThreadID)
         ? (indexedClusters + groupsX - 1u) / groupsX
         : 0u;
     _IndexedShadowBuildDispatchArgs[2] = 1u;
+    _IndexedShadowBuildDispatchArgs[3] = 0u;
 }
 
-void BuildIndexedCluster(
+void BuildTrianglePacketCluster(
     uint localClusterIndex,
     uint capacityClusters,
     uint clusterOffset,
-    uint outputBaseIndex,
     uint triangleInCluster)
 {
     uint visibleClusters = _VisibleDrawCountArgs[0];
-    if (_GeometryVertexCount == 0u || localClusterIndex >= capacityClusters)
+    if (localClusterIndex >= capacityClusters)
         return;
     uint clusterIndex = clusterOffset + localClusterIndex;
     if (clusterIndex >= visibleClusters)
@@ -660,31 +788,73 @@ void BuildIndexedCluster(
     uint firstTriangle = draw.x;
     uint triangleCount = draw.y;
     uint instanceId = draw.z;
-    uint outputIndex = outputBaseIndex +
-        (localClusterIndex * slots + triangleInCluster) * 3u;
+    if (triangleInCluster >= triangleCount)
+        return;
 
-    if (triangleInCluster < triangleCount)
-    {
-        uint triangleId = firstTriangle + triangleInCluster;
-        uint i0, i1, i2;
-        bool valid = BuildIndexedVertex(triangleId, 0u, instanceId, i0) &&
-                     BuildIndexedVertex(triangleId, 1u, instanceId, i1) &&
-                     BuildIndexedVertex(triangleId, 2u, instanceId, i2);
-        if (!valid)
-            i0 = i1 = i2 = 0u;
-        _IndexedDrawIndices.Store((outputIndex + 0u) * 4u, i0);
-        _IndexedDrawIndices.Store((outputIndex + 1u) * 4u, i1);
-        _IndexedDrawIndices.Store((outputIndex + 2u) * 4u, i2);
-    }
-    else
-    {
-        uint repeated;
-        if (!BuildIndexedVertex(firstTriangle, 0u, instanceId, repeated))
-            repeated = 0u;
-        _IndexedDrawIndices.Store((outputIndex + 0u) * 4u, repeated);
-        _IndexedDrawIndices.Store((outputIndex + 1u) * 4u, repeated);
-        _IndexedDrawIndices.Store((outputIndex + 2u) * 4u, repeated);
-    }
+    uint outputPacket = IndexedGroupOutputBasePacket + triangleInCluster;
+    uint packedPacket = ((firstTriangle + triangleInCluster) << _IndexedPacketInstanceBits) |
+                        (instanceId & _IndexedPacketInstanceMask);
+    _IndexedTrianglePackets[outputPacket] = packedPacket;
+}
+
+bool ReserveIndexedCameraPackets(
+    uint triangleCount,
+    uint basePacket,
+    out uint outputBasePacket)
+{
+    outputBasePacket = 0u;
+    if (triangleCount == 0u || basePacket >= _IndexedTrianglePacketCapacity ||
+        triangleCount > _IndexedTrianglePacketCapacity - basePacket)
+        return false;
+
+    uint reservedPackets;
+    InterlockedAdd(_IndexedBuildDispatchArgs[3], triangleCount, reservedPackets);
+    if (reservedPackets > _IndexedTrianglePacketCapacity - basePacket - triangleCount)
+        return false;
+
+    outputBasePacket = basePacket + reservedPackets;
+    InterlockedAdd(_IndexedDrawArgs[0], triangleCount * 3u);
+    return true;
+}
+
+bool ReserveIndexedAppendPackets(
+    uint triangleCount,
+    uint basePacket,
+    out uint outputBasePacket)
+{
+    outputBasePacket = 0u;
+    if (triangleCount == 0u || basePacket >= _IndexedTrianglePacketCapacity ||
+        triangleCount > _IndexedTrianglePacketCapacity - basePacket)
+        return false;
+
+    uint reservedPackets;
+    InterlockedAdd(_IndexedBuildDispatchArgs[3], triangleCount, reservedPackets);
+    if (reservedPackets > _IndexedTrianglePacketCapacity - basePacket - triangleCount)
+        return false;
+
+    outputBasePacket = basePacket + reservedPackets;
+    InterlockedAdd(_IndexedAppendDrawArgs[0], triangleCount * 3u);
+    return true;
+}
+
+bool ReserveIndexedShadowPackets(
+    uint triangleCount,
+    uint basePacket,
+    out uint outputBasePacket)
+{
+    outputBasePacket = 0u;
+    if (triangleCount == 0u || basePacket >= _IndexedTrianglePacketCapacity ||
+        triangleCount > _IndexedTrianglePacketCapacity - basePacket)
+        return false;
+
+    uint reservedPackets;
+    InterlockedAdd(_IndexedShadowBuildDispatchArgs[3], triangleCount, reservedPackets);
+    if (reservedPackets > _IndexedTrianglePacketCapacity - basePacket - triangleCount)
+        return false;
+
+    outputBasePacket = basePacket + reservedPackets;
+    InterlockedAdd(_IndexedDrawArgs[0], triangleCount * 3u);
+    return true;
 }
 
 [numthreads(128, 1, 1)]
@@ -693,11 +863,83 @@ void CSBuildIndexedDrawQueue(
     uint3 groupThreadId : SV_GroupThreadID)
 {
     uint localClusterIndex = groupId.x + groupId.y * max(1u, _IndexedDispatchGroupsX);
-    BuildIndexedCluster(
+    if (groupThreadId.x == 0u)
+    {
+        IndexedGroupOutputBasePacket = 0u;
+        IndexedGroupTriangleCount = 0u;
+        IndexedGroupAdmitted = 0u;
+        uint visibleClusters = _VisibleDrawCountArgs[0];
+        uint clusterIndex = _IndexedDrawClusterOffset + localClusterIndex;
+        if (localClusterIndex < _IndexedDrawCapacityClusters &&
+            clusterIndex < visibleClusters)
+        {
+            uint3 draw = _CompactedDrawClusters[clusterIndex];
+            IndexedGroupTriangleCount = min(draw.y, max(1u, _CompactedClusterTriangleSlots));
+            if (ReserveIndexedCameraPackets(
+                    IndexedGroupTriangleCount,
+                    0u,
+                    IndexedGroupOutputBasePacket))
+            {
+                IndexedGroupAdmitted = 1u;
+            }
+            else
+            {
+                _IndexedOverflowClusterIndices.Append(clusterIndex);
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (IndexedGroupAdmitted == 0u || groupThreadId.x >= IndexedGroupTriangleCount)
+        return;
+    BuildTrianglePacketCluster(
         localClusterIndex,
         _IndexedDrawCapacityClusters,
         _IndexedDrawClusterOffset,
-        _IndexedDrawBaseIndex,
+        groupThreadId.x);
+}
+
+[numthreads(128, 1, 1)]
+void CSBuildIndexedDrawQueueAppend(
+    uint3 groupId : SV_GroupID,
+    uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint localClusterIndex = groupId.x + groupId.y * max(1u, _IndexedDispatchGroupsX);
+    uint baseClusters = min(
+        _IndexedCameraBaseCountRead[0],
+        _IndexedDrawCapacityClusters);
+    uint capacityClusters = _IndexedDrawCapacityClusters - baseClusters;
+    if (groupThreadId.x == 0u)
+    {
+        IndexedGroupOutputBasePacket = 0u;
+        IndexedGroupTriangleCount = 0u;
+        IndexedGroupAdmitted = 0u;
+        uint visibleClusters = _VisibleDrawCountArgs[0];
+        uint clusterIndex = baseClusters + localClusterIndex;
+        if (localClusterIndex < capacityClusters && clusterIndex < visibleClusters)
+        {
+            uint3 draw = _CompactedDrawClusters[clusterIndex];
+            IndexedGroupTriangleCount = min(draw.y, max(1u, _CompactedClusterTriangleSlots));
+            uint basePacket = _IndexedCameraPacketSliceRead[0];
+            if (ReserveIndexedAppendPackets(
+                    IndexedGroupTriangleCount,
+                    basePacket,
+                    IndexedGroupOutputBasePacket))
+            {
+                IndexedGroupAdmitted = 1u;
+            }
+            else
+            {
+                _IndexedOverflowClusterIndices.Append(clusterIndex);
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (IndexedGroupAdmitted == 0u || groupThreadId.x >= IndexedGroupTriangleCount)
+        return;
+    BuildTrianglePacketCluster(
+        localClusterIndex,
+        capacityClusters,
+        baseClusters,
         groupThreadId.x);
 }
 
@@ -707,7 +949,7 @@ void CSBuildIndexedShadowDrawQueue(
     uint3 groupThreadId : SV_GroupThreadID)
 {
     uint cascadeIndex = min(_IndexedShadowCascadeIndex, 3u);
-    uint2 slice = _IndexedShadowSliceData[cascadeIndex];
+    uint4 slice = _IndexedShadowSliceData[cascadeIndex];
     uint dispatchGroupsX = min(1024u, slice.y);
     uint localClusterIndex = groupId.x + groupId.y * max(1u, dispatchGroupsX);
     uint visibleClusters = _VisibleDrawCountArgs[0];
@@ -715,39 +957,36 @@ void CSBuildIndexedShadowDrawQueue(
 
     if (groupThreadId.x == 0u)
     {
-        IndexedShadowGroupOutputBaseIndex = 0u;
+        IndexedShadowGroupOutputBasePacket = 0u;
         IndexedShadowGroupTriangleCount = 0u;
-        if (_GeometryVertexCount > 0u &&
-            localClusterIndex < slice.y &&
+        IndexedGroupAdmitted = 0u;
+        if (localClusterIndex < slice.y &&
             localClusterIndex < visibleClusters)
         {
             uint3 draw = _CompactedDrawClusters[localClusterIndex];
             IndexedShadowGroupTriangleCount = min(draw.y, slots);
-            uint reservedIndexCount;
-            InterlockedAdd(
-                _IndexedDrawArgs[0],
-                IndexedShadowGroupTriangleCount * 3u,
-                reservedIndexCount);
-            IndexedShadowGroupOutputBaseIndex = _IndexedDrawArgs[2] + reservedIndexCount;
+            if (ReserveIndexedShadowPackets(
+                    IndexedShadowGroupTriangleCount,
+                    slice.x,
+                    IndexedShadowGroupOutputBasePacket))
+            {
+                IndexedGroupAdmitted = 1u;
+            }
+            else
+            {
+                _IndexedOverflowClusterIndices.Append(localClusterIndex);
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
 
     uint triangleInCluster = groupThreadId.x;
-    if (triangleInCluster >= IndexedShadowGroupTriangleCount)
+    if (IndexedGroupAdmitted == 0u || triangleInCluster >= IndexedShadowGroupTriangleCount)
         return;
     uint3 draw = _CompactedDrawClusters[localClusterIndex];
-    uint triangleId = draw.x + triangleInCluster;
-    uint i0, i1, i2;
-    bool valid = BuildIndexedVertex(triangleId, 0u, draw.z, i0) &&
-                 BuildIndexedVertex(triangleId, 1u, draw.z, i1) &&
-                 BuildIndexedVertex(triangleId, 2u, draw.z, i2);
-    if (!valid)
-        i0 = i1 = i2 = 0u;
-    uint outputIndex = IndexedShadowGroupOutputBaseIndex + triangleInCluster * 3u;
-    _IndexedDrawIndices.Store((outputIndex + 0u) * 4u, i0);
-    _IndexedDrawIndices.Store((outputIndex + 1u) * 4u, i1);
-    _IndexedDrawIndices.Store((outputIndex + 2u) * 4u, i2);
+    uint packedPacket = ((draw.x + triangleInCluster) << _IndexedPacketInstanceBits) |
+                        (draw.z & _IndexedPacketInstanceMask);
+    _IndexedTrianglePackets[IndexedShadowGroupOutputBasePacket + triangleInCluster] = packedPacket;
 }
 
 [numthreads(256, 1, 1)]
@@ -761,6 +1000,9 @@ void CSClearHybridTileHeads(uint3 id : SV_DispatchThreadID)
 void CSClearHybridTileWork(uint3 id : SV_DispatchThreadID)
 {
     _HybridSoftwareTileNodeCounter[0] = 0u;
+    _HybridSoftwareTileNodeCounter[1] = 0u;
+    _HybridSoftwareTileNodeCounter[2] = 0u;
+    _HybridSoftwareTileNodeCounter[3] = 0u;
 }
 
 [numthreads(128, 1, 1)]
@@ -787,6 +1029,9 @@ void CSSoftwareRasterTiles(
     uint compactTileIndex = groupId.x + groupId.y * max(1u, _HybridDispatchGroupsX);
     if (compactTileIndex >= _HybridSoftwareTileCountArgs[0])
         return;
+
+    if (_HybridTelemetryEnabled != 0u && groupThreadIndex == 0u)
+        InterlockedAdd(_HybridSoftwareTileNodeCounter[3], 1u);
 
     uint tileIndex = _HybridSoftwareTileListRead[compactTileIndex];
     uint2 tile = uint2(tileIndex % _HybridTileCountX, tileIndex / _HybridTileCountX);
@@ -845,9 +1090,27 @@ void CSSoftwareRasterTiles(
                         f1 = (int2)round(HybridClipToPixel(p1) * 256.0);
                         f2 = (int2)round(HybridClipToPixel(p2) * 256.0);
                         area = HybridEdge(f0, f1, f2);
-                        z0 = saturate(p0.z / p0.w);
-                        z1 = saturate(p1.z / p1.w);
-                        z2 = saturate(p2.z / p2.w);
+                        z0 = HybridApplyDeterministicDepthTieBreak(
+                            saturate(p0.z / p0.w), triangleId);
+                        z1 = HybridApplyDeterministicDepthTieBreak(
+                            saturate(p1.z / p1.w), triangleId);
+                        z2 = HybridApplyDeterministicDepthTieBreak(
+                            saturate(p2.z / p2.w), triangleId);
+                        // Normalize either source winding to the positive edge
+                        // convention consumed below. This is equivalent to the
+                        // Cull Off hardware raster contract and naturally
+                        // handles negative-scale instances without a separate
+                        // determinant branch.
+                        if (area < 0)
+                        {
+                            int2 swapF = f1;
+                            f1 = f2;
+                            f2 = swapF;
+                            float swapZ = z1;
+                            z1 = z2;
+                            z2 = swapZ;
+                            area = -area;
+                        }
                     }
                 }
             }
@@ -898,7 +1161,18 @@ void CSSoftwareRasterTiles(
         _HybridSoftwareDepth[pixel] = bestDepth;
         if (_HybridDepthOnly == 0u)
             _HybridSoftwareWinner[pixel] = bestWinner;
+        if (_HybridTelemetryEnabled != 0u && bestWinner != 0u)
+        {
+            InterlockedAdd(_HybridSoftwareTileNodeCounter[1], 1u);
+            InterlockedMax(_HybridSoftwareTileNodeCounter[2], bestWinner);
+        }
     }
+}
+
+[numthreads(1, 1, 1)]
+void CSCaptureHybridView(uint3 id : SV_DispatchThreadID)
+{
+    _HybridViewConstantsWrite[0] = GetWorldToHClipMatrix();
 }
 
 [numthreads(1, 1, 1)]

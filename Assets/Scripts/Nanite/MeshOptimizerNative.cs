@@ -116,6 +116,36 @@ namespace Nanite
             uint options,
             out float resultError);
 
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SimplifyWithUpdate")]
+        public static extern UIntPtr NativeSimplifyWithUpdate(
+            [In, Out] uint[] indices,
+            UIntPtr indexCount,
+            [In, Out] Vector3[] vertexPositions,
+            UIntPtr vertexCount,
+            UIntPtr vertexPositionsStride,
+            [In, Out] float[] vertexAttributes,
+            UIntPtr vertexAttributesStride,
+            [In] float[] attributeWeights,
+            UIntPtr attributeCount,
+            [In] byte[] vertexLock,
+            UIntPtr targetIndexCount,
+            float targetError,
+            uint options,
+            out float resultError);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SimplifySloppy")]
+        public static extern UIntPtr NativeSimplifySloppy(
+            [Out] uint[] destination,
+            [In] uint[] indices,
+            UIntPtr indexCount,
+            [In] Vector3[] vertexPositions,
+            UIntPtr vertexCount,
+            UIntPtr vertexPositionsStride,
+            [In] byte[] vertexLock,
+            UIntPtr targetIndexCount,
+            float targetError,
+            out float resultError);
+
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "SimplifyScale")]
         public static extern float NativeSimplifyScale(
             [In] Vector3[] vertexPositions,

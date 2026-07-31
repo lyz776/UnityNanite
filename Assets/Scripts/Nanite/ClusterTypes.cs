@@ -48,6 +48,12 @@ namespace Nanite
         public float maxParentLodError;
         public int mipLevel;
         /// <summary>
+        /// The replacement was produced by the terminal vertex-update path. Its
+        /// UV contract uses the same robust 99.5 percentile gate as the builder,
+        /// while ordinary producers retain the conservative maximum-edge gate.
+        /// </summary>
+        public bool usesRobustUvGate;
+        /// <summary>
         /// This group starts a permanently resident hierarchy branch. Root residency is
         /// independent from maxParentLodError: a pruned component can remain discoverable
         /// in the root set while using a finite error to disappear below one pixel.
@@ -83,5 +89,69 @@ namespace Nanite
         public uint packedCone;
         public LODBounds self;
         public LODBounds parent;
+    }
+
+    /// <summary>
+    /// Mutable geometry arena shared by every sub-mesh during one bake. LOD0 keeps
+    /// the imported vertex IDs; coarse hierarchy levels append their optimized
+    /// position/attribute payload and therefore no longer have to approximate an
+    /// aggressive simplification using only the immutable source vertices.
+    /// </summary>
+    public sealed class NaniteBuildGeometry
+    {
+        public readonly List<Vector3> positions;
+        public readonly List<Vector3> normals;
+        public readonly List<Vector2> uvs;
+        public readonly List<Vector4> tangents;
+
+        public NaniteBuildGeometry(
+            Vector3[] sourcePositions,
+            Vector3[] sourceNormals,
+            Vector2[] sourceUvs,
+            Vector4[] sourceTangents)
+        {
+            if (sourcePositions == null)
+                throw new ArgumentNullException(nameof(sourcePositions));
+
+            int count = sourcePositions.Length;
+            positions = new List<Vector3>(sourcePositions);
+            normals = new List<Vector3>(count);
+            uvs = new List<Vector2>(count);
+            tangents = new List<Vector4>(count);
+            bool hasNormals = sourceNormals != null && sourceNormals.Length == count;
+            bool hasUvs = sourceUvs != null && sourceUvs.Length == count;
+            bool hasTangents = sourceTangents != null && sourceTangents.Length == count;
+            for (int vertexIndex = 0; vertexIndex < count; vertexIndex++)
+            {
+                normals.Add(hasNormals ? sourceNormals[vertexIndex] : Vector3.up);
+                uvs.Add(hasUvs ? sourceUvs[vertexIndex] : Vector2.zero);
+                tangents.Add(hasTangents
+                    ? sourceTangents[vertexIndex]
+                    : new Vector4(1f, 0f, 0f, 1f));
+            }
+        }
+
+        public int Count => positions.Count;
+
+        public void Append(Vector3 position, Vector3 normal, Vector2 uv, Vector4 tangent)
+        {
+            positions.Add(position);
+            normals.Add(normal);
+            uvs.Add(uv);
+            tangents.Add(tangent);
+        }
+
+        public void Truncate(int count)
+        {
+            if (count < 0 || count > Count)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            int removeCount = Count - count;
+            if (removeCount == 0)
+                return;
+            positions.RemoveRange(count, removeCount);
+            normals.RemoveRange(count, removeCount);
+            uvs.RemoveRange(count, removeCount);
+            tangents.RemoveRange(count, removeCount);
+        }
     }
 }
