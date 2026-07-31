@@ -1,5 +1,20 @@
 %YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
+--- !u!114 &-1619528804519490273
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fc4ee2a226c83b84eb5832d2b76d096f, type: 3}
+  m_Name: TODCloudShadowRendererFeature
+  m_EditorClassIdentifier: Assembly-CSharp::UnityNanite.TOD.TODCloudShadowRendererFeature
+  m_Active: 1
+  injectionPoint: 300
+  sceneView: 1
 --- !u!114 &11400000
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -26,9 +41,10 @@ MonoBehaviour:
     probeVolumeBlendStatesCS: {fileID: 7200000, guid: b9a23f869c4fd45f19c5ada54dd82176, type: 3}
   m_RendererFeatures:
   - {fileID: 7833122117494664109}
-  - {fileID: 279017014232383824}
+  - {fileID: 0}
   - {fileID: 6769014588011752513}
-  m_RendererFeatureMap: ad6b866f10d7b46c50819c037f44df0341ace06de75ef05d
+  - {fileID: -1619528804519490273}
+  m_RendererFeatureMap: ad6b866f10d7b46c50819c037f44df0341ace06de75ef05d1f4d1a07224786e9
   m_UseNativeRenderPass: 1
   xrSystemData: {fileID: 0}
   postProcessData: {fileID: 11400000, guid: 41439944d30ece34e96484bdb6645b55, type: 2}

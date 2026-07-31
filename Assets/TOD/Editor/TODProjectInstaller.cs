@@ -3,6 +3,7 @@ using System.Linq;
 using UnityEditor;
 using UnityEditor.Rendering.Universal;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
 namespace UnityNanite.TOD.Editor
@@ -12,6 +13,8 @@ namespace UnityNanite.TOD.Editor
         public const string DefaultProfilePath = "Assets/TOD/Profiles/Default TOD Profile.asset";
         public const string DefaultSkyMaterialPath = "Assets/TOD/Generated/TOD Dynamic Sky.mat";
         public const string DefaultPrefabPath = "Assets/TOD/Prefabs/TOD Rig.prefab";
+        private const string DefaultLensFlareDataPath =
+            "Packages/com.unity.render-pipelines.core/Runtime/RenderPipelineResources/Default Lens Flare (SRP).asset";
 
         [MenuItem("Tools/Unity Nanite/TOD/Install Project Defaults")]
         public static void InstallProjectDefaults()
@@ -95,7 +98,7 @@ namespace UnityNanite.TOD.Editor
 
         private static void UpgradeGeneratedDefaultProfile(TODProfile profile)
         {
-            const int currentVersion = 5;
+            const int currentVersion = 10;
             if (profile.generatedPresetVersion >= currentVersion)
                 return;
 
@@ -140,6 +143,15 @@ namespace UnityNanite.TOD.Editor
             profile.sky.mieOpticalDepth = new TODFloatParameter(0.85f);
             profile.sky.mieHorizonBoost = new TODFloatParameter(1.35f);
             profile.sky.mieMoonAmount = new TODFloatParameter(0.18f);
+            profile.sky.sunWashColor = new TODColorParameter(
+                new Color(0.92f, 0.72f, 0.52f), true,
+                TODProfile.DayGradient(
+                    new Color(0.08f, 0.11f, 0.2f),
+                    new Color(1.1f, 0.34f, 0.12f),
+                    new Color(0.72f, 0.82f, 1f)));
+            profile.sky.sunWashIntensity = new TODFloatParameter(0.28f);
+            profile.sky.sunWashPower = new TODFloatParameter(2.4f);
+            profile.sky.sunWashHorizonWeight = new TODFloatParameter(0.65f);
 
             profile.sun.diskSize = new TODFloatParameter(0.016f);
             profile.sun.diskSoftness = new TODFloatParameter(0.0015f);
@@ -178,15 +190,29 @@ namespace UnityNanite.TOD.Editor
                     new Color(0.72f, 0.33f, 0.25f),
                     new Color(0.92f, 0.96f, 1f)));
             profile.clouds.shadowColor = new TODColorParameter(new Color(0.28f, 0.34f, 0.44f));
-            profile.clouds.opacity = new TODFloatParameter(0.42f);
-            profile.clouds.coverage = new TODFloatParameter(0.6f);
-            profile.clouds.scale = new TODFloatParameter(3.2f);
-            profile.clouds.detailScale = new TODFloatParameter(2.85f);
-            profile.clouds.softness = new TODFloatParameter(0.14f);
-            profile.clouds.erosion = new TODFloatParameter(0.32f);
-            profile.clouds.distortion = new TODFloatParameter(1.35f);
+            profile.clouds.frontLitColor =
+                new TODColorParameter(new Color(1.02f, 1.04f, 1.08f));
+            profile.clouds.frontDarkColor =
+                new TODColorParameter(new Color(0.38f, 0.45f, 0.58f));
+            profile.clouds.backLitColor =
+                new TODColorParameter(new Color(1.18f, 0.82f, 0.52f));
+            profile.clouds.backDarkColor =
+                new TODColorParameter(new Color(0.24f, 0.29f, 0.40f));
+            profile.clouds.directionalColorAmount = new TODFloatParameter(0.82f);
+            profile.clouds.rimColor =
+                new TODColorParameter(new Color(1.2f, 0.82f, 0.5f));
+            profile.clouds.rimIntensity = new TODFloatParameter(0.62f);
+            profile.clouds.rimPower = new TODFloatParameter(3.5f);
+            profile.clouds.rimWidth = new TODFloatParameter(0.08f);
+            profile.clouds.opacity = new TODFloatParameter(0.68f);
+            profile.clouds.coverage = new TODFloatParameter(0.58f);
+            profile.clouds.scale = new TODFloatParameter(6.2f);
+            profile.clouds.detailScale = new TODFloatParameter(3.4f);
+            profile.clouds.softness = new TODFloatParameter(0.1f);
+            profile.clouds.erosion = new TODFloatParameter(0.44f);
+            profile.clouds.distortion = new TODFloatParameter(1.2f);
             profile.clouds.altitude = new TODFloatParameter(6f);
-            profile.clouds.thickness = new TODFloatParameter(0.9f);
+            profile.clouds.thickness = new TODFloatParameter(1.25f);
             profile.clouds.densityMultiplier = new TODFloatParameter(1f);
             profile.clouds.horizonDensity = new TODFloatParameter(0.55f);
             profile.clouds.zenithDensity = new TODFloatParameter(1f);
@@ -203,9 +229,50 @@ namespace UnityNanite.TOD.Editor
             profile.clouds.moonLighting = new TODFloatParameter(0.22f);
             profile.clouds.ambientColor =
                 new TODColorParameter(new Color(0.32f, 0.42f, 0.58f));
-            profile.clouds.ambientIntensity = new TODFloatParameter(0.38f);
-            profile.clouds.multipleScattering = new TODFloatParameter(0.28f);
+            profile.clouds.ambientIntensity = new TODFloatParameter(0.3f);
+            profile.clouds.multipleScattering = new TODFloatParameter(0.34f);
             profile.clouds.aerialPerspective = new TODFloatParameter(0.55f);
+            profile.clouds.lightWrap = new TODFloatParameter(0.36f);
+            profile.clouds.selfShadowStrength = new TODFloatParameter(1.8f);
+            profile.clouds.selfShadowDistance = new TODFloatParameter(0.4f);
+            profile.clouds.stylization = new TODFloatParameter(0.62f);
+            profile.clouds.lightSteps = new TODFloatParameter(4f);
+            profile.clouds.lightStepSoftness = new TODFloatParameter(0.27f);
+            profile.clouds.sunTransmission = new TODFloatParameter(0.75f);
+            profile.clouds.sunTransmissionPower = new TODFloatParameter(3.2f);
+            profile.clouds.undersideStrength = new TODFloatParameter(0.56f);
+            profile.clouds.shadows = new TODCloudShadowSettings
+            {
+                enabled = true,
+                color = new TODColorParameter(new Color(0.52f, 0.60f, 0.72f)),
+                scale = new TODFloatParameter(0.0015f),
+                sunnyStrength = new TODFloatParameter(0.22f),
+                overcastStrength = new TODFloatParameter(0.48f),
+                softness = new TODFloatParameter(0.12f),
+                maxDistance = new TODFloatParameter(1800f)
+            };
+
+            profile.lensFlare = new TODLensFlareSettings();
+            profile.fog.topColor = new TODColorParameter(
+                new Color(0.58f, 0.69f, 0.78f), true,
+                TODProfile.DayGradient(
+                    new Color(0.012f, 0.018f, 0.04f),
+                    new Color(0.72f, 0.24f, 0.13f),
+                    new Color(0.58f, 0.69f, 0.78f)));
+            profile.fog.bottomColor = new TODColorParameter(
+                new Color(0.42f, 0.52f, 0.58f), true,
+                TODProfile.DayGradient(
+                    new Color(0.008f, 0.012f, 0.025f),
+                    new Color(0.58f, 0.18f, 0.1f),
+                    new Color(0.42f, 0.52f, 0.58f)));
+            profile.fog.topIntensity = new TODFloatParameter(0.8f);
+            profile.fog.bottomIntensity = new TODFloatParameter(1f);
+            profile.fog.skyIntensity = new TODFloatParameter(0.18f);
+            profile.fog.power = new TODFloatParameter(1f);
+            profile.fog.exponentialBlend = new TODFloatParameter(0f);
+            profile.fog.heightFogEnabled = false;
+            profile.fog.screenSpace = new TODScreenSpaceFogSettings();
+            profile.fog.groundVolume = new TODGroundVolumeFogSettings();
 
             profile.generatedPresetVersion = currentVersion;
             EditorUtility.SetDirty(profile);
@@ -242,6 +309,20 @@ namespace UnityNanite.TOD.Editor
                         existingController.Profile = profile;
                         existingController.AssignSkybox = true;
                         existingController.SkyboxMaterial = skyMaterial;
+                        Transform sunAnchor = EnsureCelestialAnchor(
+                            contents.transform,
+                            existingController.SunVisual,
+                            "Sun Visual Anchor",
+                            out LensFlareComponentSRP sunFlare);
+                        Transform moonAnchor = EnsureCelestialAnchor(
+                            contents.transform,
+                            existingController.MoonVisual,
+                            "Moon Visual Anchor",
+                            out LensFlareComponentSRP moonFlare);
+                        existingController.SunVisual = sunAnchor;
+                        existingController.MoonVisual = moonAnchor;
+                        existingController.SunLensFlare = sunFlare;
+                        existingController.MoonLensFlare = moonFlare;
                         PrefabUtility.SaveAsPrefabAsset(contents, DefaultPrefabPath);
                     }
                 }
@@ -273,10 +354,18 @@ namespace UnityNanite.TOD.Editor
                 GameObject sunAnchor = new GameObject("Sun Visual Anchor");
                 sunAnchor.transform.SetParent(root.transform, false);
                 controller.SunVisual = sunAnchor.transform;
+                ConfigureLensFlareAnchor(
+                    sunAnchor,
+                    out LensFlareComponentSRP sunFlare);
+                controller.SunLensFlare = sunFlare;
 
                 GameObject moonAnchor = new GameObject("Moon Visual Anchor");
                 moonAnchor.transform.SetParent(root.transform, false);
                 controller.MoonVisual = moonAnchor.transform;
+                ConfigureLensFlareAnchor(
+                    moonAnchor,
+                    out LensFlareComponentSRP moonFlare);
+                controller.MoonLensFlare = moonFlare;
 
                 PrefabUtility.SaveAsPrefabAsset(root, DefaultPrefabPath);
             }
@@ -284,6 +373,49 @@ namespace UnityNanite.TOD.Editor
             {
                 UnityEngine.Object.DestroyImmediate(root);
             }
+        }
+
+        private static Transform EnsureCelestialAnchor(
+            Transform root,
+            Transform current,
+            string name,
+            out LensFlareComponentSRP flare)
+        {
+            Transform anchor = current != null ? current : root.Find(name);
+            if (anchor == null)
+            {
+                GameObject anchorObject = new GameObject(name);
+                anchorObject.transform.SetParent(root, false);
+                anchor = anchorObject.transform;
+            }
+
+            ConfigureLensFlareAnchor(anchor.gameObject, out flare);
+            return anchor;
+        }
+
+        private static void ConfigureLensFlareAnchor(
+            GameObject anchor,
+            out LensFlareComponentSRP flare)
+        {
+            Light anchorLight = anchor.GetComponent<Light>();
+            if (anchorLight == null)
+                anchorLight = anchor.AddComponent<Light>();
+            anchorLight.type = LightType.Directional;
+            anchorLight.intensity = 0f;
+            anchorLight.shadows = LightShadows.None;
+            anchorLight.enabled = false;
+
+            flare = anchor.GetComponent<LensFlareComponentSRP>();
+            if (flare == null)
+                flare = anchor.AddComponent<LensFlareComponentSRP>();
+            if (flare.lensFlareData == null)
+            {
+                flare.lensFlareData =
+                    AssetDatabase.LoadAssetAtPath<LensFlareDataSRP>(DefaultLensFlareDataPath);
+            }
+            flare.useOcclusion = true;
+            flare.attenuationByLightShape = false;
+            flare.allowOffScreen = false;
         }
 
         private static int EnsureRendererFeatures()
@@ -297,28 +429,35 @@ namespace UnityNanite.TOD.Editor
                 if (rendererData == null)
                     continue;
 
-                if (rendererData.rendererFeatures.Any(feature => feature is TODFogRendererFeature))
-                    continue;
-
-                TODFogRendererFeature feature = ScriptableObject.CreateInstance<TODFogRendererFeature>();
-                feature.name = nameof(TODFogRendererFeature);
-                AssetDatabase.AddObjectToAsset(feature, rendererData);
-                AssetDatabase.TryGetGUIDAndLocalFileIdentifier(feature, out _, out long localId);
-
-                SerializedObject serializedData = new SerializedObject(rendererData);
-                SerializedProperty features = serializedData.FindProperty("m_RendererFeatures");
-                SerializedProperty featureMap = serializedData.FindProperty("m_RendererFeatureMap");
-                features.arraySize++;
-                features.GetArrayElementAtIndex(features.arraySize - 1).objectReferenceValue = feature;
-                featureMap.arraySize++;
-                featureMap.GetArrayElementAtIndex(featureMap.arraySize - 1).longValue = localId;
-                serializedData.ApplyModifiedPropertiesWithoutUndo();
-
-                EditorUtility.SetDirty(feature);
-                EditorUtility.SetDirty(rendererData);
-                count++;
+                count += AddRendererFeatureIfMissing<TODCloudShadowRendererFeature>(rendererData);
+                count += AddRendererFeatureIfMissing<TODFogRendererFeature>(rendererData);
             }
             return count;
+        }
+
+        private static int AddRendererFeatureIfMissing<T>(UniversalRendererData rendererData)
+            where T : ScriptableRendererFeature
+        {
+            if (rendererData.rendererFeatures.Any(feature => feature is T))
+                return 0;
+
+            T feature = ScriptableObject.CreateInstance<T>();
+            feature.name = typeof(T).Name;
+            AssetDatabase.AddObjectToAsset(feature, rendererData);
+            AssetDatabase.TryGetGUIDAndLocalFileIdentifier(feature, out _, out long localId);
+
+            SerializedObject serializedData = new SerializedObject(rendererData);
+            SerializedProperty features = serializedData.FindProperty("m_RendererFeatures");
+            SerializedProperty featureMap = serializedData.FindProperty("m_RendererFeatureMap");
+            features.arraySize++;
+            features.GetArrayElementAtIndex(features.arraySize - 1).objectReferenceValue = feature;
+            featureMap.arraySize++;
+            featureMap.GetArrayElementAtIndex(featureMap.arraySize - 1).longValue = localId;
+            serializedData.ApplyModifiedPropertiesWithoutUndo();
+
+            EditorUtility.SetDirty(feature);
+            EditorUtility.SetDirty(rendererData);
+            return 1;
         }
 
         [MenuItem("Tools/Unity Nanite/TOD/Validate Installation")]
@@ -334,10 +473,18 @@ namespace UnityNanite.TOD.Editor
                 .ToArray();
             bool fog = renderers.Length > 0 &&
                        renderers.All(value => value.rendererFeatures.Any(feature => feature is TODFogRendererFeature));
+            bool cloudShadows = renderers.Length > 0 &&
+                renderers.All(value =>
+                    value.rendererFeatures.Any(feature => feature is TODCloudShadowRendererFeature));
             Shader skyShader = Shader.Find("Skybox/Unity Nanite TOD Dynamic Sky");
             Shader fogShader = Shader.Find("Hidden/Unity Nanite/TOD Fog");
+            Shader cloudShadowShader = Shader.Find("Hidden/Unity Nanite/TOD Cloud Shadow");
+            bool skyCompiled = HasNoShaderMessages(skyShader);
+            bool fogCompiled = HasNoShaderMessages(fogShader);
+            bool cloudShadowCompiled = HasNoShaderMessages(cloudShadowShader);
 
-            if (profile && material && prefab && fog && skyShader != null && fogShader != null)
+            if (profile && material && prefab && fog && cloudShadows &&
+                skyCompiled && fogCompiled && cloudShadowCompiled)
             {
                 Debug.Log("[TOD][Validation] PASS: profile, prefab, shaders, material and all URP renderer features are installed.");
             }
@@ -345,8 +492,29 @@ namespace UnityNanite.TOD.Editor
             {
                 Debug.LogError(
                     $"[TOD][Validation] FAIL profile={profile}, material={material}, prefab={prefab}, " +
-                    $"fogFeatures={fog}, skyShader={skyShader != null}, fogShader={fogShader != null}.");
+                    $"fogFeatures={fog}, cloudShadowFeatures={cloudShadows}, skyShader={skyShader != null}, " +
+                    $"fogShader={fogShader != null}, cloudShadowShader={cloudShadowShader != null}, " +
+                    $"skyCompiled={skyCompiled}, fogCompiled={fogCompiled}, " +
+                    $"cloudShadowCompiled={cloudShadowCompiled}.");
             }
+        }
+
+        private static bool HasNoShaderMessages(Shader shader)
+        {
+            if (shader == null)
+                return false;
+
+            var messages = ShaderUtil.GetShaderMessages(shader);
+            if (messages == null || messages.Length == 0)
+                return true;
+
+            foreach (var message in messages)
+            {
+                Debug.LogError(
+                    $"[TOD][Shader] {shader.name}: {message.message} " +
+                    $"(line {message.line}, {message.file})");
+            }
+            return false;
         }
 
         // Isolated to keep the installer readable and avoid relying on internal scene APIs.

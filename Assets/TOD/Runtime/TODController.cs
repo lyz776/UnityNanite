@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace UnityNanite.TOD
 {
@@ -17,6 +18,11 @@ namespace UnityNanite.TOD
         [SerializeField] private Light mainLight;
         [SerializeField] private Transform sunVisual;
         [SerializeField] private Transform moonVisual;
+        [SerializeField] private LensFlareComponentSRP sunLensFlare;
+        [SerializeField] private LensFlareComponentSRP moonLensFlare;
+        [SerializeField] private Texture terrainHeightTexture;
+        [SerializeField] private Vector3 terrainHeightOrigin;
+        [SerializeField] private Vector3 terrainHeightSize = new Vector3(1000f, 256f, 1000f);
         [SerializeField] private bool assignSkybox = true;
         [SerializeField] private Material skyboxMaterial;
 
@@ -57,6 +63,11 @@ namespace UnityNanite.TOD
         public Light MainLight { get => mainLight; set { mainLight = value; Apply(true); } }
         public Transform SunVisual { get => sunVisual; set { sunVisual = value; Apply(true); } }
         public Transform MoonVisual { get => moonVisual; set { moonVisual = value; Apply(true); } }
+        public LensFlareComponentSRP SunLensFlare { get => sunLensFlare; set { sunLensFlare = value; Apply(true); } }
+        public LensFlareComponentSRP MoonLensFlare { get => moonLensFlare; set { moonLensFlare = value; Apply(true); } }
+        public Texture TerrainHeightTexture { get => terrainHeightTexture; set { terrainHeightTexture = value; Apply(true); } }
+        public Vector3 TerrainHeightOrigin { get => terrainHeightOrigin; set { terrainHeightOrigin = value; Apply(true); } }
+        public Vector3 TerrainHeightSize { get => terrainHeightSize; set { terrainHeightSize = value; Apply(true); } }
         public bool AssignSkybox { get => assignSkybox; set { assignSkybox = value; Apply(true); } }
         public Material SkyboxMaterial { get => skyboxMaterial; set { skyboxMaterial = value; Apply(true); } }
 
@@ -116,6 +127,7 @@ namespace UnityNanite.TOD
 
             UpdateCelestialTransform(sunVisual, sunDirection, profile.gizmoRadius);
             UpdateCelestialTransform(moonVisual, moonDirection, profile.gizmoRadius);
+            ApplyLensFlares(profile, hour);
 
             if (mainLight != null)
             {
@@ -161,6 +173,12 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODMieOpticalDepth", Mathf.Max(0f, value.sky.mieOpticalDepth.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODMieHorizonBoost", Mathf.Max(0f, value.sky.mieHorizonBoost.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODMieMoonAmount", Mathf.Max(0f, value.sky.mieMoonAmount.Evaluate(hour)));
+            SetColor("_TODSunWashColor", value.sky.sunWashColor.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODSunWashIntensity", Mathf.Max(0f, value.sky.sunWashIntensity.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODSunWashPower", Mathf.Max(0.1f, value.sky.sunWashPower.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODSunWashHorizonWeight",
+                Mathf.Clamp01(value.sky.sunWashHorizonWeight.Evaluate(hour)));
 
             Shader.SetGlobalFloat("_TODStarsEnabled", value.stars.enabled ? 1f : 0f);
             SetColor("_TODStarsColor", value.stars.color.Evaluate(hour));
@@ -177,6 +195,17 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODCloudsEnabled", value.clouds.enabled ? 1f : 0f);
             SetColor("_TODCloudColor", value.clouds.color.Evaluate(hour));
             SetColor("_TODCloudShadowColor", value.clouds.shadowColor.Evaluate(hour));
+            SetColor("_TODCloudFrontLitColor", value.clouds.frontLitColor.Evaluate(hour));
+            SetColor("_TODCloudFrontDarkColor", value.clouds.frontDarkColor.Evaluate(hour));
+            SetColor("_TODCloudBackLitColor", value.clouds.backLitColor.Evaluate(hour));
+            SetColor("_TODCloudBackDarkColor", value.clouds.backDarkColor.Evaluate(hour));
+            Shader.SetGlobalFloat(
+                "_TODCloudDirectionalColorAmount",
+                Mathf.Clamp01(value.clouds.directionalColorAmount.Evaluate(hour)));
+            SetColor("_TODCloudRimColor", value.clouds.rimColor.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODCloudRimIntensity", Mathf.Max(0f, value.clouds.rimIntensity.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudRimPower", Mathf.Max(0.01f, value.clouds.rimPower.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudRimWidth", Mathf.Max(0.001f, value.clouds.rimWidth.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudOpacity", Mathf.Clamp01(value.clouds.opacity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudCoverage", Mathf.Clamp01(value.clouds.coverage.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudScale", Mathf.Max(0.01f, value.clouds.scale.Evaluate(hour)));
@@ -205,6 +234,47 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODCloudAmbientIntensity", Mathf.Max(0f, value.clouds.ambientIntensity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudMultipleScattering", Mathf.Max(0f, value.clouds.multipleScattering.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudAerialPerspective", Mathf.Clamp01(value.clouds.aerialPerspective.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudLightWrap", Mathf.Clamp01(value.clouds.lightWrap.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudSelfShadowStrength",
+                Mathf.Max(0f, value.clouds.selfShadowStrength.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudSelfShadowDistance",
+                Mathf.Max(0f, value.clouds.selfShadowDistance.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudStylization", Mathf.Clamp01(value.clouds.stylization.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudLightSteps",
+                Mathf.Clamp(Mathf.Round(value.clouds.lightSteps.Evaluate(hour)), 1f, 8f));
+            Shader.SetGlobalFloat(
+                "_TODCloudLightStepSoftness",
+                Mathf.Clamp(value.clouds.lightStepSoftness.Evaluate(hour), 0.001f, 0.49f));
+            Shader.SetGlobalFloat(
+                "_TODCloudSunTransmission",
+                Mathf.Max(0f, value.clouds.sunTransmission.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudSunTransmissionPower",
+                Mathf.Max(0.1f, value.clouds.sunTransmissionPower.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudUndersideStrength",
+                Mathf.Clamp01(value.clouds.undersideStrength.Evaluate(hour)));
+
+            Shader.SetGlobalFloat(
+                "_TODCloudShadowsEnabled",
+                value.clouds.enabled && value.clouds.shadows.enabled ? 1f : 0f);
+            SetColor("_TODCloudShadowTint", value.clouds.shadows.color.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODCloudShadowScale", Mathf.Max(0.000001f, value.clouds.shadows.scale.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudShadowSunnyStrength",
+                Mathf.Clamp01(value.clouds.shadows.sunnyStrength.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudShadowOvercastStrength",
+                Mathf.Clamp01(value.clouds.shadows.overcastStrength.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudShadowSoftness",
+                Mathf.Max(0.001f, value.clouds.shadows.softness.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudShadowMaxDistance",
+                Mathf.Max(1f, value.clouds.shadows.maxDistance.Evaluate(hour)));
 
             SetColor("_TODSunColor", value.sun.color.Evaluate(hour));
             Shader.SetGlobalFloat("_TODSunIntensity", Mathf.Max(0f, value.sun.intensity.Evaluate(hour)));
@@ -230,13 +300,29 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODMoonAtmosphereBlend", Mathf.Clamp01(value.moon.atmosphereBlend.Evaluate(hour)));
         }
 
-        private static void ApplyFogGlobals(TODProfile value, float hour)
+        private void ApplyFogGlobals(TODProfile value, float hour)
         {
             Shader.SetGlobalFloat("_TODFogEnabled", value.fog.enabled ? 1f : 0f);
             SetColor("_TODFogColor", value.fog.color.Evaluate(hour));
+            SetColor("_TODFogTopColor", value.fog.topColor.Evaluate(hour));
+            SetColor("_TODFogBottomColor", value.fog.bottomColor.Evaluate(hour));
             float start = Mathf.Max(0f, value.fog.startDistance.Evaluate(hour));
             float end = Mathf.Max(start + 0.001f, value.fog.endDistance.Evaluate(hour));
-            Shader.SetGlobalVector("_TODFogDistance", new Vector4(start, end, Mathf.Max(0f, value.fog.density.Evaluate(hour)), 0f));
+            Shader.SetGlobalVector("_TODFogDistance", new Vector4(
+                start,
+                end,
+                Mathf.Max(0f, value.fog.density.Evaluate(hour)),
+                Mathf.Clamp01(value.fog.exponentialBlend.Evaluate(hour))));
+            Shader.SetGlobalVector("_TODFogShape", new Vector4(
+                Mathf.Max(0f, value.fog.topIntensity.Evaluate(hour)),
+                Mathf.Max(0f, value.fog.bottomIntensity.Evaluate(hour)),
+                Mathf.Clamp01(value.fog.skyIntensity.Evaluate(hour)),
+                Mathf.Max(0.01f, value.fog.power.Evaluate(hour))));
+            Shader.SetGlobalVector("_TODFogHeight", new Vector4(
+                value.fog.baseHeight.Evaluate(hour),
+                Mathf.Max(0.001f, value.fog.heightRange.Evaluate(hour)),
+                0f,
+                0f));
 
             Shader.SetGlobalFloat("_TODHeightFogEnabled", value.fog.heightFogEnabled ? 1f : 0f);
             SetColor("_TODHeightFogColor", value.fog.heightColor.Evaluate(hour));
@@ -248,6 +334,116 @@ namespace UnityNanite.TOD
                 Mathf.Max(0f, value.fog.heightDensity.Evaluate(hour)),
                 0f));
             Shader.SetGlobalVector("_TODHeightFogDistance", new Vector4(heightStart, heightEnd, 0f, 0f));
+
+            TODScreenSpaceFogSettings screen = value.fog.screenSpace;
+            float screenStart = Mathf.Max(0f, screen.startDistance.Evaluate(hour));
+            float screenEnd = Mathf.Max(screenStart + 0.001f, screen.endDistance.Evaluate(hour));
+            Shader.SetGlobalFloat(
+                "_TODScreenFogEnabled",
+                value.fog.enabled && screen.enabled ? 1f : 0f);
+            Shader.SetGlobalVector("_TODScreenFogParams", new Vector4(
+                Mathf.Clamp01(screen.intensity.Evaluate(hour)),
+                Mathf.Clamp(screen.radius.Evaluate(hour), 0f, 8f),
+                screenStart,
+                screenEnd));
+            Shader.SetGlobalVector("_TODScreenFogDepth", new Vector4(
+                Mathf.Max(0.0001f, screen.depthThreshold.Evaluate(hour)),
+                Mathf.Clamp01(screen.skyContribution.Evaluate(hour)),
+                0f,
+                0f));
+
+            TODGroundVolumeFogSettings ground = value.fog.groundVolume;
+            Shader.SetGlobalFloat(
+                "_TODGroundFogEnabled",
+                value.fog.enabled && ground.enabled ? 1f : 0f);
+            SetColor("_TODGroundFogAlbedo", ground.albedo.Evaluate(hour));
+            Shader.SetGlobalVector("_TODGroundFogParams0", new Vector4(
+                Mathf.Max(0f, ground.density.Evaluate(hour)),
+                ground.fogHeight.Evaluate(hour),
+                Mathf.Max(0.001f, ground.heightRange.Evaluate(hour)),
+                Mathf.Max(1f, ground.maxDistance.Evaluate(hour))));
+            Shader.SetGlobalVector("_TODGroundFogParams1", new Vector4(
+                Mathf.Clamp01(ground.terrainConformity.Evaluate(hour)),
+                Mathf.Max(0.00001f, ground.noise2DScale.Evaluate(hour)),
+                Mathf.Max(0.00001f, ground.noise3DScale.Evaluate(hour)),
+                Mathf.Clamp01(ground.erosion.Evaluate(hour))));
+            Shader.SetGlobalVector("_TODGroundFogParams2", new Vector4(
+                ground.windX.Evaluate(hour),
+                ground.windZ.Evaluate(hour),
+                Mathf.Clamp(ground.anisotropy.Evaluate(hour), -0.9f, 0.9f),
+                Mathf.Clamp01(ground.shadowStrength.Evaluate(hour))));
+            Shader.SetGlobalVector("_TODGroundFogParams3", new Vector4(
+                Mathf.Max(0f, ground.shaftIntensity.Evaluate(hour)),
+                Mathf.Clamp(Mathf.Round(ground.stepCount.Evaluate(hour)), 8f, 128f),
+                Time.realtimeSinceStartup,
+                0f));
+            Shader.SetGlobalTexture(
+                "_TODTerrainHeightTexture",
+                terrainHeightTexture != null ? terrainHeightTexture : Texture2D.blackTexture);
+            Shader.SetGlobalVector("_TODTerrainHeightOrigin", terrainHeightOrigin);
+            Shader.SetGlobalVector("_TODTerrainHeightSize", new Vector4(
+                Mathf.Max(0.001f, terrainHeightSize.x),
+                Mathf.Max(0.001f, terrainHeightSize.y),
+                Mathf.Max(0.001f, terrainHeightSize.z),
+                terrainHeightTexture != null ? 1f : 0f));
+        }
+
+        private void ApplyLensFlares(TODProfile value, float hour)
+        {
+            ApplyLensFlare(
+                sunLensFlare,
+                value.lensFlare,
+                value.lensFlare.sunIntensity.Evaluate(hour),
+                value.lensFlare.sunScale.Evaluate(hour),
+                value.sun.color.Evaluate(hour),
+                hour);
+            ApplyLensFlare(
+                moonLensFlare,
+                value.lensFlare,
+                value.lensFlare.moonIntensity.Evaluate(hour),
+                value.lensFlare.moonScale.Evaluate(hour),
+                value.moon.color.Evaluate(hour),
+                hour);
+        }
+
+        private static void ApplyLensFlare(
+            LensFlareComponentSRP flare,
+            TODLensFlareSettings settings,
+            float intensity,
+            float scale,
+            Color lightColor,
+            float hour)
+        {
+            if (flare == null)
+                return;
+
+            bool active = settings.enabled && flare.lensFlareData != null;
+            flare.enabled = active;
+            if (!active)
+                return;
+
+            flare.intensity = Mathf.Max(0f, intensity);
+            flare.scale = Mathf.Max(0f, scale);
+            flare.useOcclusion = settings.useOcclusion;
+            flare.environmentOcclusion = settings.environmentOcclusion;
+            flare.allowOffScreen = settings.allowOffScreen;
+            flare.occlusionRadius = Mathf.Max(0f, settings.occlusionRadius.Evaluate(hour));
+            flare.sampleCount = (uint)Mathf.Clamp(
+                Mathf.RoundToInt(settings.occlusionSamples.Evaluate(hour)), 1, 64);
+            flare.maxAttenuationDistance = Mathf.Max(
+                0.0001f, settings.maxAttenuationDistance.Evaluate(hour));
+            flare.maxAttenuationScale = flare.maxAttenuationDistance;
+            flare.attenuationByLightShape = false;
+
+            // 挂点上的零强度方向光只负责让 SRP Flare 使用“无限远天体”定位，
+            // 不参与场景照明；它的颜色仍可供 Flare Data 做颜色调制。
+            Light anchorLight = flare.GetComponent<Light>();
+            if (anchorLight != null)
+            {
+                anchorLight.type = LightType.Directional;
+                anchorLight.color = lightColor;
+                anchorLight.intensity = 0f;
+            }
         }
 
         private static void ApplyEnvironment(TODProfile value, float hour)
@@ -256,7 +452,7 @@ namespace UnityNanite.TOD
             // material fog disabled prevents standard URP shaders being fogged twice.
             RenderSettings.fog = false;
             RenderSettings.fogMode = FogMode.Linear;
-            RenderSettings.fogColor = value.fog.color.Evaluate(hour);
+            RenderSettings.fogColor = value.fog.bottomColor.Evaluate(hour);
             RenderSettings.fogStartDistance = Mathf.Max(0f, value.fog.startDistance.Evaluate(hour));
             RenderSettings.fogEndDistance = Mathf.Max(RenderSettings.fogStartDistance + 0.001f, value.fog.endDistance.Evaluate(hour));
         }

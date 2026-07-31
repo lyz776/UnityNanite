@@ -13,6 +13,11 @@ namespace UnityNanite.TOD.Editor
         private SerializedProperty mainLight;
         private SerializedProperty sunVisual;
         private SerializedProperty moonVisual;
+        private SerializedProperty sunLensFlare;
+        private SerializedProperty moonLensFlare;
+        private SerializedProperty terrainHeightTexture;
+        private SerializedProperty terrainHeightOrigin;
+        private SerializedProperty terrainHeightSize;
         private SerializedProperty assignSkybox;
         private SerializedProperty skyboxMaterial;
         private SerializedObject profileObject;
@@ -26,6 +31,11 @@ namespace UnityNanite.TOD.Editor
             mainLight = serializedObject.FindProperty("mainLight");
             sunVisual = serializedObject.FindProperty("sunVisual");
             moonVisual = serializedObject.FindProperty("moonVisual");
+            sunLensFlare = serializedObject.FindProperty("sunLensFlare");
+            moonLensFlare = serializedObject.FindProperty("moonLensFlare");
+            terrainHeightTexture = serializedObject.FindProperty("terrainHeightTexture");
+            terrainHeightOrigin = serializedObject.FindProperty("terrainHeightOrigin");
+            terrainHeightSize = serializedObject.FindProperty("terrainHeightSize");
             assignSkybox = serializedObject.FindProperty("assignSkybox");
             skyboxMaterial = serializedObject.FindProperty("skyboxMaterial");
             RebuildProfileObject();
@@ -77,9 +87,21 @@ namespace UnityNanite.TOD.Editor
             EditorGUILayout.PropertyField(mainLight, new GUIContent("主方向光"));
             EditorGUILayout.PropertyField(sunVisual, new GUIContent("太阳可视化挂点"));
             EditorGUILayout.PropertyField(moonVisual, new GUIContent("月亮可视化挂点"));
+            EditorGUILayout.Space(3f);
+            EditorGUILayout.LabelField("Lens Flare 挂点", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(sunLensFlare, new GUIContent("太阳 Lens Flare"));
+            EditorGUILayout.PropertyField(moonLensFlare, new GUIContent("月亮 Lens Flare"));
             EditorGUILayout.PropertyField(assignSkybox, new GUIContent("自动设置天空盒"));
             if (assignSkybox.boolValue)
                 EditorGUILayout.PropertyField(skyboxMaterial, new GUIContent("天空盒材质"));
+            EditorGUILayout.Space(3f);
+            EditorGUILayout.LabelField("贴地体积雾场景数据（预研接口）", EditorStyles.boldLabel);
+            EditorGUILayout.HelpBox(
+                "高度图与世界范围属于场景数据，不写入 Profile。当前阶段仅传入全局参数，后续由贴地体积雾 Renderer Feature 读取。",
+                MessageType.None);
+            EditorGUILayout.PropertyField(terrainHeightTexture, new GUIContent("地形高度图"));
+            EditorGUILayout.PropertyField(terrainHeightOrigin, new GUIContent("高度图世界原点"));
+            EditorGUILayout.PropertyField(terrainHeightSize, new GUIContent("高度图世界尺寸"));
             EditorGUILayout.EndVertical();
 
             if (serializedObject.ApplyModifiedProperties())

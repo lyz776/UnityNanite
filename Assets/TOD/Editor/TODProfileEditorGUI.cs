@@ -64,6 +64,10 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("风格化", "sky.mieOpticalDepth", "米氏光学厚度", 0f, 8f),
             new TODParameterDescriptor("风格化", "sky.mieHorizonBoost", "地平线气溶胶增强", 0f, 8f),
             new TODParameterDescriptor("风格化", "sky.mieMoonAmount", "月光米氏散射", 0f, 2f),
+            new TODParameterDescriptor("风格化", "sky.sunWashColor", "太阳宽域染色色", true),
+            new TODParameterDescriptor("风格化", "sky.sunWashIntensity", "太阳宽域染色强度", 0f, 4f),
+            new TODParameterDescriptor("风格化", "sky.sunWashPower", "太阳宽域聚焦", 0.1f, 16f),
+            new TODParameterDescriptor("风格化", "sky.sunWashHorizonWeight", "染色地平线权重", 0f, 1f),
 
             new TODParameterDescriptor("星空", "stars.color", "星星颜色", true),
             new TODParameterDescriptor("星空", "stars.intensity", "星空强度", 0f, 8f),
@@ -76,39 +80,65 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("星空", "stars.horizonFade", "地平线淡出", 0.001f, 0.5f),
             new TODParameterDescriptor("星空", "stars.rotation", "星空旋转"),
 
-            new TODParameterDescriptor("云层 / 外观", "clouds.color", "云受光颜色", true),
-            new TODParameterDescriptor("云层 / 外观", "clouds.shadowColor", "云背光颜色", true),
-            new TODParameterDescriptor("云层 / 外观", "clouds.opacity", "不透明度", 0f, 1f),
-            new TODParameterDescriptor("云层 / 外观", "clouds.coverage", "覆盖率", 0f, 1f),
-            new TODParameterDescriptor("云层 / 外观", "clouds.scale", "基础云尺度", 0.05f, 20f),
-            new TODParameterDescriptor("云层 / 外观", "clouds.detailScale", "细节噪声尺度", 0.5f, 12f),
-            new TODParameterDescriptor("云层 / 外观", "clouds.softness", "边缘柔和", 0.001f, 0.5f),
-            new TODParameterDescriptor("云层 / 外观", "clouds.erosion", "细节侵蚀", 0f, 1f),
-            new TODParameterDescriptor("云层 / 外观", "clouds.distortion", "云形扭曲", 0f, 4f),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.color", "整体亮部基色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.shadowColor", "整体暗部基色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.frontLitColor", "Front Lit 正面亮色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.frontDarkColor", "Front Dark 正面暗色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.backLitColor", "Back Lit 背光亮色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.backDarkColor", "Back Dark 背光暗色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.directionalColorAmount", "四向染色权重", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimColor", "Rim 边缘光颜色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimIntensity", "Rim 强度", 0f, 8f),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimPower", "Rim 朝向聚焦", 0.1f, 16f),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimWidth", "Rim 宽度", 0.001f, 0.35f),
 
-            new TODParameterDescriptor("云层 / 分布", "clouds.altitude", "高空云高度（km）", 0.1f, 50f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.thickness", "光学厚度", 0.01f, 12f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.densityMultiplier", "密度倍率", 0f, 8f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.horizonDensity", "地平线密度", 0f, 4f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.zenithDensity", "天顶密度", 0f, 4f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.latitudePosition", "纬度渐变位置", 0f, 1f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.latitudeWidth", "纬度渐变宽度", 0.001f, 1f),
-            new TODParameterDescriptor("云层 / 分布", "clouds.speedX", "水平速度 X"),
-            new TODParameterDescriptor("云层 / 分布", "clouds.speedY", "水平速度 Y"),
-            new TODParameterDescriptor("云层 / 分布", "clouds.horizonFade", "地平线淡出", 0.001f, 0.5f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.opacity", "不透明度", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.coverage", "覆盖率", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.scale", "基础云尺度", 0.05f, 20f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.detailScale", "细节噪声尺度", 0.5f, 12f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.softness", "边缘柔和", 0.001f, 0.5f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.erosion", "细节侵蚀", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 形态", "clouds.distortion", "云形扭曲", 0f, 4f),
 
-            new TODParameterDescriptor("云层 / 光学", "clouds.scatteringCoefficient", "散射系数 RGB", true),
-            new TODParameterDescriptor("云层 / 光学", "clouds.absorptionCoefficient", "吸收系数 RGB", true),
-            new TODParameterDescriptor("云层 / 光学", "clouds.phaseForward", "前向相位 G", 0f, 0.95f),
-            new TODParameterDescriptor("云层 / 光学", "clouds.phaseBackward", "后向相位 G", -0.9f, 0f),
-            new TODParameterDescriptor("云层 / 光学", "clouds.phaseBlend", "双瓣相位混合", 0f, 1f),
-            new TODParameterDescriptor("云层 / 光学", "clouds.multipleScattering", "多重散射近似", 0f, 2f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.altitude", "高空云高度（km）", 0.1f, 50f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.thickness", "光学厚度", 0.01f, 12f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.densityMultiplier", "密度倍率", 0f, 8f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.horizonDensity", "地平线密度", 0f, 4f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.zenithDensity", "天顶密度", 0f, 4f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.latitudePosition", "纬度渐变位置", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.latitudeWidth", "纬度渐变宽度", 0.001f, 1f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.speedX", "水平速度 X"),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.speedY", "水平速度 Y"),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.horizonFade", "地平线淡出", 0.001f, 0.5f),
 
-            new TODParameterDescriptor("云层 / 光照", "clouds.sunLighting", "太阳光照", 0f, 8f),
-            new TODParameterDescriptor("云层 / 光照", "clouds.moonLighting", "月亮光照", 0f, 4f),
-            new TODParameterDescriptor("云层 / 光照", "clouds.ambientColor", "环境补光颜色", true),
-            new TODParameterDescriptor("云层 / 光照", "clouds.ambientIntensity", "环境补光强度", 0f, 4f),
-            new TODParameterDescriptor("云层 / 光照", "clouds.aerialPerspective", "空气透视", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.sunLighting", "太阳光照", 0f, 8f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.moonLighting", "月亮光照", 0f, 4f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.ambientColor", "环境补光颜色", true),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.ambientIntensity", "环境补光强度", 0f, 4f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.aerialPerspective", "空气透视", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.lightWrap", "包裹光", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.selfShadowStrength", "云体自遮挡强度", 0f, 8f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.selfShadowDistance", "自遮挡采样距离", 0f, 2f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.stylization", "分段光照权重", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.lightSteps", "明暗色阶数", 1f, 8f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.lightStepSoftness", "色阶过渡柔度", 0.001f, 0.49f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.sunTransmission", "太阳透光强度", 0f, 8f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.sunTransmissionPower", "透光方向聚焦", 0.1f, 16f),
+            new TODParameterDescriptor("高空云 / 光照", "clouds.undersideStrength", "云底暗面强度", 0f, 1f),
+
+            new TODParameterDescriptor("高空云 / 光学", "clouds.scatteringCoefficient", "散射系数 RGB", true),
+            new TODParameterDescriptor("高空云 / 光学", "clouds.absorptionCoefficient", "吸收系数 RGB", true),
+            new TODParameterDescriptor("高空云 / 光学", "clouds.phaseForward", "前向相位 G", 0f, 0.95f),
+            new TODParameterDescriptor("高空云 / 光学", "clouds.phaseBackward", "后向相位 G", -0.9f, 0f),
+            new TODParameterDescriptor("高空云 / 光学", "clouds.phaseBlend", "双瓣相位混合", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 光学", "clouds.multipleScattering", "多重散射近似", 0f, 2f),
+
+            new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.color", "阴影染色", true),
+            new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.scale", "世界空间尺度", 0.00001f, 0.02f),
+            new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.sunnyStrength", "晴天阴影强度", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.overcastStrength", "阴天阴影强度", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.softness", "阴影柔和", 0.001f, 0.5f),
+            new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.maxDistance", "最大作用距离", 1f, 10000f),
 
             new TODParameterDescriptor("太阳", "sun.color", "太阳颜色", true),
             new TODParameterDescriptor("太阳", "sun.intensity", "太阳强度", 0f, 8f),
@@ -137,17 +167,49 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("主方向光", "lighting.mainLightIntensity", "主光强度", 0f, 8f),
             new TODParameterDescriptor("主方向光", "lighting.shadowStrength", "阴影强度", 0f, 1f),
 
-            new TODParameterDescriptor("线性雾", "fog.color", "雾颜色", true),
-            new TODParameterDescriptor("线性雾", "fog.startDistance", "起始距离", 0f, 10000f),
-            new TODParameterDescriptor("线性雾", "fog.endDistance", "结束距离", 0f, 10000f),
-            new TODParameterDescriptor("线性雾", "fog.density", "浓度", 0f, 4f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.sunIntensity", "太阳 Flare 强度", 0f, 8f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.sunScale", "太阳 Flare 尺寸", 0f, 4f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.moonIntensity", "月亮 Flare 强度", 0f, 4f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.moonScale", "月亮 Flare 尺寸", 0f, 4f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.occlusionRadius", "遮挡采样半径", 0f, 2f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.occlusionSamples", "遮挡采样数", 1f, 64f),
+            new TODParameterDescriptor("Lens Flare", "lensFlare.maxAttenuationDistance", "最大衰减距离", 1f, 50000f),
 
-            new TODParameterDescriptor("高度雾", "fog.heightColor", "高度雾颜色", true),
-            new TODParameterDescriptor("高度雾", "fog.baseHeight", "基准高度"),
-            new TODParameterDescriptor("高度雾", "fog.heightRange", "高度范围", 0.01f, 2000f),
-            new TODParameterDescriptor("高度雾", "fog.heightDensity", "高度雾浓度", 0f, 8f),
-            new TODParameterDescriptor("高度雾", "fog.heightStartDistance", "起始距离", 0f, 10000f),
-            new TODParameterDescriptor("高度雾", "fog.heightEndDistance", "结束距离", 0f, 10000f)
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.topColor", "顶部颜色", true),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.topIntensity", "顶部颜色强度", 0f, 8f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.bottomColor", "底部颜色", true),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.bottomIntensity", "底部颜色强度", 0f, 8f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.skyIntensity", "天空参与强度", 0f, 1f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.power", "雾曲线 Power", 0.1f, 8f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.exponentialBlend", "指数雾混合", 0f, 1f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.startDistance", "雾起始距离", 0f, 10000f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.endDistance", "雾结束距离", 0f, 10000f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.density", "雾浓度", 0f, 4f),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.baseHeight", "雾高度"),
+            new TODParameterDescriptor("雾 / 常规距离雾", "fog.heightRange", "高度范围", 0.01f, 2000f),
+
+            new TODParameterDescriptor("雾 / 屏幕空间散射", "fog.screenSpace.intensity", "柔化强度", 0f, 1f),
+            new TODParameterDescriptor("雾 / 屏幕空间散射", "fog.screenSpace.radius", "采样半径（像素）", 0f, 8f),
+            new TODParameterDescriptor("雾 / 屏幕空间散射", "fog.screenSpace.startDistance", "柔化起始距离", 0f, 10000f),
+            new TODParameterDescriptor("雾 / 屏幕空间散射", "fog.screenSpace.endDistance", "柔化结束距离", 0f, 10000f),
+            new TODParameterDescriptor("雾 / 屏幕空间散射", "fog.screenSpace.depthThreshold", "深度边缘阈值", 0.0001f, 0.2f),
+            new TODParameterDescriptor("雾 / 屏幕空间散射", "fog.screenSpace.skyContribution", "天空柔化参与", 0f, 1f),
+
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.albedo", "介质反照率", true),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.density", "消光密度", 0f, 1f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.fogHeight", "离地高度", -100f, 500f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.heightRange", "雾层厚度", 0.1f, 500f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.maxDistance", "最大追踪距离", 1f, 5000f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.terrainConformity", "贴地形程度", 0f, 1f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.noise2DScale", "2D 天气噪声尺度", 0.00001f, 1f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.noise3DScale", "3D 形态噪声尺度", 0.00001f, 1f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.erosion", "噪声侵蚀", 0f, 1f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.windX", "流动速度 X"),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.windZ", "流动速度 Z"),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.anisotropy", "相位函数 G", -0.9f, 0.9f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.shadowStrength", "体积阴影强度", 0f, 1f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.shaftIntensity", "丁达尔光强度", 0f, 8f),
+            new TODParameterDescriptor("雾 / 贴地体积雾（预研）", "fog.groundVolume.stepCount", "视线步进数", 8f, 128f)
         };
 
         private static readonly Dictionary<string, bool> Foldouts = new Dictionary<string, bool>();
@@ -156,6 +218,7 @@ namespace UnityNanite.TOD.Editor
         private static float draggedLabelStartMouse;
         private static bool draggedLabelMoved;
         private static GUIStyle sectionStyle;
+        private static GUIStyle subsectionStyle;
 
         public static void DrawProfile(
             SerializedObject profileObject,
@@ -164,9 +227,41 @@ namespace UnityNanite.TOD.Editor
         {
             profileObject.Update();
             string activeSection = null;
+            bool highCloudDrawn = false;
+            bool fogDrawn = false;
 
             foreach (TODParameterDescriptor descriptor in Parameters)
             {
+                if (descriptor.Section.StartsWith("高空云 / ", StringComparison.Ordinal))
+                {
+                    if (!highCloudDrawn)
+                    {
+                        if (activeSection != null)
+                        {
+                            EditorGUILayout.EndVertical();
+                            activeSection = null;
+                        }
+                        DrawNestedGroup(profileObject, onSelect, compact, "高空云");
+                        highCloudDrawn = true;
+                    }
+                    continue;
+                }
+
+                if (descriptor.Section.StartsWith("雾 / ", StringComparison.Ordinal))
+                {
+                    if (!fogDrawn)
+                    {
+                        if (activeSection != null)
+                        {
+                            EditorGUILayout.EndVertical();
+                            activeSection = null;
+                        }
+                        DrawNestedGroup(profileObject, onSelect, compact, "雾");
+                        fogDrawn = true;
+                    }
+                    continue;
+                }
+
                 if (activeSection != descriptor.Section)
                 {
                     if (activeSection != null)
@@ -181,6 +276,8 @@ namespace UnityNanite.TOD.Editor
                     Foldouts[activeSection] = EditorGUI.Foldout(
                         header, Foldouts[activeSection], activeSection, true, GetSectionStyle());
                     DrawSectionEnable(profileObject, activeSection, header);
+                    if (Foldouts[activeSection])
+                        DrawSectionOptions(profileObject, activeSection);
                 }
 
                 if (!Foldouts[activeSection])
@@ -215,6 +312,73 @@ namespace UnityNanite.TOD.Editor
                 TODController.RefreshAll((TODProfile)profileObject.targetObject);
                 SceneView.RepaintAll();
             }
+        }
+
+        private static void DrawNestedGroup(
+            SerializedObject profileObject,
+            Action<TODParameterDescriptor> onSelect,
+            bool compact,
+            string group)
+        {
+            if (!Foldouts.ContainsKey(group))
+                Foldouts[group] = true;
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            Rect header = EditorGUILayout.GetControlRect(false, 30f);
+            EditorGUI.DrawRect(
+                new Rect(header.x - 3f, header.y - 2f, header.width + 6f, header.height + 2f),
+                new Color(0.09f, 0.16f, 0.22f, 0.92f));
+            Foldouts[group] = EditorGUI.Foldout(
+                header, Foldouts[group], group, true, GetSectionStyle());
+            DrawSectionEnable(profileObject, group, header);
+
+            if (Foldouts[group])
+            {
+                string activeSubsection = null;
+                foreach (TODParameterDescriptor descriptor in Parameters)
+                {
+                    if (!descriptor.Section.StartsWith(group + " / ", StringComparison.Ordinal))
+                        continue;
+
+                    if (activeSubsection != descriptor.Section)
+                    {
+                        if (activeSubsection != null)
+                            EditorGUILayout.EndVertical();
+                        activeSubsection = descriptor.Section;
+                        if (!Foldouts.ContainsKey(activeSubsection))
+                            Foldouts[activeSubsection] = true;
+
+                        EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+                        Rect subHeader = EditorGUILayout.GetControlRect(false, 24f);
+                        string title = activeSubsection.Substring((group + " / ").Length);
+                        Foldouts[activeSubsection] = EditorGUI.Foldout(
+                            subHeader,
+                            Foldouts[activeSubsection],
+                            title,
+                            true,
+                            GetSubsectionStyle());
+                        DrawSectionEnable(profileObject, activeSubsection, subHeader);
+                        if (Foldouts[activeSubsection])
+                            DrawSectionOptions(profileObject, activeSubsection);
+                    }
+
+                    if (!Foldouts[activeSubsection])
+                        continue;
+
+                    SerializedProperty parameter = profileObject.FindProperty(descriptor.Path);
+                    if (parameter == null)
+                        continue;
+                    if (descriptor.IsColor)
+                        DrawColorParameter(parameter, descriptor, onSelect, compact);
+                    else
+                        DrawFloatParameter(parameter, descriptor, onSelect, compact);
+                }
+
+                if (activeSubsection != null)
+                    EditorGUILayout.EndVertical();
+            }
+
+            EditorGUILayout.EndVertical();
         }
 
         private static void DrawFloatParameter(
@@ -330,17 +494,49 @@ namespace UnityNanite.TOD.Editor
             return sectionStyle;
         }
 
+        private static GUIStyle GetSubsectionStyle()
+        {
+            if (subsectionStyle != null)
+                return subsectionStyle;
+            subsectionStyle = new GUIStyle(EditorStyles.foldoutHeader)
+            {
+                fontSize = 12,
+                fontStyle = FontStyle.Bold,
+                fixedHeight = 0f
+            };
+            return subsectionStyle;
+        }
+
         private static void DrawSectionEnable(SerializedObject profileObject, string section, Rect header)
         {
             string path = section == "星空" ? "stars.enabled" :
-                section == "云层 / 外观" ? "clouds.enabled" :
-                section == "线性雾" ? "fog.enabled" :
-                section == "高度雾" ? "fog.heightFogEnabled" : null;
+                section == "高空云" ? "clouds.enabled" :
+                section == "高空云 / 云阴影" ? "clouds.shadows.enabled" :
+                section == "Lens Flare" ? "lensFlare.enabled" :
+                section == "雾" ? "fog.enabled" :
+                section == "雾 / 屏幕空间散射" ? "fog.screenSpace.enabled" :
+                section == "雾 / 贴地体积雾（预研）" ? "fog.groundVolume.enabled" : null;
             if (path == null)
                 return;
             SerializedProperty enabled = profileObject.FindProperty(path);
             Rect toggleRect = new Rect(header.xMax - 48f, header.y + 3f, 46f, header.height - 6f);
             enabled.boolValue = GUI.Toggle(toggleRect, enabled.boolValue, "启用", EditorStyles.miniButton);
+        }
+
+        private static void DrawSectionOptions(SerializedObject profileObject, string section)
+        {
+            if (section != "Lens Flare")
+                return;
+
+            EditorGUILayout.PropertyField(
+                profileObject.FindProperty("lensFlare.useOcclusion"),
+                new GUIContent("深度遮挡"));
+            EditorGUILayout.PropertyField(
+                profileObject.FindProperty("lensFlare.environmentOcclusion"),
+                new GUIContent("环境效果遮挡"));
+            EditorGUILayout.PropertyField(
+                profileObject.FindProperty("lensFlare.allowOffScreen"),
+                new GUIContent("允许屏幕外产生光斑"));
         }
 
         public static TODParameterDescriptor? FindDescriptor(string path)

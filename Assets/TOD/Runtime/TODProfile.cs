@@ -107,6 +107,16 @@ namespace UnityNanite.TOD
         public TODFloatParameter mieOpticalDepth = new TODFloatParameter(0.85f);
         public TODFloatParameter mieHorizonBoost = new TODFloatParameter(1.35f);
         public TODFloatParameter mieMoonAmount = new TODFloatParameter(0.18f);
+        public TODColorParameter sunWashColor = new TODColorParameter(
+            new Color(0.92f, 0.72f, 0.52f),
+            true,
+            TODProfile.DayGradient(
+                new Color(0.08f, 0.11f, 0.2f),
+                new Color(1.1f, 0.34f, 0.12f),
+                new Color(0.72f, 0.82f, 1f)));
+        public TODFloatParameter sunWashIntensity = new TODFloatParameter(0.28f);
+        public TODFloatParameter sunWashPower = new TODFloatParameter(2.4f);
+        public TODFloatParameter sunWashHorizonWeight = new TODFloatParameter(0.65f);
     }
 
     [Serializable]
@@ -131,6 +141,19 @@ namespace UnityNanite.TOD
     }
 
     [Serializable]
+    public sealed class TODCloudShadowSettings
+    {
+        public bool enabled = true;
+        public TODColorParameter color =
+            new TODColorParameter(new Color(0.52f, 0.60f, 0.72f));
+        public TODFloatParameter scale = new TODFloatParameter(0.0015f);
+        public TODFloatParameter sunnyStrength = new TODFloatParameter(0.22f);
+        public TODFloatParameter overcastStrength = new TODFloatParameter(0.48f);
+        public TODFloatParameter softness = new TODFloatParameter(0.12f);
+        public TODFloatParameter maxDistance = new TODFloatParameter(1800f);
+    }
+
+    [Serializable]
     public sealed class TODCloudSettings
     {
         public bool enabled = true;
@@ -142,17 +165,31 @@ namespace UnityNanite.TOD
                 new Color(0.72f, 0.33f, 0.25f),
                 new Color(0.92f, 0.96f, 1f)));
         public TODColorParameter shadowColor = new TODColorParameter(new Color(0.28f, 0.34f, 0.44f));
-        public TODFloatParameter opacity = new TODFloatParameter(0.42f);
-        public TODFloatParameter coverage = new TODFloatParameter(0.6f);
-        public TODFloatParameter scale = new TODFloatParameter(3.2f);
-        public TODFloatParameter detailScale = new TODFloatParameter(2.85f);
-        public TODFloatParameter softness = new TODFloatParameter(0.14f);
-        public TODFloatParameter erosion = new TODFloatParameter(0.32f);
-        public TODFloatParameter distortion = new TODFloatParameter(1.35f);
+        public TODColorParameter frontLitColor =
+            new TODColorParameter(new Color(1.02f, 1.04f, 1.08f));
+        public TODColorParameter frontDarkColor =
+            new TODColorParameter(new Color(0.38f, 0.45f, 0.58f));
+        public TODColorParameter backLitColor =
+            new TODColorParameter(new Color(1.18f, 0.82f, 0.52f));
+        public TODColorParameter backDarkColor =
+            new TODColorParameter(new Color(0.24f, 0.29f, 0.40f));
+        public TODFloatParameter directionalColorAmount = new TODFloatParameter(0.82f);
+        public TODColorParameter rimColor =
+            new TODColorParameter(new Color(1.2f, 0.82f, 0.5f));
+        public TODFloatParameter rimIntensity = new TODFloatParameter(0.62f);
+        public TODFloatParameter rimPower = new TODFloatParameter(3.5f);
+        public TODFloatParameter rimWidth = new TODFloatParameter(0.08f);
+        public TODFloatParameter opacity = new TODFloatParameter(0.68f);
+        public TODFloatParameter coverage = new TODFloatParameter(0.58f);
+        public TODFloatParameter scale = new TODFloatParameter(6.2f);
+        public TODFloatParameter detailScale = new TODFloatParameter(3.4f);
+        public TODFloatParameter softness = new TODFloatParameter(0.1f);
+        public TODFloatParameter erosion = new TODFloatParameter(0.44f);
+        public TODFloatParameter distortion = new TODFloatParameter(1.2f);
         public TODFloatParameter speedX = new TODFloatParameter(0.006f);
         public TODFloatParameter speedY = new TODFloatParameter(0.002f);
         public TODFloatParameter altitude = new TODFloatParameter(6f);
-        public TODFloatParameter thickness = new TODFloatParameter(0.9f);
+        public TODFloatParameter thickness = new TODFloatParameter(1.25f);
         public TODFloatParameter densityMultiplier = new TODFloatParameter(1f);
         public TODFloatParameter horizonDensity = new TODFloatParameter(0.55f);
         public TODFloatParameter zenithDensity = new TODFloatParameter(1f);
@@ -167,9 +204,19 @@ namespace UnityNanite.TOD
         public TODFloatParameter sunLighting = new TODFloatParameter(0.85f);
         public TODFloatParameter moonLighting = new TODFloatParameter(0.22f);
         public TODColorParameter ambientColor = new TODColorParameter(new Color(0.32f, 0.42f, 0.58f));
-        public TODFloatParameter ambientIntensity = new TODFloatParameter(0.38f);
-        public TODFloatParameter multipleScattering = new TODFloatParameter(0.28f);
+        public TODFloatParameter ambientIntensity = new TODFloatParameter(0.3f);
+        public TODFloatParameter multipleScattering = new TODFloatParameter(0.34f);
         public TODFloatParameter aerialPerspective = new TODFloatParameter(0.55f);
+        public TODFloatParameter lightWrap = new TODFloatParameter(0.36f);
+        public TODFloatParameter selfShadowStrength = new TODFloatParameter(1.8f);
+        public TODFloatParameter selfShadowDistance = new TODFloatParameter(0.4f);
+        public TODFloatParameter stylization = new TODFloatParameter(0.62f);
+        public TODFloatParameter lightSteps = new TODFloatParameter(4f);
+        public TODFloatParameter lightStepSoftness = new TODFloatParameter(0.27f);
+        public TODFloatParameter sunTransmission = new TODFloatParameter(0.75f);
+        public TODFloatParameter sunTransmissionPower = new TODFloatParameter(3.2f);
+        public TODFloatParameter undersideStrength = new TODFloatParameter(0.56f);
+        public TODCloudShadowSettings shadows = new TODCloudShadowSettings();
     }
 
     [Serializable]
@@ -256,9 +303,72 @@ namespace UnityNanite.TOD
     }
 
     [Serializable]
+    public sealed class TODLensFlareSettings
+    {
+        public bool enabled = true;
+        public TODFloatParameter sunIntensity = new TODFloatParameter(
+            0.35f,
+            true,
+            new AnimationCurve(
+                new Keyframe(0f, 0f), new Keyframe(5.5f, 0f), new Keyframe(7f, 0.16f),
+                new Keyframe(12f, 0.35f), new Keyframe(17f, 0.18f), new Keyframe(18.5f, 0f),
+                new Keyframe(24f, 0f)));
+        public TODFloatParameter sunScale = new TODFloatParameter(0.7f);
+        public TODFloatParameter moonIntensity = new TODFloatParameter(
+            0.12f,
+            true,
+            new AnimationCurve(
+                new Keyframe(0f, 0.12f), new Keyframe(5f, 0.1f), new Keyframe(7f, 0f),
+                new Keyframe(17.5f, 0f), new Keyframe(19f, 0.1f), new Keyframe(24f, 0.12f)));
+        public TODFloatParameter moonScale = new TODFloatParameter(0.28f);
+        public bool useOcclusion = true;
+        public bool environmentOcclusion;
+        public bool allowOffScreen;
+        public TODFloatParameter occlusionRadius = new TODFloatParameter(0.18f);
+        public TODFloatParameter occlusionSamples = new TODFloatParameter(24f);
+        public TODFloatParameter maxAttenuationDistance = new TODFloatParameter(10000f);
+    }
+
+    [Serializable]
+    public sealed class TODScreenSpaceFogSettings
+    {
+        public bool enabled = false;
+        public TODFloatParameter intensity = new TODFloatParameter(0.28f);
+        public TODFloatParameter radius = new TODFloatParameter(1.75f);
+        public TODFloatParameter startDistance = new TODFloatParameter(120f);
+        public TODFloatParameter endDistance = new TODFloatParameter(900f);
+        public TODFloatParameter depthThreshold = new TODFloatParameter(0.025f);
+        public TODFloatParameter skyContribution = new TODFloatParameter(0.08f);
+    }
+
+    [Serializable]
+    public sealed class TODGroundVolumeFogSettings
+    {
+        // 第一阶段仅建立稳定的数据、全局参数与地形高度入口。
+        // 实际 froxel / raymarch 渲染将在专用 Renderer Feature 中实现。
+        public bool enabled = false;
+        public TODColorParameter albedo = new TODColorParameter(new Color(0.82f, 0.88f, 0.9f));
+        public TODFloatParameter density = new TODFloatParameter(0.035f);
+        public TODFloatParameter fogHeight = new TODFloatParameter(2.5f);
+        public TODFloatParameter heightRange = new TODFloatParameter(8f);
+        public TODFloatParameter maxDistance = new TODFloatParameter(280f);
+        public TODFloatParameter terrainConformity = new TODFloatParameter(1f);
+        public TODFloatParameter noise2DScale = new TODFloatParameter(0.018f);
+        public TODFloatParameter noise3DScale = new TODFloatParameter(0.045f);
+        public TODFloatParameter erosion = new TODFloatParameter(0.42f);
+        public TODFloatParameter windX = new TODFloatParameter(0.8f);
+        public TODFloatParameter windZ = new TODFloatParameter(0.25f);
+        public TODFloatParameter anisotropy = new TODFloatParameter(0.45f);
+        public TODFloatParameter shadowStrength = new TODFloatParameter(0.75f);
+        public TODFloatParameter shaftIntensity = new TODFloatParameter(0.65f);
+        public TODFloatParameter stepCount = new TODFloatParameter(48f);
+    }
+
+    [Serializable]
     public sealed class TODFogSettings
     {
         public bool enabled = true;
+        // color 与旧高度雾字段暂时保留，以保证早期 Profile 能无损反序列化。
         public TODColorParameter color = new TODColorParameter(
             new Color(0.5f, 0.62f, 0.72f),
             true,
@@ -266,6 +376,25 @@ namespace UnityNanite.TOD
                 new Color(0.008f, 0.012f, 0.025f),
                 new Color(0.65f, 0.16f, 0.08f),
                 new Color(0.5f, 0.62f, 0.72f)));
+        public TODColorParameter topColor = new TODColorParameter(
+            new Color(0.58f, 0.69f, 0.78f),
+            true,
+            TODProfile.DayGradient(
+                new Color(0.012f, 0.018f, 0.04f),
+                new Color(0.72f, 0.24f, 0.13f),
+                new Color(0.58f, 0.69f, 0.78f)));
+        public TODColorParameter bottomColor = new TODColorParameter(
+            new Color(0.42f, 0.52f, 0.58f),
+            true,
+            TODProfile.DayGradient(
+                new Color(0.008f, 0.012f, 0.025f),
+                new Color(0.58f, 0.18f, 0.1f),
+                new Color(0.42f, 0.52f, 0.58f)));
+        public TODFloatParameter topIntensity = new TODFloatParameter(0.8f);
+        public TODFloatParameter bottomIntensity = new TODFloatParameter(1f);
+        public TODFloatParameter skyIntensity = new TODFloatParameter(0.18f);
+        public TODFloatParameter power = new TODFloatParameter(1f);
+        public TODFloatParameter exponentialBlend = new TODFloatParameter(0f);
         public TODFloatParameter startDistance = new TODFloatParameter(20f);
         public TODFloatParameter endDistance = new TODFloatParameter(600f);
         public TODFloatParameter density = new TODFloatParameter(1f);
@@ -277,6 +406,8 @@ namespace UnityNanite.TOD
         public TODFloatParameter heightDensity = new TODFloatParameter(0.7f);
         public TODFloatParameter heightStartDistance = new TODFloatParameter(0f);
         public TODFloatParameter heightEndDistance = new TODFloatParameter(500f);
+        public TODScreenSpaceFogSettings screenSpace = new TODScreenSpaceFogSettings();
+        public TODGroundVolumeFogSettings groundVolume = new TODGroundVolumeFogSettings();
     }
 
     [CreateAssetMenu(fileName = "TOD Profile", menuName = "Unity Nanite/TOD/Profile")]
@@ -289,6 +420,7 @@ namespace UnityNanite.TOD
         public TODSunSettings sun = new TODSunSettings();
         public TODMoonSettings moon = new TODMoonSettings();
         public TODLightingSettings lighting = new TODLightingSettings();
+        public TODLensFlareSettings lensFlare = new TODLensFlareSettings();
         public TODFogSettings fog = new TODFogSettings();
 
         [Header("Procedural Celestial Orbit (not keyframed)")]
@@ -298,6 +430,16 @@ namespace UnityNanite.TOD
         [Range(-45f, 45f)] public float moonOrbitOffset = 5f;
         [Min(1f)] public float gizmoRadius = 25f;
         [Range(0f, 0.25f)] public float twilightWidth = 0.06f;
+
+        private void OnEnable()
+        {
+            clouds ??= new TODCloudSettings();
+            clouds.shadows ??= new TODCloudShadowSettings();
+            lensFlare ??= new TODLensFlareSettings();
+            fog ??= new TODFogSettings();
+            fog.screenSpace ??= new TODScreenSpaceFogSettings();
+            fog.groundVolume ??= new TODGroundVolumeFogSettings();
+        }
 
         public static float WrapHour(float hour)
         {

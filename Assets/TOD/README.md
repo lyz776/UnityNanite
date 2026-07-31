@@ -53,19 +53,41 @@ TOD Rig 会自动把默认动态天空材质设为当前场景的 Skybox；也�
 - 美术色调、饱和度、对比度和曝光；
 - 程序化星空、密度、随机大小和亮度、闪烁、旋转与地平线淡出；
 - 程序化 2D 高空云，支持云高、光学厚度、纬度分布、双层噪声侵蚀、RGB
-  散射/吸收系数、太阳/月亮双光源、双瓣相位函数、环境补光与空气透视。
+  散射/吸收系数、太阳/月亮双光源、双瓣相位函数、环境补光与空气透视；
+- 高空云在 Inspector 和 TOD 窗口中作为一级目录，内部按颜色、形态、分布、光照、
+  光学和云阴影划分二级目录；
+- 云颜色支持 Front Lit、Front Dark、Back Lit、Back Dark 四向染色与可调 Rim，
+  这些美术颜色作用在物理散射亮度之后，不替代透射率与能量积分；
+- 风格化云光照支持宽包裹光、低频云体自遮挡、可柔化的明暗色阶、冷色云底以及
+  朝太阳方向的暖色透光；天空另有宽范围太阳染色区，使日出和逆光云不只依赖小光晕；
+- 云阴影通过独立 URP Renderer Feature 投射到场景不透明物体，支持阴影染色、
+  世界空间尺度、晴天/阴天强度、柔和度和最大作用距离。
 
-这些项主要吸收了 AC 天空中“方向性太阳散射、程序化星空、噪声云、地平线淡出和
-颜色校正”的表现思路，但 TOD 的 Profile、编辑器和 Shader 均为本模块独立实现。
+这些项主要吸收了公开大气/云渲染资料以及美术参考中“方向性太阳散射、程序化星空、
+噪声云、地平线淡出和颜色校正”的表现思路，但 TOD 的 Profile、编辑器和 Shader
+均为本模块独立实现。
 
 ## 雾与全局参数
+
+Profile 中的“雾”现在是一级目录，内部包含：
+
+- “常规距离雾”：上下分色、天空参与量、Power、线性 / 指数混合、距离与高度衰减；
+- “屏幕空间散射”：按距离淡入的深度感知柔化，默认关闭；
+- “贴地体积雾（预研）”：完整 Profile 参数与地形高度图入口，当前尚未执行体积积分。
+
+Lens Flare 使用太阳和月亮挂点上的 Unity URP `LensFlareComponentSRP`。Profile 可按时间
+控制两者强度、尺寸和遮挡采样；光斑、鬼影与彩虹环的具体形状由挂点上的
+`LensFlareDataSRP` 资产决定。
+
+完整设计、性能分级和贴地雾实现顺序见
+`Assets/TOD/Docs/FOG_AND_LENS_FLARE_PLAN.md`。
 
 控制器每次应用 Profile 时会写入：
 
 - `_TODTime`、`_TODTime01`、`_TODDayOrNight`
 - `_TODMainLightDir`、`_TODSunDir`、`_TODMoonDir`
 - `_TODLightBottom`、`_TODLightMiddle`、`_TODLightTop`、`_TODHorizonColor`
-- 太阳、月亮、主方向光、星空、云层、线性雾和高度雾的 `_TOD*` 参数
+- 太阳、月亮、主方向光、星空、云层、Lens Flare 与三类雾的 `_TOD*` 参数
 
 `_TODMainLightDir` 指向当前主天体光源，`_TODDayOrNight` 为由太阳高度平滑计算的
 0（夜）到 1（日）。
@@ -74,11 +96,17 @@ TOD Rig 会自动把默认动态天空材质设为当前场景的 Skybox；也�
 雾化；需要逐像素正确雾化的透明材质，应自行采样同一组 `_TODFog*` 全局参数，以免
 透明层被重复雾化。
 
+云阴影 Pass 插入在 `AfterRenderingOpaques`，使用相机深度重建世界坐标，再沿太阳方向
+投影到高空云层采样程序化云形。安装器会同时确保
+`TODCloudShadowRendererFeature` 和 `TODFogRendererFeature` 存在于项目的 URP
+Renderer Data。
+
 ## 当前边界
 
-高度雾是基于深度重建的轻量解析效果，不是 Froxel 体积散射系统。它支持基础高度、
-高度范围、密度以及起止距离。当前云仍是适合风格化远景的单层 2D 高空云，不是
-体积云 Ray March；它有参与介质光学近似，但不包含云体自阴影、天气图或局部云体。
+贴地体积雾当前只有数据接口，不是已经完成的 Froxel 体积散射系统；启用其 Profile
+开关不会伪装出一个错误的平面雾效果。当前云仍是适合风格化远景的单层 2D 高空云，不是
+体积云 Ray March；它包含沿主光方向的低频自遮挡近似，但不包含完整体积阴影、天气图
+或局部云体。
 
 目前 TOD 不再主动覆盖 Unity 的 Ambient Sky / Equator / Ground 设置，环境光请暂时
 继续在 Lighting Settings 或项目自身的光照系统中维护。Profile 内原有环境光数据保留，

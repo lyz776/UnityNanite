@@ -49,6 +49,10 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float _TODMieOpticalDepth;
             float _TODMieHorizonBoost;
             float _TODMieMoonAmount;
+            float3 _TODSunWashColor;
+            float _TODSunWashIntensity;
+            float _TODSunWashPower;
+            float _TODSunWashHorizonWeight;
 
             float _TODStarsEnabled;
             float3 _TODStarsColor;
@@ -65,6 +69,15 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float _TODCloudsEnabled;
             float3 _TODCloudColor;
             float3 _TODCloudShadowColor;
+            float3 _TODCloudFrontLitColor;
+            float3 _TODCloudFrontDarkColor;
+            float3 _TODCloudBackLitColor;
+            float3 _TODCloudBackDarkColor;
+            float _TODCloudDirectionalColorAmount;
+            float3 _TODCloudRimColor;
+            float _TODCloudRimIntensity;
+            float _TODCloudRimPower;
+            float _TODCloudRimWidth;
             float _TODCloudOpacity;
             float _TODCloudCoverage;
             float _TODCloudScale;
@@ -92,6 +105,15 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float _TODCloudAmbientIntensity;
             float _TODCloudMultipleScattering;
             float _TODCloudAerialPerspective;
+            float _TODCloudLightWrap;
+            float _TODCloudSelfShadowStrength;
+            float _TODCloudSelfShadowDistance;
+            float _TODCloudStylization;
+            float _TODCloudLightSteps;
+            float _TODCloudLightStepSoftness;
+            float _TODCloudSunTransmission;
+            float _TODCloudSunTransmissionPower;
+            float _TODCloudUndersideStrength;
 
             float3 _TODSunDir;
             float3 _TODSunColor;
@@ -217,6 +239,21 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 return result;
             }
 
+            float StylizedLightSteps(float value)
+            {
+                float steps = clamp(floor(_TODCloudLightSteps + 0.5), 1.0, 8.0);
+                if (steps <= 1.0)
+                    return saturate(value);
+
+                float scaledValue = saturate(value) * steps;
+                float baseStep = floor(scaledValue);
+                float transition = smoothstep(
+                    0.5 - _TODCloudLightStepSoftness,
+                    0.5 + _TODCloudLightStepSoftness,
+                    frac(scaledValue));
+                return saturate((baseStep + transition) / steps);
+            }
+
             float3 RotateAroundY(float3 direction, float degrees)
             {
                 float angle = radians(degrees);
@@ -264,12 +301,15 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 return star * starCell * variedBrightness * twinkle * horizonFade;
             }
 
-            float3 ProceduralClouds(float3 viewDirection)
+            float4 ProceduralClouds(float3 viewDirection)
             {
                 // Intersect the view ray with a stylized high-altitude layer.
                 // Altitude changes parallax/feature scale instead of merely
                 // translating a screen-space noise pattern.
-                float rayHeight = max(0.035, viewDirection.y + 0.06);
+                // Avoid an extreme frequency jump at the horizon. The previous
+                // near-zero clamp stretched the planar projection into tiny
+                // noisy strips while the zenith stayed almost uniform.
+                float rayHeight = max(0.12, viewDirection.y + 0.08);
                 float layerDistance = _TODCloudAltitude / rayHeight;
                 float2 wind = _Time.y * _TODCloudSpeed;
                 float2 cloudUV =
@@ -288,6 +328,20 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 float cloud = smoothstep(threshold - edge, threshold + edge, density);
                 cloud *= lerp(0.72, 1.0, smoothstep(0.22, 0.82, fineShape));
 
+                // A low-frequency sample shifted toward the sun approximates
+                // cloud-body occlusion without turning this 2D layer into a
+                // full ray marcher. Low sun angles use a longer optical path.
+                float2 sunPlane = _TODSunDir.xz;
+                float sunPlaneLength = max(0.0001, length(sunPlane));
+                sunPlane /= sunPlaneLength;
+                float grazingShadow = lerp(
+                    0.38,
+                    1.65,
+                    1.0 - saturate(abs(_TODSunDir.y)));
+                float2 shadowUV = cloudUV + warp * (_TODCloudDistortion * 0.6) +
+                    sunPlane * _TODCloudSelfShadowDistance * grazingShadow;
+                float shadowProbe = Fbm(shadowUV);
+
                 float latitude = saturate(viewDirection.y);
                 float latitudeBlend = smoothstep(
                     _TODCloudLatitudePosition - _TODCloudLatitudeWidth,
@@ -299,10 +353,11 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                     latitudeBlend);
                 cloud *= distribution * _TODCloudDensityMultiplier;
                 cloud *= smoothstep(-0.015, _TODCloudHorizonFade, viewDirection.y);
-                return float3(
+                return float4(
                     saturate(cloud),
                     saturate(density),
-                    saturate(layerDistance / max(1.0, _TODCloudAltitude * 24.0)));
+                    saturate(fineShape),
+                    saturate(shadowProbe));
             }
 
             half4 Frag(Varyings input) : SV_Target
@@ -355,6 +410,21 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 sky += _TODSunScatterColor *
                     (mieSun * max(0.0, _TODSunIntensity) + mieMoon) *
                     smoothstep(-0.08, 0.06, height);
+
+                // A broad sun-facing wash supplies the painterly transition
+                // visible around large cloud banks. Unlike the narrow halo it
+                // covers a wide sky region and becomes more horizon-weighted
+                // around dawn and dusk.
+                float sunWashFacing = pow(
+                    saturate(sunDot * 0.5 + 0.5),
+                    _TODSunWashPower);
+                float sunWashHorizon = lerp(
+                    1.0,
+                    pow(1.0 - saturate(abs(height)), 1.6),
+                    _TODSunWashHorizonWeight);
+                float sunWashVisibility = smoothstep(-0.24, 0.08, sunDirection.y);
+                sky += _TODSunWashColor * sunWashFacing * sunWashHorizon *
+                    sunWashVisibility * _TODSunWashIntensity * 0.32;
                 float2 viewHorizontal = viewDirection.xz;
                 float2 sunHorizontal = _TODSunDir.xz;
                 viewHorizontal /= max(length(viewHorizontal), 0.0001);
@@ -439,7 +509,7 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
 
                 if (_TODCloudsEnabled > 0.5)
                 {
-                    float3 cloudData = ProceduralClouds(viewDirection);
+                    float4 cloudData = ProceduralClouds(viewDirection);
                     float cloudDensity = cloudData.x;
 
                     // Frostbite-inspired single-segment participating media:
@@ -453,6 +523,9 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                         max(0.16, viewDirection.y + 0.22);
                     float3 transmittance = exp(-sigmaE * grazingPath);
                     transmittance = lerp(1.0.xxx, transmittance, _TODCloudOpacity);
+                    float meanTransmittance = dot(
+                        transmittance,
+                        float3(0.333333, 0.333333, 0.333333));
 
                     float sunPhase = lerp(
                         HenyeyGreenstein(sunDot, _TODCloudPhaseBackward),
@@ -473,10 +546,26 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                     float3 directLuminance =
                         (source - source * transmittance) / sigmaE;
 
+                    float cloudThreshold = lerp(0.64, 0.30, _TODCloudCoverage);
+                    float shadowEdge = max(0.015, _TODCloudSoftness * 0.45);
+                    float shadowOccluder = smoothstep(
+                        cloudThreshold - shadowEdge,
+                        cloudThreshold + shadowEdge,
+                        cloudData.w);
+                    float bodyDepth = smoothstep(0.12, 0.92, cloudDensity);
+                    float selfShadow = exp(
+                        -shadowOccluder * _TODCloudSelfShadowStrength *
+                        lerp(0.35, 1.15, bodyDepth));
+                    float detailLight = smoothstep(0.16, 0.88, cloudData.z);
+                    float internalLightVariation = lerp(0.68, 1.14, detailLight);
+                    directLuminance *=
+                        lerp(1.0, selfShadow, 0.86) * internalLightVariation;
+
                     float3 singleScatteringAlbedo = sigmaS / sigmaE;
                     float3 lostLight = 1.0 - transmittance;
                     float3 ambientLuminance = _TODCloudAmbientColor *
-                        _TODCloudAmbientIntensity * lostLight * singleScatteringAlbedo;
+                        _TODCloudAmbientIntensity * lostLight * singleScatteringAlbedo *
+                        lerp(0.76, 1.08, detailLight);
                     float3 multipleLuminance = _TODCloudColor *
                         _TODCloudMultipleScattering * lostLight *
                         (0.18 + 0.32 * singleScatteringAlbedo);
@@ -488,13 +577,92 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                         _TODCloudShadowColor,
                         _TODCloudColor,
                         lightFacing);
+                    float frontLight = saturate(-sunDot * 0.5 + 0.5);
+                    float wrappedFrontLight = saturate(
+                        (frontLight + _TODCloudLightWrap) /
+                        (1.0 + _TODCloudLightWrap));
+                    float continuousLight = saturate(
+                        wrappedFrontLight * selfShadow *
+                        (0.35 + 0.65 * saturate(_TODSunIntensity)));
+                    float steppedLight = StylizedLightSteps(continuousLight);
+                    float artisticLight = lerp(
+                        continuousLight,
+                        steppedLight,
+                        _TODCloudStylization);
+                    float frontLitAmount = saturate(
+                        0.18 + artisticLight * 0.92 -
+                        cloudData.y * 0.28);
+                    float backLitAmount = saturate(
+                        pow(saturate(sunDot), 2.0) * _TODSunIntensity +
+                        lightFacing * 0.35);
+                    float3 frontTint = lerp(
+                        _TODCloudFrontDarkColor,
+                        _TODCloudFrontLitColor,
+                        frontLitAmount);
+                    float3 backTint = lerp(
+                        _TODCloudBackDarkColor,
+                        _TODCloudBackLitColor,
+                        backLitAmount);
+                    float backView = smoothstep(-0.18, 0.42, sunDot);
+                    float3 fourWayTint = lerp(frontTint, backTint, backView);
+                    artisticCloudTint = lerp(
+                        artisticCloudTint,
+                        fourWayTint,
+                        _TODCloudDirectionalColorAmount);
+                    float underside = bodyDepth *
+                        lerp(0.38, 1.0, 1.0 - saturate(viewDirection.y));
+                    artisticCloudTint *= lerp(
+                        1.0.xxx,
+                        max(float3(0.08, 0.08, 0.08), _TODCloudShadowColor),
+                        underside * _TODCloudUndersideStrength);
+                    // Apply the posterized light result to energy as well as
+                    // hue. Previously the four-way colors changed, but the
+                    // analytical scattering term stayed almost uniform, which
+                    // made large cloud banks read as a single flat cutout.
+                    float stylizedEnergy = lerp(
+                        1.0,
+                        lerp(0.38, 1.16, artisticLight),
+                        _TODCloudStylization);
+                    float bodySculpt = lerp(
+                        1.0,
+                        lerp(0.62, 1.08, detailLight) *
+                            lerp(1.0, 0.72, bodyDepth),
+                        _TODCloudStylization);
                     float3 cloudLuminance =
                         (directLuminance + ambientLuminance + multipleLuminance) *
-                        artisticCloudTint * _TODCloudOpacity;
+                        artisticCloudTint * stylizedEnergy * bodySculpt *
+                        _TODCloudOpacity;
 
-                    float meanTransmittance = dot(
-                        transmittance,
-                        float3(0.333333, 0.333333, 0.333333));
+                    float rimBand = 1.0 - smoothstep(
+                        _TODCloudRimWidth,
+                        _TODCloudRimWidth * 2.5,
+                        abs(cloudData.y - cloudThreshold));
+                    rimBand *= saturate(cloudDensity * 5.0);
+                    float rimFacing = pow(
+                        saturate(sunDot * 0.5 + 0.5),
+                        _TODCloudRimPower);
+                    float3 rimLuminance = _TODCloudRimColor *
+                        rimBand * rimFacing * _TODCloudRimIntensity *
+                        _TODSunIntensity * _TODCloudOpacity;
+                    cloudLuminance += rimLuminance;
+
+                    float transmissionWindow =
+                        pow(saturate(meanTransmittance), 0.42) *
+                        (1.0 - meanTransmittance) * 2.1;
+                    float transmissionFacing = pow(
+                        saturate(sunDot),
+                        _TODCloudSunTransmissionPower);
+                    float edgeTransmission = lerp(
+                        1.0,
+                        0.28,
+                        bodyDepth);
+                    float3 transmissionLuminance =
+                        _TODSunColor * _TODCloudBackLitColor *
+                        transmissionWindow * transmissionFacing *
+                        edgeTransmission * _TODCloudSunTransmission *
+                        _TODSunIntensity * _TODCloudOpacity;
+                    cloudLuminance += transmissionLuminance;
+
                     float cloudOpacity = saturate((1.0 - meanTransmittance) * 1.35);
 
                     // The sun, moon and stars are effectively at infinity and sit
