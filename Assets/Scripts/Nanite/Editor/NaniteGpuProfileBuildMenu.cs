@@ -80,7 +80,17 @@ namespace Nanite.Editor
                 return;
             }
 
-            BuildReport report = BuildPipeline.BuildPlayer(options);
+            bool previousFrameTimingStats = PlayerSettings.enableFrameTimingStats;
+            BuildReport report;
+            try
+            {
+                PlayerSettings.enableFrameTimingStats = true;
+                report = BuildPipeline.BuildPlayer(options);
+            }
+            finally
+            {
+                PlayerSettings.enableFrameTimingStats = previousFrameTimingStats;
+            }
             if (report.summary.result != BuildResult.Succeeded)
             {
                 Debug.LogError(

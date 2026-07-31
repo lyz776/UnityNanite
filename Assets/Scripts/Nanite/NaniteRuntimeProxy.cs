@@ -44,7 +44,7 @@ namespace Nanite
         [Header("Pipeline Admission")]
         [Tooltip("始终进入虚拟几何管线；用于低面模型对比或强制 Nanite。")]
         public bool forceNaniteRendering = false;
-        [Tooltip("始终交给普通 MeshRenderer/SRP 路径。与 forceNaniteRendering 同时开启时 Nanite 优先。")]
+        [Tooltip("始终交给普通 MeshRenderer/SRP 路径。两个 Force 同时开启属于冲突配置，运行时按自动准入处理。")]
         public bool forceRasterRendering = false;
         [Tooltip("低复杂度回退使用的原始 Mesh。留空时优先使用 NaniteMesh.sourceMesh，其次捕获当前 MeshFilter。")]
         public Mesh rasterFallbackMesh;
@@ -100,10 +100,13 @@ namespace Nanite
         Mesh capturedRasterFallbackMesh;
         Mesh admissionCountMesh;
         int admissionTriangleCount;
+        int admissionDrawCount;
         bool rasterFallbackActive;
         NaniteGpuCullingBackend gpuBackend;
         NaniteMesh gpuBackendMesh;
         ComputeShader gpuBackendShader;
+        NaniteMesh failedGpuBackendMesh;
+        ComputeShader failedGpuBackendShader;
         NaniteMesh pageGpuMesh;
         PageGpuData[] pageGpuData;
         NaniteMesh mergedGpuMesh;
@@ -155,6 +158,8 @@ namespace Nanite
         public int VisiblePageRangeCount => runtimeSelection.pageRanges.Count;
         public bool NaniteRenderingActive => !rasterFallbackActive;
         public bool RasterFallbackActive => rasterFallbackActive;
+        public bool ForceNaniteRequested => forceNaniteRendering && !forceRasterRendering;
+        public bool ForceRasterRequested => forceRasterRendering && !forceNaniteRendering;
 
         public int RasterFallbackTriangleCount
         {
@@ -171,7 +176,21 @@ namespace Nanite
                     indexCount += (long)mesh.GetIndexCount(subMesh);
                 admissionCountMesh = mesh;
                 admissionTriangleCount = (int)Math.Min(int.MaxValue, indexCount / 3L);
+                admissionDrawCount = Mathf.Max(1, mesh.subMeshCount);
                 return admissionTriangleCount;
+            }
+        }
+
+        public int RasterFallbackDrawCount
+        {
+            get
+            {
+                Mesh mesh = ResolveRasterFallbackMesh();
+                if (mesh == null)
+                    return 0;
+                if (admissionCountMesh != mesh)
+                    _ = RasterFallbackTriangleCount;
+                return Mathf.Max(1, admissionDrawCount);
             }
         }
 
@@ -184,10 +203,15 @@ namespace Nanite
         {
             get
             {
-                if (forceNaniteRendering)
+                if (ForceNaniteRequested)
                     return false;
-                if (forceRasterRendering)
+                if (ForceRasterRequested)
                     return true;
+                // The admission system itself enables this renderer. Do not
+                // interpret that state as a persistent user request, otherwise
+                // a proxy can never return to Nanite when scene density grows.
+                if (rasterFallbackActive)
+                    return false;
                 if (renderVisibleMesh)
                     return false;
                 MeshRenderer renderer = GetComponent<MeshRenderer>();
@@ -212,6 +236,12 @@ namespace Nanite
 
         void LateUpdate()
         {
+            // Once the RendererFeature owns the scene, production proxies are
+            // passive registry records. Per-object maintenance here would turn
+            // the GPU-driven scene back into O(instanceCount) script work.
+            if (NaniteRuntimeRegistry.IsFeatureDriving && !renderVisibleMesh)
+                return;
+
             TryAutoLoadNaniteMesh();
 
             if (rasterFallbackActive)
@@ -249,6 +279,25 @@ namespace Nanite
                 }
                 else
                     ClearDebugMesh();
+                return;
+            }
+
+            // The per-Proxy culling backend is a debug-mesh producer, not a
+            // production fallback. Running it while the central GPU Scene is
+            // still being created duplicates traversal and buffer uploads once
+            // per instance. Production proxies therefore stay passive unless
+            // their explicit debug mesh is requested.
+            if (!renderVisibleMesh)
+            {
+                visible.Clear();
+                runtimeSelection.Clear();
+                visibleClusterCount = 0;
+                visiblePageCount = 0;
+                testedNodeCount = 0;
+                testedPartCount = 0;
+                testedClusterCount = 0;
+                testedInstanceCount = 0;
+                ReleaseSelectionBuffers();
                 return;
             }
 
@@ -447,7 +496,7 @@ namespace Nanite
         {
             CaptureRasterFallbackMesh();
             Mesh source = ResolveRasterFallbackMesh();
-            bool next = enabled && !forceNaniteRendering && source != null &&
+            bool next = enabled && !ForceNaniteRequested && source != null &&
                         debugMeshFilter != null && debugMeshRenderer != null;
             if (rasterFallbackActive == next)
             {
@@ -863,6 +912,18 @@ namespace Nanite
 
         bool EnsureGpuBackend()
         {
+            // The shipping Nanite path is authored and validated for DX12. In a Null,
+            // WebGPU or other unsupported device, FindKernel can report every stripped
+            // variant once per proxy before the renderer feature's global gate runs.
+            // Fail before touching the compute asset; CPU/debug fallback remains valid.
+            if (SystemInfo.graphicsDeviceType !=
+                    UnityEngine.Rendering.GraphicsDeviceType.Direct3D12 ||
+                !SystemInfo.supportsComputeShaders)
+            {
+                DisposeGpuBackend();
+                return false;
+            }
+
             if (!useGpuCulling || gpuCullingShader == null || naniteMesh == null)
             {
                 DisposeGpuBackend();
@@ -874,16 +935,30 @@ namespace Nanite
 
             if (gpuBackendMesh != naniteMesh || gpuBackendShader != gpuCullingShader || !gpuBackend.IsReady)
             {
+                // A missing/stripped compute variant is deterministic for the current
+                // mesh/shader pair. Retrying FindKernel every LateUpdate produced an
+                // unbounded log storm on unsupported or -nographics devices. A changed
+                // asset reference or component lifecycle reset still permits recovery.
+                if (failedGpuBackendMesh == naniteMesh &&
+                    failedGpuBackendShader == gpuCullingShader)
+                {
+                    return false;
+                }
+
                 bool ok = gpuBackend.Initialize(naniteMesh, gpuCullingShader);
                 if (!ok)
                 {
                     gpuBackendMesh = null;
                     gpuBackendShader = null;
+                    failedGpuBackendMesh = naniteMesh;
+                    failedGpuBackendShader = gpuCullingShader;
                     return false;
                 }
 
                 gpuBackendMesh = naniteMesh;
                 gpuBackendShader = gpuCullingShader;
+                failedGpuBackendMesh = null;
+                failedGpuBackendShader = null;
             }
 
             return true;
@@ -895,6 +970,8 @@ namespace Nanite
             gpuBackend = null;
             gpuBackendMesh = null;
             gpuBackendShader = null;
+            failedGpuBackendMesh = null;
+            failedGpuBackendShader = null;
         }
 
         public bool EnsurePageGpuBuffers()

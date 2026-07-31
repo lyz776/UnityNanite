@@ -1323,3 +1323,585 @@ paths execute correctly and self-select, but only the HW floor wins on this capt
 largest remaining product gap is heterogeneous shader/texture execution; the largest
 geometry-quality gap is a higher-quality continuous hierarchy bake. Streaming needs eviction
 pressure, camera teleport and multi-asset stress acceptance rather than more nominal code.
+
+## Atomic producer-group traversal correction (2026-07-30)
+
+The 154-instance stress scene exposed that per-cluster screen-density rejection is not a
+valid Nanite LOD operation. A producer group is the atomic replacement edge in the DAG:
+either its complete coarse set or its complete refined set is emitted. Removing individual
+members reduced the camera queue from 152,784 to 87,312 clusters, but created holes,
+flicker and invalid material coverage. That experiment was fully removed.
+
+Production camera traversal now uses the bounded breadth-first hierarchy queue
+(`GPU-RootGroup-RefineQueue-DrawIndirect`). Four-cascade shadow traversal uses the same
+atomic rule with a cascade mask (`shadowFrustum/fusedHierarchyQueue`). The persistent
+queue remains disabled because bounded dispatch is the validated non-TDR path. Formal,
+depth and shadow raster remain `Cull Off` until bake metadata stores and validates a stable
+front-face convention.
+
+Latest cold DX12 Player smoke (300 rendered frames, exit code 0):
+
+- camera atomic cut: 129,874 clusters;
+- shadow maximum: 139,968 clusters, down from the spatial path's 155,088;
+- no invalid kernel, missing resource, UAV overflow or RenderGraph error.
+
+The remaining queue cost must be removed in the bake/root hierarchy, not by punching
+individual clusters out of a valid cut.
+
+## meshoptimizer clusterlod conformance: seam protection (2026-07-30)
+
+The bake previously marked UV, normal and tangent discontinuities as `Protect`, and also
+marked both the non-canonical wedge and its canonical position representative. On the Toyota
+asset this protected roughly 42% of all vertices and made hard-surface branches become
+terminal root sets.
+
+The implementation now follows meshoptimizer's official `demo/clusterlod.h` contract:
+
+- permissive simplification protects UV discontinuities only;
+- normal and tangent variation stays in the attribute error metric instead of becoming a
+  topological constraint;
+- only the non-canonical UV wedge receives `SimplifyVertex_Protect`;
+- dynamic inter-group `Lock` bits are still rebuilt every hierarchy generation and propagated
+  by position, while `Protect` remains per wedge.
+
+References used for this correction:
+
+- `meshoptimizer/demo/clusterlod.h`, `clodDefaultConfig`, `lockBoundary`, and `clodBuild`;
+- meshoptimizer README sections "Attribute-aware simplification" and "Permissive
+  simplification";
+- UE Nanite's invariant that a hierarchy node/group is the indivisible refinement unit.
+
+This change only affects newly baked assets. Its acceptance gates are lower resident root
+triangles and lower camera/shadow queues with unchanged UV seams, no holes and no flicker.
+
+### Isolated full-bake and DX12 Player result
+
+The Toyota asset was fully rebuilt in `D:\UnityNanite_CodexSmoke_20260730`; no user scene or
+main-project baked asset was overwritten. The hierarchy audit passed every fatal contract:
+membership, mip ownership, error monotonicity, parent/group containment and triangle
+reduction all reported zero violations.
+
+- UV seam Protect vertices: 98,791 -> 8,500;
+- resident root triangles: 48,926 -> 17,067 (-65.1%);
+- hierarchy: 5,269 clusters, 322 groups, max mip 6;
+- packed pages: 63, 13.99 MiB packed / 10.98 MiB LZ4 storage;
+- camera atomic cut: 129,874 -> 83,036 clusters (-36.1%);
+- maximum four-cascade shadow queue: 139,968 -> 64,204 clusters (-54.1%);
+- all camera/shadow queues fit one packet chunk; 300-frame DX12 Player exited cleanly.
+
+The renderer still uses the complete producer-group cut and `Cull Off`; the queue reduction
+comes entirely from a less over-constrained hierarchy. This is the first current-stage
+optimization that materially lowers both camera and shadow geometry without deleting an
+individual selected cluster.
+
+### UV precision correction
+
+Page V3 previously selected FloatUV only for non-finite values or values outside the half
+range. Half remains representable at large tiled UV coordinates but loses absolute precision;
+the Toyota bake passed the former tolerance with a measured maximum UV error of `0.4421`.
+This explains material samples moving to visibly different texture regions even when triangle
+identity and residency were correct.
+
+The encoder now round-trips every page UV through half before choosing its format. A page
+keeps HalfUV only when the absolute error is at most `1/4096`, otherwise it uses the already
+supported FloatUV flag and decode path. Isolated full-bake results:
+
+- maximum UV decode error: 0.4421 -> 0;
+- LZ4 page storage: 10.98 MiB -> 12.29 MiB;
+- format-aware Page planning: 72 pages at 88.8% average fill (the old HalfUV-only
+  estimate would late-split the same data into 105 pages);
+- hierarchy/root counts unchanged;
+- all page codec validation and hierarchy contracts passed.
+
+The approximately 1.31 MiB storage increase is intentional correctness data, localized to
+pages whose tiled UVs cannot meet 4K sub-texel precision in half. Ordinary 0..1 UV pages
+remain compact.
+
+## Formal raster/resolve and LOD correctness closure (2026-07-30)
+
+FloatUV removed Page payload quantization error, but it could not fix the later screenshot's
+camera-dependent fragments and wrong high-detail material regions. Two independent runtime
+contract violations remained:
+
+1. hierarchy refinement was AND-ed with a projected bounding-sphere area / coarse-triangle
+   density heuristic. That value is not a conservative visual-error bound and can stop on a
+   coarse producer group even while its attribute/geometric error is many pixels. Camera and
+   all four shadow cascades now select a cut exclusively from the baked absolute error and Page
+   residency, matching meshoptimizer clusterlod/Nanite's error-driven refinement contract;
+2. Formal Resolve used `GetNormalizedScreenSpaceUV` for both `Texture.Load` and clip-space
+   reconstruction. URP applies `_ScaleBiasRt` to that UV, after which the Nanite helper flipped
+   Y again. Raster writes and Resolve reads could therefore refer to different RT pixels. The
+   VBuffer now loads in native `SV_POSITION` pixel space, barycentrics use that same raw pixel
+   centre, and only lighting receives URP's orientation-adjusted normalized UV.
+
+Resolve no longer clamps an invalid barycentric solution onto a triangle edge. A decoded
+triangle must cover the current pixel within a 1% numerical edge tolerance or the pixel is
+discarded. This makes an ID/address regression fail visibly and locally instead of painting a
+large surface with an unrelated triangle's UV. The same validation is used by the depth slice.
+
+The unversioned meshoptimizer cone test is temporarily fail-open for camera and shadow. Bake,
+Unity import and procedural raster do not yet store one proven front-face convention; applying
+an assumed cone sign was able to reject complete front-facing clusters. Frustum, screen-error,
+residency and optional HZB culling remain active.
+
+Hierarchy format V2 records that `maxParentLodError` is the absolute error returned by the
+attribute-aware simplification which actually produced the replacement geometry. V1 assets
+are rejected from hierarchy traversal and must be re-Baked. Runtime scene construction also
+audits the immutable packet address domain: every Page index must be in range and every Page
+triangle must have exactly one cluster owner before exact packet raster is admitted.
+
+Isolated acceptance in `D:\UnityNanite_CodexSmoke_20260730` completed with Unity 6000.3.10f1:
+
+- full Toyota V2 Bake: 5,273 clusters, 323 groups, max mip 6, 71 Pages;
+- all hierarchy/DAG fatal counters zero; UV decode error zero;
+- DX12 Standalone Player build succeeded with all runtime shader variants;
+- 300 rendered frames completed without invalid kernels, missing bindings, Page/triangle
+  address errors or GPU crash;
+- after streaming settled, the hierarchy queue remained stable at 129,715 camera clusters
+  and the four shadow queues remained within the exact packet capacity.
+
+## Watertight V3 hierarchy and cumulative error closure (2026-07-30)
+
+The remaining close-camera coarse geometry, popping, holes and flashing were reproduced in
+the isolated DX12 Player. A forced `0.01px` leaf-quality run matched an ordinary MeshRenderer,
+which isolated the defect to hierarchy replacement rather than Page decode, VBuffer identity
+or material Resolve.
+
+Two topology/selection violations were corrected:
+
+1. error propagation now matches meshoptimizer `demo/clusterlod.h` exactly:
+   `max(previous_error, simplify_error) + simplify_error`. V2 only retained the maximum and
+   therefore under-reported accumulated replacement damage, selecting coarse geometry close
+   to the camera;
+2. each independently simplified producer group now carries an exact canonical shared-edge
+   contract. A replacement that removes a cross-group edge is rejected and becomes terminal,
+   preventing T-junctions. After an atomic group cut is selected, camera and shadow code no
+   longer delete individual non-terminal clusters merely because their own bound is below one
+   pixel/texel; that post-cut optimization was topology-unsafe and directly created holes.
+
+This changes the hierarchy ABI to V3; V1/V2 assets fail closed and require a re-Bake. Isolated
+Toyota acceptance at the production `1px` threshold produced:
+
+- 4,924 clusters, 302 groups, max mip 6 and 67 Pages;
+- 276/302 successful simplifications; 20 unsafe shared-edge replacements rejected;
+- mip triangles `312269 -> 151935 -> 67459 -> 29388 -> 13114 -> 8026 -> 1726`;
+- all DAG/hierarchy fatal counters zero, 11.36 MiB LZ4 Page storage;
+- 432-instance settled camera cut: 369,615 clusters, versus 653,010 for forced fine geometry;
+- the V3 Nanite and forced ordinary-Mesh reference images differ by only about `0.5/255`
+  mean absolute RGB at the fixed view;
+- two settled fixed-camera captures 25 frames apart changed only 0.298% of pixels, with no
+  full-background hole transitions; no invalid kernel, missing binding or Page address error.
+
+The remaining performance work must reduce valid producer-group cuts or raster cost; deleting
+members from an already selected cut is no longer an admissible optimization.
+
+## V4 attribute metric and previous-HZB quarantine (2026-07-30)
+
+The V3 hierarchy still mixed dimensionless tiled UV/tangent values into an error later
+projected as object-space distance. V4 follows meshoptimizer's official Nanite example:
+normal weights are `0.5`, UV/tangent QEM weights are zero, and UV discontinuities remain
+topology-Protected. The exact shared-edge contract and cumulative
+`max(previous,current) + current` propagation remain mandatory.
+
+The isolated V4 Toyota Bake produced 4,870 clusters, 294 groups, 66 Pages and max mip 5.
+Mip triangle counts are
+`312269 -> 151018 -> 67756 -> 30828 -> 11196 -> 5667`; 24 replacements which broke a
+shared canonical edge were conservatively rejected. The production 1-pixel, 432-instance
+camera cut is 365,865 clusters. This is still too expensive, but it is a complete valid cut;
+post-cut member deletion is not an acceptable way to reduce it.
+
+The fused Formal WriteDepth pass previously failed to publish `depthWrittenThisFrame`, so
+the HZB history was never actually built. Fixing that flag exposed a second issue: existing
+previous-frame instance, hierarchy-group and cluster rejection is not conservative under
+self-occlusion. It reduced the queue substantially but produced catastrophic holes and
+flashing. Production therefore now:
+
+- keeps the fused depth-state publication fix and current-frame HZB infrastructure;
+- removes instance and hierarchy-group HZB rejection from both bounded and persistent
+  traversal;
+- hard-quarantines previous-frame HZB admission regardless of stale Renderer Feature
+  serialization;
+- preserves the complete atomic producer cut until a conservative two-phase node test has
+  its depth convention and image-difference contract proven.
+
+Safe-path isolated DX12 acceptance (Unity 6000.3.10f1, exit code 0):
+
+- all 66 Pages became resident; no invalid kernel, missing binding, UAV overflow or Page
+  address error;
+- settled camera cut stayed at 365,865 clusters with `previousHzbThisDispatch=False`;
+- two fixed-camera captures 25 frames apart had mean RGB delta `0.029/255`, with only
+  `0.166%` of pixels changing by more than 8 levels;
+- Nanite versus ordinary MeshRenderer reference had mean RGB delta `0.458/255`;
+- the validated V4 `.asset` and Page payload were copied to the main project, replacing the
+  incompatible V3 runtime asset.
+
+The next performance milestone is conservative hierarchy-node occlusion plus a denser valid
+producer hierarchy. It must reduce complete cuts, pass automated reference/temporal image
+gates, and never remove individual members after a cut has been selected.
+
+An isolated runtime-derived group-AABB experiment was also rejected rather than shipped. An
+8-corner clip-space rectangle lowered the settled camera queue from 365,865 to about 201,000,
+but still changed roughly 8% of pixels by more than 8 RGB levels and exposed visible holes.
+Increasing the depth guard and testing both render-target Y conventions did not satisfy the
+reference gate. The required next design is therefore a UE-style previous-visible first pass
+plus an explicit uncertain/disocclusion recovery queue, not direct node deletion during the
+first hierarchy traversal.
+
+That recovery queue was prototyped in the isolated project as a second gate. Pass1 retained
+each previous-HZB-rejected canonical producer task, current depth omitted those tasks, and
+Pass2 traversed them again against the newly built HZB. The queue remained within the eight
+UAV contract and reduced the final camera queue to about 247,000, but the reference image
+still differed on roughly 6% of pixels by more than 8 RGB levels. This proves the remaining
+fault is below queue scheduling: the HZB projection/orientation or hardware-depth comparison
+contract itself is not yet trustworthy. The prototype was removed. Before re-enabling node
+occlusion, the next implementation must visualize and validate projected bounds and HZB
+samples against known occluder/occludee fixtures, then reapply the two-phase queue.
+
+## Camera ownership and capability admission closure (2026-07-30)
+
+The fixed standalone camera was stable while Editor Scene/Game views still flashed or lost
+rows of instances. The cause was a camera-transient ownership violation, not another Bake
+threshold problem. Compact validity used frame, selection and geometry generation but omitted
+camera identity. The second camera in a frame could therefore keep the first camera's indirect
+arguments while consuming its own newly-written draw queue. Indexed packet validity had the
+same incomplete check at consumption. GPU visibility ownership is now explicit as well:
+`GpuVisibleMaskReady` carries its producer camera ID and a different camera cannot relabel the
+mask as prepared.
+
+The Page policy is also now budget-driven. If all virtual Pages fit in the configured pool,
+they are uploaded and transcoded once; root-only demand streaming is reserved for scenes that
+actually exceed the pool. The 66-page Toyota asset therefore settles at `66/66` immediately
+inside its 66 allocated slots instead of introducing residency-driven LOD changes in a pool
+that already has room for the complete asset.
+
+Finally, platform capability detection no longer silently admits unvalidated optional work.
+Previous-HZB consumption remains quarantined, so HZB Depth/Copy/Build/Cull2 is not scheduled.
+Hybrid and compact integer VBuffer paths require their explicit production setting; the
+validated indexed hardware packet path remains available through negotiated DX12 capability.
+
+Isolated DX12 dual-camera acceptance renders `main -> interference -> main` every frame:
+
+- Player build succeeded with no C# or shader-kernel errors;
+- all 66 Pages were resident before the first settled cut;
+- 180 camera renders completed without invalid bindings, UAV overflow or Page errors;
+- the main cut remained 365,865 clusters and exact indexed packet submission stayed valid;
+- two main-camera captures had mean absolute RGB delta `0.077/255`;
+- the 60-frame triple-camera smoke wall time fell from about 20 s to 16 s after removing the
+  non-consuming HZB chain (startup included, so this is a directional rather than FPS metric).
+
+The remaining visual transition work belongs to hierarchy attribute error and seamless
+replacement quality. It must be solved in Bake/producer groups, not by adding another
+per-cluster runtime deletion or an Inspector fallback switch.
+
+## Reference hierarchy correction and distance audit (2026-07-30)
+
+The prior V3/V4 notes above are historical results, not the current hierarchy contract.
+Fresh comparison with `meshoptimizer/demo/clusterlod.h` at commit
+`a6ecc73c094bdd5d09644f9286bbf25134853679` found two deviations which have now been
+corrected:
+
+- default clusterlod error propagation is `max(previous_error, current_error)`. The additive
+  term is zero in `clodDefaultConfig`; repeatedly adding the current error inflated remote
+  levels and prevented useful coarse cuts;
+- projected perspective error is `error * (0.5 * screenHeight * cot(fov/2)) / distance`.
+  The runtime multiplied this by two even though `_ProjectionScale` already contains the
+  half-height factor.
+
+The global exact-edge rejection added in V3 was also removed. It turned 24 producer groups
+into terminal roots and raised the resident root set to about 53.8K triangles. Producer
+replacement is instead checked for connected-component growth and extreme UV-edge-stretch
+growth, with progressively less aggressive retries before a group is made terminal. The
+meshoptimizer edge-length error limiter is applied after simplification, matching the
+reference implementation's treatment of dense normal-attributed geometry.
+
+`NaniteHierarchyDistanceAuditMenu` now validates hierarchy ranges and producer reduction,
+then CPU-simulates the mutually-exclusive cut over six camera directions and twelve
+distances. It reports selected clusters/triangles, mip histograms, duplicate geometry,
+monotonic regressions, connected-component growth, UV-stretch outliers and resident roots.
+The old Toyota V4 asset showed no duplicate traversal but retained roughly 109K-118K
+triangles at 180 m and contained intermediate producer topology outliers, proving that the
+remaining issue was Bake quality rather than duplicate GPU submission.
+
+The corrected topology-preserving isolation Bake reduced the finite error maximum from 33.7
+to 3.70 object units and resident roots from 53.8K to 17.1K triangles, with no UV-stretch
+outlier. A UV-weight relaxation and a component-prune experiment were rejected because they
+reduced root storage without materially improving the distance cut.
+
+The official `simplifySloppy` terminal fallback is now exported by the native wrapper and
+implemented with the same sparse-group deindex/restore procedure and `2x` error amplification
+as `clusterlod.h`. Additional gates require all hard producer-boundary positions to survive,
+forbid connected-component growth and reject extreme UV stretch. In isolation this produced:
+
+- 5,330 clusters, 327 groups, max mip 12 and five roots;
+- mip triangle counts
+  `312269 -> 155916 -> 79203 -> 39831 -> 21317 -> 13292 -> 4009 -> 1711 -> 880 -> 696 -> 328 -> 164 -> 82`;
+- resident roots reduced to 6,611 triangles;
+- all DAG membership, mip, error-monotonicity, containment and reduction fatal counters zero;
+- no new component-growth group and no UV-stretch outlier;
+- monotonic, duplicate-free distance cuts in all audited camera directions.
+
+This closes the missing reference fallback and makes the hierarchy complete, but it is not
+claimed as the final performance or temporal-quality fix: the 4K/1px audit still selects
+about 58K triangles at 180 m. The next Bake architecture step is the meshoptimizer-recommended
+`meshopt_simplifyWithUpdate` path for aggressive upper levels, with per-level vertex payloads,
+locked producer boundaries and UV/normal attribute updates. That change is required to lower
+coarse-level geometric error instead of hiding it with runtime thresholds.
+
+The updated native wrapper can be reproduced with `Native/API_CPP/build_zig.ps1`; the tested
+source commit is printed by the script. The new DLL was validated in the isolated Unity
+6000.3.10f1 DX12 Player build before deployment to the main project.
+
+## Mesh-wide quantization, deterministic visibility and atomic density cut (2026-07-30)
+
+The reported fixed-camera trim flicker and the intermediate-distance hood break were
+reproduced in a one-proxy DX12 Player capture. Three independent defects were found instead
+of compensating them with another exposed LOD threshold:
+
+- Page V3 encoded positions on a Page-local UNorm16 grid. A shared source vertex therefore
+  decoded to different positions on two Pages and opened a real streaming seam. All Pages
+  now use one mesh-wide position grid while remaining independently compressed/streamed.
+- the old hierarchy audit recursively treated regrouped clusterlod output as a tree. The
+  hierarchy is a DAG; the audit and production cut now use the official mutually-exclusive
+  consumer/producer group predicate.
+- visible clusters arrive through unordered GPU append queues. Equal-depth coplanar material
+  triangles could therefore choose a different VBuffer owner each frame. Hardware raster now
+  uses a stable material key plus a full immutable-triangle hash depth tie-break.
+
+The rebuilt isolation asset has 5,466 clusters, 328 groups, 74 Pages and a 5,933-triangle
+resident root set. All fatal DAG, error, containment, Page-budget and binary round-trip checks
+are zero. Mesh-wide quantization reduced exact Page-induced connected-component growth from
+roughly 97 cases to one remaining producer-quality case. Ten identical camera frames now have
+zero pixels changing by more than four RGB levels; the earlier strip-scale change is gone.
+
+The remote-density problem was also structural. Geometric error alone retained about 47.7K
+triangles at 64 model radii because many conservative upper-level group spheres overlap on
+screen. Runtime now stores a per-group sum of tight fine-Cluster coverage radii and triangle
+count. A group refines only while its geometric error is visible and its complete fine side is
+not already over the conservative screen-space triangle budget. Both fine and coarse sides
+look up the same group decision through immutable consumer/producer IDs, so the budget cannot
+delete individual clusters or recreate a transition gap. The same rule is applied per shadow
+cascade.
+
+At 2160p/1px, the CPU mirror audit is unchanged through 0.5 model radii, changes the 1R cut by
+less than one percent, and reduces the 64R cut from 47,745 to 7,694 triangles with no monotonic
+regression or duplicate geometry. The 432-instance DX12 smoke completed 300 shadowed frames
+with all 74 Pages resident, no invalid kernel/resource/UAV errors, and the fixed/dolly captures
+showed no break or temporal flash. Main-project geometry must be re-Baked once to receive the
+mesh-wide quantization grid; the isolated Toyota assets were deliberately not copied over the
+user's project.
+
+## Geometric-error production baseline and formal A/B (2026-07-31)
+
+The density override described in the previous historical section was not retained. It changed
+the selected cut even when geometric error was still visible, which is why the user observed
+rapid near-camera degradation followed by dense remote geometry. The production predicate now
+uses projected object-space geometric error as the hard quality bound. Attribute-weighted
+meshoptimizer error remains a candidate/topology metric and is never projected as metres.
+
+The corrected isolation Bake produced 5,513 clusters, 17 hierarchy levels, 75 Pages, a
+31-triangle resident root, 16.61 MiB packed / 12.94 MiB NZC1-LZ4 storage, and zero fatal DAG
+contract counters. Finite geometric error is at most `0.399x` the model radius. A deterministic
+52-frame dolly against the native MeshRenderer reference measured `0.224/255` mean RGB error,
+`0.430/255` worst-frame MAE and no extra fixed-camera temporal change. A 4 MiB pool retained
+16/75 Pages without missing-Page holes; the expected quality loss came from the resident coarse
+cut, not random cluster deletion.
+
+Same-player DX12 A/B at 1280x720, four cascades and HardwareOnly:
+
+| Instances | Native MeshRenderer | Nanite |
+|---:|---:|---:|
+| 1 | 1072 FPS | 754 FPS (forced; production admission uses native) |
+| 8 | 1012 FPS | 682 FPS (forced) |
+| 24 | 577 FPS | 783 FPS |
+| 48 | 330 FPS | 684 FPS |
+| 96 | 174 FPS | 683 FPS |
+| 154 | 110 FPS | 720 FPS |
+| 432 | 40 FPS | 496 FPS |
+
+This establishes the measured low-submission crossover between 8 and 24 instances. Production
+defaults therefore return scenes with at most 12 fallback-capable instances / 16 source draws /
+4M source triangles to URP, while dense large scenes stay GPU-driven.
+
+The heterogeneous acceptance asset uses four material-boundary-preserving SubMeshes and eight
+URP/Lit parameter/texture variants. Its Bake has 5,512 clusters, 357 groups, 76 Pages, one root
+Page, no split producer group, no oversized Page and zero fatal DAG counters. At 154 instances
+the current geometric-error cut submits about 69,372 clusters / 7.67M triangles and runs at
+about 500 FPS; the exact same source Mesh and 616 ordinary SubMesh draws run at about 140 FPS.
+Material ownership and texture slots match the native reference. Remaining foreground-level
+lighting deviation is the known procedural reflection-probe binding difference, not a material
+or UV remap; deleting its fallback was tested and rejected because metallic bins became black.
+
+Forced Hybrid remains a valid but slower path on this GPU: approximately 415 FPS at 154 and
+401 FPS at 432 instances, versus HardwareOnly's 720/496 FPS in the corresponding single-material
+tests. NVIDIA `vk_lod_clusters` commit `70506fdc...` documents the same current limitation for
+its compute raster path. Hybrid remains capability- and timing-gated instead of being forced.
+
+Finally, arbitrary shader compatibility is now explicit. `NaniteMaterialResolveRegistry`
+registers a source-program predicate, a VBuffer-to-GBuffer resolve Material and a per-bin binder.
+Unregistered programs remain on their native Renderer; forced diagnostics skip unsupported bins
+instead of silently applying URP/Lit semantics. The isolated registry lifecycle audit passed
+registration, admission, scene-generation invalidation and disposal.
+
+## Reproducible streaming and multi-geometry acceptance (2026-07-31)
+
+The streaming harness now compares settled equal-camera endpoints. A 16 MiB pool loaded the
+50 non-root Pages required by the path, performed zero eviction, and produced the exact fully
+resident cuts over three cycles. The 4 MiB fault tier evicted 542 Pages in 720 frames and
+changed the near cut; it is not a production capacity and is not used to claim temporal quality.
+
+The first multi-unique-mesh A/B uses three baked meshes and 154 instances at 1280x720 with four
+shadow cascades. Nanite rendered at 675.38 FPS (1.481 ms average), while MeshRenderer rendered
+at 424.19 FPS (2.357 ms). Runtime sharing was
+`mesh:3, part:550/28369, cluster:3516/181351`; 53/53 Pages and three roots were resident.
+
+With the same 154-instance three-mesh scene constrained to 8 MiB, the normal framing needs only
+7/53 Pages (three pinned roots plus four streamed Pages), performs zero eviction and runs at
+604.74 FPS. At `distanceScale=0.5` it needs 14/53 Pages, still performs zero eviction, submits
+7,458 clusters / 782,910 triangles and runs at 641.30 FPS. Captured frames contain all three
+shapes without missing-Page holes. This validates multiple root/address spaces under pressure;
+camera-motion churn across multiple unique working sets remains a separate final test.
+
+The moving multi-geometry test is now complete. With 432 instances and three unique meshes,
+8 MiB keeps 32/53 Pages, streams 143, evicts 114 (8.89 evictions/s), and produces identical
+cluster/triangle counts at every repeated near and far endpoint. The 16 MiB reference keeps
+53/53 Pages with zero streaming or eviction. Adjacent fixed-camera pairs have zero pixels
+changing by more than four RGB levels in both tiers. The small cross-cycle image delta is also
+present in the fully resident tier (time-of-day/background drift), so it is not attributed to
+Page residency. The 8 MiB tier is a valid coarse fallback but remains lower quality than the
+16 MiB production working set.
+
+## Exact packet arena acceptance (2026-07-31)
+
+Same-player DX12, 1280x720, four cascades, HardwareOnly:
+
+| Instances | Camera Clusters | Camera Triangles | Packet working set | FPS |
+|---:|---:|---:|---:|---:|
+| 154 | 19,818 | 2,256,734 | 35.1 MiB | 633.40 |
+| 432 | 51,786 | 5,857,606 | 40.6 MiB | 537.23 |
+
+The previous double-expanded overflow capacity allocated 504.2 MiB for the 154-instance case. A forced 1M-packet overflow run at 432 instances produced the same complete validation image at 507.06 FPS with a 12.6 MiB working set. No kernel-invalid, missing binding, UAV-limit or Page errors occurred. This closes packet capacity as a correctness cliff: memory is bounded by a 4K one-triangle-per-pixel arena and excess whole Clusters remain renderable without CPU readback.
+
+### Post-packet heterogeneous delivery checks
+
+- Four-SubMesh/eight-material scene, 154 instances: 50,596 camera Clusters, 5.69M triangles, four compatibility bins, 76/76 Pages, 442.65 FPS.
+- Three unique baked meshes, 154 instances: GPU Scene sharing is mesh 3 / geometry Clusters 3,516 / virtual Clusters 181,351; 53/53 Pages, 664.70 FPS.
+- Both runs used the 8,388,608-packet production arena, four shadow queues and zero CPU readback. Validation captures retained material variation and complete geometry with no kernel/resource/UAV errors.
+
+### 4K scale gate
+
+The final 8M-packet production build rendered 432 instances at 3840x2160 with four cascades at 231.59 FPS (4.318 ms average). The camera cut contained 85,071 Clusters / 9,713,782 triangles, intentionally exceeding packet capacity, so the accepted overflow path was active in a real 4K workload. The captured frame was complete and the Player reported no invalid kernel, missing resource, UAV or Page error.
+
+## Direct-queue acceptance delta (2026-07-31)
+
+The previous large-scene backend still allocated 16-byte virtual Cluster records for every
+instance even though spatial traversal already carried instance identity. The 1,000-instance
+Toyota workload therefore described 5,219,000 virtual records for only 5,219 immutable geometry
+Clusters. The accepted path replaces those records with one-element compatibility placeholders,
+uses a unique geometry Page-address table, and drives camera and shadow queues directly.
+
+Final isolated Player results at 1280x720 are 354.24 FPS for 1,000 instances with four cascades,
+773.62 FPS for 154 instances across three unique meshes, and 659.53 FPS for 154 four-SubMesh/eight-
+material instances. Counts and captures match the pre-compaction path; no capacity, kernel, UAV or
+resource errors occurred. These are unattended Player measurements, not Editor Stats or a
+Profiler-attached run.
+
+## Hybrid explicit-queue regression closure (2026-07-31)
+
+The r3 close-camera Hybrid regression was an indexed-submission ownership bug. The explicit
+Hybrid HW queue reached packet construction with its own valid Cluster/count buffers and a
+RenderGraph dependency, but `TryBuildCameraIndexedDraw` still rejected it unless the unrelated
+global compact queue's direct/readiness stamps matched the current camera. This made most of the
+Hybrid cut disappear while the small software bin remained visible. The fix scopes those stamps
+to the implicit global queue; explicit override queues use their own ownership contract.
+
+An isolated clean rebuild and sequential (non-concurrent) DX12 A/B used identical 1280x720
+single-car dolly input and a 2 px Hybrid threshold. Both runs completed 180 renders, captured 52
+frames and reached 68/68 resident Pages. No invalid kernel, missing binding/resource, UAV-limit,
+Page or queue-overflow error was logged. The Hybrid audit settled at 251,760 winner pixels and
+1,267 raster tiles with asynchronous software raster restored.
+
+| Check | HardwareOnly | Hybrid 2 px |
+|---|---:|---:|
+| Fixed-camera max adjacent MAE (RGB levels) | 0.000486 | 0.000565 |
+| Fixed-camera adjacent pixels over 8 levels | 0 | 0 |
+| Camera renders / captures | 180 / 52 | 180 / 52 |
+| Resident Pages | 68 / 68 | 68 / 68 |
+
+Across every matching frame, HW-versus-Hybrid worst MAE was `0.001908/255`; the worst frame had
+only two pixels over 8 levels, while the close fixed-camera range had none. This closes the
+missing-HW-geometry and temporal-flicker regression. It does not change the prior performance
+decision: on the tested RTX 4500 Ada the compatibility software raster remains slower and stays
+capability/cost gated, while HardwareOnly is the production default.
+
+## Main-project final performance closure (2026-07-31)
+
+After the project-owned r3 Bake, a clean 6000.3.10f1 DX12 Player at 1280x720 submitted 198,637
+camera Clusters / 21.857M triangles for 432 instances. Exact packet construction stayed within one
+8,388,608-packet arena; GPU Scene used one immutable mesh, 5,122 geometry Clusters and direct
+instance references. All 69 Pages were resident and runtime readback remained zero.
+
+| Mode | Four cascades | FPS | Frame ms |
+|---|---:|---:|---:|
+| HardwareOnly | no | 277.37 | 3.605 |
+| HardwareOnly | yes | 71.35 | 14.016 |
+| Hybrid 2 px | yes | 63.23 | 15.815 |
+
+Each cascade currently reaches the correctness-preserving root floor of 162,000 Clusters / 17.607M
+triangles. The approximately 10.41 ms shadow delta is therefore the remaining hotspot and explains
+why older measurements made with the invalid 95-triangle root asset are not comparable. This is
+an explicit performance limitation, not hidden by a quality switch.
+
+Hybrid classification requested 7.86M sparse tile nodes, exceeding the 524,288-node arena. Whole
+Clusters were returned to indexed HW as designed; final stress-frame MAE versus HardwareOnly was
+`0.000841/255` with 16 pixels over eight levels and no missing geometry. The 11.4% Hybrid slowdown
+confirms the production decision to keep HardwareOnly default.
+
+## Post-closure shadow and HZB audit (2026-07-31)
+
+The remaining shadow cost was first attacked by reducing invalid work, not by changing the shadow
+LOD target. URP caster planes are now applied throughout the GPU traversal; external-only scenes
+fall back to a conservative directional swept-cylinder receiver test. In the reproducible
+1920x1080 / 100-instance run this removed 33,400 first-cascade Cluster submissions, preserved the
+final image bit-for-bit, and improved wall time by 5.2%. At 4K / 432 instances the accepted queue
+remained `3456/3456/1296/432` and the final image stayed complete. This closes the avoidable
+off-volume caster cost while preserving four independent cascade cuts.
+
+The HZB recovery architecture now carries instance-qualified rejected records and dispatches only
+that queue. It fixes the former cross-instance alias and passes static/moving occlusion-stack image
+parity, but it is not admitted to production:
+
+| 4K / 432 case | HZB off | HZB on | Result |
+|---|---:|---:|---|
+| Occlusion stack | 5.048 ms | 6.085 ms | Same PNG; cost regression |
+| Close field | 4.499 ms / 95,749 Clusters | 4.160 ms / 53,845 Clusters | Visible holes; rejected |
+
+The close-field failure remains after Y-origin and reversed-Z fixes, so the faster number is not a
+valid optimization result. Shipping remains `HardwareOnly`, `useHzbCulling=false`, four-cascade
+shadow caster-volume admission enabled, and zero synchronous readback. The project remains at the
+approximately 90% Windows DX12 delivery checkpoint: the unaccepted HZB experiment is not on the
+default path and does not weaken the stable image contract.
+
+## Far-field attribute-preservation acceptance (2026-07-31)
+
+The final coarse-LOD material defect was isolated to offline proxy payload generation. Copying a
+whole source UV primitive to a differently sized proxy was explicitly rejected even though it
+looked better than the earlier constant-UV workaround: hierarchy audit found three UV-stretch
+outliers and 4K/432 far-field throughput fell to 169.57 FPS. The accepted position-to-UV Jacobian
+footprint is bounded inside the selected source chart primitive, so it preserves local texture
+density while preventing atlas-island bleed and decal magnification.
+
+| 4K / 432 / no shadows | Nanite Clusters | Nanite triangles | Nanite FPS | MeshRenderer FPS |
+|---:|---:|---:|---:|---:|
+| distanceScale 0.20 | 84,875 | 9,184,183 | 219.89 | 122.84 |
+| distanceScale 0.35 | 76,960 | 7,713,308 | 231.47 | 85.37 |
+| distanceScale 0.50 | 58,350 | 5,368,372 | 261.29 | 72.52 |
+| distanceScale 0.70 | 31,101 | 2,535,564 | 314.43 | 71.55 |
+| distanceScale 1.00 | 17,225 | 1,240,017 | 352.37 | 72.11 |
+
+All 77 Pages were resident in each run and no HZB, shadow or software-raster path was enabled.
+This isolates the comparison to the production HardwareOnly camera path. The hierarchy continues
+to a real 12-triangle root, has no five-direction monotonic regression and reports
+`uvStretchOutlier=0`. A separate single-car 0.02R-to-64R Dolly completed 52 paired frames; its
+worst full-frame Nanite-versus-MeshRenderer MAE was 0.02643 RGB levels. No valid Player log
+contained a compile exception, invalid kernel, missing binding/resource, D3D12 removal or Page
+error. These results supersede the discarded full-source-UV footprint experiment.

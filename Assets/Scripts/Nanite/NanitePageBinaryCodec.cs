@@ -120,6 +120,41 @@ namespace Nanite
             out NanitePageBinaryStats stats,
             out string error)
         {
+            error = null;
+            if (ReferenceEquals(page, null) || !TryValidateSource(page, out error))
+            {
+                blob = null;
+                stats = default;
+                return false;
+            }
+            CalculatePositionBounds(
+                page.vertexData,
+                page.vertexStride,
+                page.vertexCount,
+                out Vector3 positionMin,
+                out Vector3 positionExtent);
+            return TryEncode(
+                page,
+                positionMin,
+                positionExtent,
+                out blob,
+                out stats,
+                out error);
+        }
+
+        /// <summary>
+        /// Encodes a Page on an explicitly supplied mesh-wide position grid.
+        /// Pages remain independently streamable, while vertices shared across
+        /// Page boundaries quantize to identical integers and cannot open seams.
+        /// </summary>
+        public static bool TryEncode(
+            NaniteMeshPage page,
+            Vector3 positionMin,
+            Vector3 positionExtent,
+            out byte[] blob,
+            out NanitePageBinaryStats stats,
+            out string error)
+        {
             blob = null;
             stats = default;
             error = null;
@@ -138,7 +173,14 @@ namespace Nanite
                             (floatUv ? NanitePageBinaryFlags.FloatUv : NanitePageBinaryFlags.HalfUv) |
                             (index16 ? NanitePageBinaryFlags.Index16 : NanitePageBinaryFlags.None);
 
-                CalculatePositionBounds(page.vertexData, page.vertexStride, vertexCount, out Vector3 min, out Vector3 extent);
+                Vector3 min = positionMin;
+                Vector3 extent = positionExtent;
+                if (!IsFinite(min.x) || !IsFinite(min.y) || !IsFinite(min.z) ||
+                    !IsFinite(extent.x) || !IsFinite(extent.y) || !IsFinite(extent.z) ||
+                    extent.x < 0f || extent.y < 0f || extent.z < 0f)
+                {
+                    throw new InvalidDataException("Position quantization grid is invalid.");
+                }
 
                 byte[][] sections =
                 {
@@ -344,8 +386,12 @@ namespace Nanite
                 }
             }
 
-            CalculatePositionBounds(source.vertexData, source.vertexStride, source.vertexCount, out _, out Vector3 extent);
-            float positionTolerance = Mathf.Max(1e-6f, extent.magnitude / ushort.MaxValue);
+            // The header grid may intentionally be mesh-wide rather than the
+            // tighter Page bounds. Validate against the grid that encoded this
+            // Page, otherwise valid shared-grid Pages fail round-trip checks.
+            float positionTolerance = Mathf.Max(
+                1e-6f,
+                header.positionExtent.magnitude / ushort.MaxValue);
             bool uvFloat = (header.flags & NanitePageBinaryFlags.FloatUv) != 0;
             float uvTolerance = uvFloat ? 1e-6f : CalculateHalfUvTolerance(source.vertexData, stride, source.vertexCount);
             if (stats.maxPositionError > positionTolerance ||
@@ -802,15 +848,35 @@ namespace Nanite
 
         static bool RequiresFloatUv(float[] vertices, int stride, int count)
         {
+            // Half precision is adequate for ordinary 0..1 UVs, but its absolute
+            // step grows with tiled coordinates. The old range-only test accepted
+            // a measured 0.4421 UV error on the Toyota asset, which can select an
+            // entirely different texel/island. Keep the compact representation only
+            // while its round trip stays below one texel at 4K.
+            const float maxHalfUvError = 1f / 4096f;
             for (int i = 0; i < count; i++)
             {
                 int o = i * stride;
                 float u = vertices[o + 3];
                 float v = vertices[o + 4];
-                if (!IsFinite(u) || !IsFinite(v) || Mathf.Abs(u) > 65504f || Mathf.Abs(v) > 65504f)
+                if (UvRequiresFloatStorage(u, v, maxHalfUvError))
                     return true;
             }
             return false;
+        }
+
+        public static bool UvRequiresFloatStorage(
+            float u,
+            float v,
+            float maxHalfUvError = 1f / 4096f)
+        {
+            if (!IsFinite(u) || !IsFinite(v) ||
+                Mathf.Abs(u) > 65504f || Mathf.Abs(v) > 65504f)
+                return true;
+            float decodedU = HalfToFloat(FloatToHalf(u));
+            float decodedV = HalfToFloat(FloatToHalf(v));
+            return Mathf.Abs(decodedU - u) > maxHalfUvError ||
+                   Mathf.Abs(decodedV - v) > maxHalfUvError;
         }
 
         static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);

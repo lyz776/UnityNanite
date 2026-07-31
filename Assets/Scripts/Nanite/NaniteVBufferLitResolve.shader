@@ -46,6 +46,7 @@ Shader "Nanite/VBufferLitResolve"
             #pragma vertex vertFullscreen
             #pragma fragment fragDepthOnly
             #pragma multi_compile_local _ NANITE_COMPACT_VBUFFER
+            #pragma multi_compile_local _ NANITE_FLOAT2_VBUFFER
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/ShaderVariablesFunctions.hlsl"
             #include "NaniteVBufferCommon.hlsl"
@@ -69,6 +70,8 @@ Shader "Nanite/VBufferLitResolve"
 
             #if defined(NANITE_COMPACT_VBUFFER)
             Texture2D<uint2> _NaniteVBufferTex;
+            #elif defined(NANITE_FLOAT2_VBUFFER)
+            Texture2D<float2> _NaniteVBufferTex;
             #else
             TEXTURE2D_FLOAT(_NaniteVBufferTex);
             #endif
@@ -101,12 +104,12 @@ Shader "Nanite/VBufferLitResolve"
                     _VertexData[baseOffset + 2]);
             }
 
-            uint2 NaniteVBufferCoord(float2 screenUv)
+            uint2 NaniteVBufferCoord(float2 rawScreenUv)
             {
                 // 未绑定或非法时回退全屏尺寸，避免 (0,0)→钳成 1x1 导致全屏采同一 texel。
                 float2 size = _NaniteVBufferSize.x > 1.5 ? _NaniteVBufferSize.xy : _ScreenParams.xy;
                 size = max(size, 1.0);
-                return uint2(min(floor(screenUv * size), size - 1.0));
+                return uint2(clamp(floor(rawScreenUv * size), 0.0, size - 1.0));
             }
 
             Varyings vertFullscreen(Attributes input)
@@ -123,11 +126,17 @@ Shader "Nanite/VBufferLitResolve"
             {
                 outputDepth = UNITY_RAW_FAR_CLIP_VALUE;
 
-                float2 screenUv = GetNormalizedScreenSpaceUV(input.positionCS);
-                uint2 pixelCoord = NaniteVBufferCoord(screenUv);
+                float2 rawScreenUv = NaniteScreenUvFromPositionCS(
+                    input.positionCS,
+                    _NaniteViewInvSize);
+                uint2 pixelCoord = NaniteVBufferCoord(rawScreenUv);
                 #if defined(NANITE_COMPACT_VBUFFER)
                 uint2 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
                 NaniteDecodedVBufferIds decoded = NaniteDecodeCompactVBufferIds(
+                    encoded, InstanceCountInt(), TriangleCountInt());
+                #elif defined(NANITE_FLOAT2_VBUFFER)
+                float2 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
+                NaniteDecodedVBufferIds decoded = NaniteDecodeFloat2VBufferIds(
                     encoded, InstanceCountInt(), TriangleCountInt());
                 #else
                 float4 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
@@ -137,7 +146,7 @@ Shader "Nanite/VBufferLitResolve"
                 if (decoded.valid == 0)
                     discard;
 
-                #if defined(NANITE_COMPACT_VBUFFER)
+                #if defined(NANITE_COMPACT_VBUFFER) || defined(NANITE_FLOAT2_VBUFFER)
                 int triangleId = decoded.triangleId;
                 float4x4 localToWorld = _InstanceLocalToWorld[decoded.instanceId];
                 float3 p0OS;
@@ -167,12 +176,14 @@ Shader "Nanite/VBufferLitResolve"
                 float4 p0CS = TransformWorldToHClip(p0WS);
                 float4 p1CS = TransformWorldToHClip(p1WS);
                 float4 p2CS = TransformWorldToHClip(p2WS);
-                float2 pixelNdc = NaniteNdcFromScreenUv(screenUv);
+                float2 pixelNdc = NaniteNdcFromScreenUv(rawScreenUv);
                 NaniteBarycentrics bary = CalculateTriangleBarycentricsNdc(pixelNdc, p0CS, p1CS, p2CS, _NaniteViewInvSize);
                 float barySum = bary.value.x + bary.value.y + bary.value.z;
                 if (abs(barySum) < 1e-5)
                     discard;
                 bary.value /= barySum;
+                if (!NaniteRepairCoveredBarycentrics(bary, 0.01, 1.5))
+                    discard;
                 float3 positionWS = p0WS * bary.value.x + p1WS * bary.value.y + p2WS * bary.value.z;
                 outputDepth = NaniteDeviceDepthFromClip(TransformWorldToHClip(positionWS));
                 #else
@@ -206,6 +217,7 @@ Shader "Nanite/VBufferLitResolve"
             #pragma vertex vertResolve
             #pragma fragment frag
             #pragma multi_compile_local _ NANITE_COMPACT_VBUFFER
+            #pragma multi_compile_local _ NANITE_FLOAT2_VBUFFER
             #pragma multi_compile _ NANITE_GBUFFER_DEPTH_SLICE
             #pragma multi_compile _ _LIGHT_LAYERS
             #pragma multi_compile _ SHADOWS_SHADOWMASK
@@ -265,6 +277,8 @@ Shader "Nanite/VBufferLitResolve"
 
             #if defined(NANITE_COMPACT_VBUFFER)
             Texture2D<uint2> _NaniteVBufferTex;
+            #elif defined(NANITE_FLOAT2_VBUFFER)
+            Texture2D<float2> _NaniteVBufferTex;
             #else
             TEXTURE2D_FLOAT(_NaniteVBufferTex);
             #endif
@@ -514,22 +528,33 @@ Shader "Nanite/VBufferLitResolve"
                 return o;
             }
 
-            uint2 NaniteVBufferCoord(float2 screenUv)
+            uint2 NaniteVBufferCoord(float2 rawScreenUv)
             {
                 float2 size = _NaniteVBufferSize.x > 1.5 ? _NaniteVBufferSize.xy : _ScreenParams.xy;
                 size = max(size, 1.0);
-                return uint2(min(floor(screenUv * size), size - 1.0));
+                return uint2(clamp(floor(rawScreenUv * size), 0.0, size - 1.0));
             }
 
             GBufferFragOutput frag(Varyings input)
             {
+                // VBuffer addressing and barycentric reconstruction use native
+                // RT coordinates. Lighting keeps URP's orientation-adjusted UV.
+                float2 rawScreenUv = NaniteScreenUvFromPositionCS(
+                    input.positionCS,
+                    _NaniteViewInvSize);
                 float2 screenUv = GetNormalizedScreenSpaceUV(input.positionCS);
-                uint2 pixelCoord = NaniteVBufferCoord(screenUv);
+                uint2 pixelCoord = NaniteVBufferCoord(rawScreenUv);
                 int resolveMaterialId = ResolveMaterialIdInt();
 
                 #if defined(NANITE_COMPACT_VBUFFER)
                 uint2 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
                 NaniteDecodedVBufferIds decoded = NaniteDecodeCompactVBufferIds(
+                    encoded,
+                    InstanceCountInt(),
+                    TriangleCountInt());
+                #elif defined(NANITE_FLOAT2_VBUFFER)
+                float2 encoded = _NaniteVBufferTex.Load(int3(pixelCoord, 0));
+                NaniteDecodedVBufferIds decoded = NaniteDecodeFloat2VBufferIds(
                     encoded,
                     InstanceCountInt(),
                     TriangleCountInt());
@@ -630,17 +655,17 @@ Shader "Nanite/VBufferLitResolve"
                 float4 p1CS = TransformWorldToHClip(p1WS);
                 float4 p2CS = TransformWorldToHClip(p2WS);
 
-                float2 pixelNdc = NaniteNdcFromScreenUv(screenUv);
+                float2 pixelNdc = NaniteNdcFromScreenUv(rawScreenUv);
                 NaniteBarycentrics bary = CalculateTriangleBarycentricsNdc(pixelNdc, p0CS, p1CS, p2CS, _NaniteViewInvSize);
                 float barySum = bary.value.x + bary.value.y + bary.value.z;
                 if (abs(barySum) < 1e-5)
                     discard;
-                // 仅吸收浮点误差带来的微小负分量；不可在 h 符号错误时把重心整体清零。
-                bary.value = max(bary.value, 0.0);
-                float baryClampedSum = bary.value.x + bary.value.y + bary.value.z;
-                if (baryClampedSum < 1e-5)
+                bary.value /= barySum;
+                // Accept only the bounded sample-position mismatch shared by HW
+                // coverage/TAA and fullscreen resolve. Larger disagreement still
+                // indicates a broken VBuffer identity contract and is discarded.
+                if (!NaniteRepairCoveredBarycentrics(bary, 0.01, 1.5))
                     discard;
-                bary.value /= baryClampedSum;
 
                 float2 meshUvDx;
                 float2 meshUvDy;
@@ -660,7 +685,7 @@ Shader "Nanite/VBufferLitResolve"
                     uvDy *= scale;
                 }
                 float3 positionWS = p0WS * bary.value.x + p1WS * bary.value.y + p2WS * bary.value.z;
-                #if defined(NANITE_COMPACT_VBUFFER)
+                #if defined(NANITE_COMPACT_VBUFFER) || defined(NANITE_FLOAT2_VBUFFER)
                 // 由透视正确的 world position 重建，不能直接线性插值三个顶点的 clip z。
                 float deviceDepth = NaniteDeviceDepthFromClip(TransformWorldToHClip(positionWS));
                 #else

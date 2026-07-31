@@ -8,16 +8,16 @@ Texture2D<float> _SourceMip;
 RWTexture2D<float> _DestMip;
 
 int2 _SourceSize;
+int _ReversedZ;
 
 float ReduceDepth(float a, float b, float c, float d)
 {
-#if defined(UNITY_REVERSED_Z)
     // Conservative occlusion needs the farthest depth in the complete tile.
-    // Reversed-Z stores farther samples as smaller values.
-    return min(min(a, b), min(c, d));
-#else
-    return max(max(a, b), max(c, d));
-#endif
+    // This standalone compute does not include the SRP API header that defines
+    // UNITY_REVERSED_Z, so use the runtime graphics-device contract explicitly.
+    float minimum = min(min(a, b), min(c, d));
+    float maximum = max(max(a, b), max(c, d));
+    return _ReversedZ != 0 ? minimum : maximum;
 }
 
 [numthreads(8, 8, 1)]

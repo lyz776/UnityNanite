@@ -2,12 +2,15 @@
 #pragma kernel CSTileClassify
 #pragma kernel CSClearTileBins
 #pragma multi_compile _ NANITE_COMPACT_VBUFFER
+#pragma multi_compile _ NANITE_FLOAT2_VBUFFER
 
 // 每 group 处理一个 tile；64 线程并行扫像素并用 groupshared 归约 mask。
 // 旧版 numthreads(1,1,1) 单线程串行扫 8x8，在 1080p 上可达 ~0.7ms。
 
 #if defined(NANITE_COMPACT_VBUFFER)
 Texture2D<uint2> _NaniteVBufferTex;
+#elif defined(NANITE_FLOAT2_VBUFFER)
+Texture2D<float2> _NaniteVBufferTex;
 #else
 Texture2D<float4> _NaniteVBufferTex;
 #endif
@@ -101,6 +104,31 @@ uint2 DecodeMaterialBits(uint2 encoded)
         familyId > 0 && familyId < 32 ? (1u << familyId) : 0u,
         compatibilityBin > 0 ? (1u << ((uint)compatibilityBin & 31u)) : 0u);
 }
+#elif defined(NANITE_FLOAT2_VBUFFER)
+uint2 DecodeMaterialBits(float2 encoded)
+{
+    if (encoded.x <= 0.0 || encoded.y <= 0.0)
+        return 0u.xx;
+
+    int instanceId = (int)round(encoded.x * ((float)max(1, _InstanceCount) + 1.0)) - 1;
+    int triangleId = (int)round(encoded.y * ((float)max(1, _TriangleCount) + 1.0)) - 1;
+    if (instanceId < 0 || instanceId >= _InstanceCount ||
+        triangleId < 0 || triangleId >= _TriangleCount)
+        return 0u.xx;
+
+    uint2 materialRange = _InstanceMaterialRange[instanceId];
+    int subMeshId = _TriangleSubMesh[triangleId];
+    subMeshId = clamp(subMeshId, 0, max(0, (int)materialRange.y - 1));
+    int materialId = _InstanceSubMeshMaterial[materialRange.x + (uint)subMeshId];
+    if (materialId < 0 || materialId >= _MaterialCount)
+        return 0u.xx;
+    NaniteMaterialData materialData = _NaniteMaterialData[materialId];
+    int familyId = (int)round(materialData.feature0.z);
+    int compatibilityBin = (int)round(materialData.feature0.w);
+    return uint2(
+        familyId > 0 && familyId < 32 ? (1u << familyId) : 0u,
+        compatibilityBin > 0 ? (1u << ((uint)compatibilityBin & 31u)) : 0u);
+}
 #else
 uint2 DecodeMaterialBits(float4 encoded)
 {
@@ -179,6 +207,8 @@ void CSTileClassify(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupTh
 
                 #if defined(NANITE_COMPACT_VBUFFER)
                 uint2 encoded = _NaniteVBufferTex.Load(int3(px, py, 0));
+                #elif defined(NANITE_FLOAT2_VBUFFER)
+                float2 encoded = _NaniteVBufferTex.Load(int3(px, py, 0));
                 #else
                 float4 encoded = _NaniteVBufferTex.Load(int3(px, py, 0));
                 #endif

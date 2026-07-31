@@ -146,6 +146,64 @@ EXPORT_API size_t SimplifyWithAttributes(
 		result_error);
 }
 
+EXPORT_API size_t SimplifyWithUpdate(
+	unsigned int* indices,
+	size_t index_count,
+	float* vertex_positions,
+	size_t vertex_count,
+	size_t vertex_positions_stride,
+	float* vertex_attributes,
+	size_t vertex_attributes_stride,
+	const float* attribute_weights,
+	size_t attribute_count,
+	const unsigned char* vertex_lock,
+	size_t target_index_count,
+	float target_error,
+	unsigned int options,
+	float* result_error)
+{
+	return meshopt_simplifyWithUpdate(
+		indices,
+		index_count,
+		vertex_positions,
+		vertex_count,
+		vertex_positions_stride,
+		vertex_attributes,
+		vertex_attributes_stride,
+		attribute_weights,
+		attribute_count,
+		vertex_lock,
+		target_index_count,
+		target_error,
+		options,
+		result_error);
+}
+
+EXPORT_API size_t SimplifySloppy(
+	unsigned int* destination,
+	const unsigned int* indices,
+	size_t index_count,
+	const float* vertex_positions,
+	size_t vertex_count,
+	size_t vertex_positions_stride,
+	const unsigned char* vertex_lock,
+	size_t target_index_count,
+	float target_error,
+	float* result_error)
+{
+	return meshopt_simplifySloppy(
+		destination,
+		indices,
+		index_count,
+		vertex_positions,
+		vertex_count,
+		vertex_positions_stride,
+		vertex_lock,
+		target_index_count,
+		target_error,
+		result_error);
+}
+
 EXPORT_API float SimplifyScale(
 	const float* vertex_positions,
 	size_t vertex_count,

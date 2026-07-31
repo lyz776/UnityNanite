@@ -1,0 +1,409 @@
+#pragma kernel UpdateSurfaceRadiance
+#pragma kernel CommitSurfaceRadiance
+#pragma target 5.0
+
+#include "../../Shaders/GISceneCommon.hlsl"
+#include "../../Shaders/GIClipmapCommon.hlsl"
+
+struct GILocalLightData
+{
+    float4 positionRange;
+    float4 colorIntensity;
+    float4 directionOuterCos;
+    // x = type (0 point, 1 spot), y = inner cos, z = casts shadow,
+    // w = indirect multiplier.
+    float4 parameters;
+};
+
+StructuredBuffer<uint> _GIRadianceDirtyBricks;
+StructuredBuffer<GIGpuClipmapBrickData> _GITargetBrickData;
+StructuredBuffer<uint> _GITargetOccupancy;
+StructuredBuffer<uint> _GITargetSurface;
+StructuredBuffer<uint> _GITargetSurfaceUV;
+RWStructuredBuffer<uint> _GITargetRadiance;
+RWStructuredBuffer<uint> _GITargetRadianceScratch;
+RWStructuredBuffer<uint> _GITargetValidity;
+RWStructuredBuffer<uint> _GITargetValidityScratch;
+StructuredBuffer<GIMaterialData> _GIMaterials;
+StructuredBuffer<GILocalLightData> _GILocalLights;
+
+StructuredBuffer<GIClipmapLevelData> _GIClipmapLevels;
+StructuredBuffer<int> _GIStaticPageTable;
+StructuredBuffer<uint> _GIStaticOccupancy;
+StructuredBuffer<uint> _GIStaticSurface;
+StructuredBuffer<uint> _GIStaticDistance;
+StructuredBuffer<uint> _GIStaticRadiance;
+StructuredBuffer<uint> _GIStaticValidity;
+StructuredBuffer<int> _GIDynamicPageTable;
+StructuredBuffer<uint> _GIDynamicOccupancy;
+StructuredBuffer<uint> _GIDynamicSurface;
+StructuredBuffer<uint> _GIDynamicDistance;
+StructuredBuffer<uint> _GIDynamicRadiance;
+StructuredBuffer<uint> _GIDynamicValidity;
+Texture2DArray<float4> _GIBaseColorTextures;
+Texture2DArray<float4> _GIEmissionTextures;
+SamplerState sampler_LinearRepeat;
+
+uint _GIRadianceDirtyBrickCount;
+uint _GIMaterialCount;
+uint _GILocalLightCount;
+uint _GIMaxShadowedLocalLights;
+uint _GISecondaryBounceRays;
+uint _GIRadianceFrameIndex;
+uint _GITargetLayer;
+uint _GITextureSliceCount;
+float3 _GIMainLightDirection;
+float3 _GIMainLightColor;
+float3 _GISkyColor;
+float _GIRadianceShadowDistance;
+float _GISecondaryBounceIntensity;
+float _GIRadianceHistoryWeight;
+float _GIRadianceClamp;
+uint _GIEnableRadianceShadows;
+
+uint GILocalCellIndex(uint3 cell)
+{
+    return cell.x + cell.y * GI_BRICK_SIZE + cell.z * GI_BRICK_SIZE * GI_BRICK_SIZE;
+}
+
+bool GITargetCellOccupied(uint physicalBrick, uint localCell)
+{
+    uint word = _GITargetOccupancy[physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u];
+    return (word & (1u << (localCell & 31u))) != 0u;
+}
+
+float3 GIUnpackSurfaceNormal(uint packedSurface)
+{
+    float2 oct = float2(packedSurface & 0xffu, (packedSurface >> 8u) & 0xffu) /
+                 255.0 * 2.0 - 1.0;
+    float3 normal = float3(oct, 1.0 - abs(oct.x) - abs(oct.y));
+    if (normal.z < 0.0)
+    {
+        float2 signNotZero = float2(normal.x >= 0.0 ? 1.0 : -1.0,
+                                    normal.y >= 0.0 ? 1.0 : -1.0);
+        normal.xy = (1.0 - abs(normal.yx)) * signNotZero;
+    }
+    return normalize(normal);
+}
+
+uint GIPackRgb9E5(float3 color)
+{
+    color = clamp(color, 0.0, 65408.0);
+    float maximum = max(color.x, max(color.y, color.z));
+    if (maximum < 1e-9)
+        return 0u;
+    int exponentValue = clamp((int)ceil(log2(maximum)), -15, 16);
+    float scale = exp2((float)exponentValue - 9.0);
+    uint3 mantissa = min((uint3)round(color / scale), 511u);
+    uint exponentBits = (uint)(exponentValue + 15);
+    return mantissa.x | (mantissa.y << 9u) | (mantissa.z << 18u) |
+           (exponentBits << 27u);
+}
+
+float3 GIUnpackRgb9E5(uint packed)
+{
+    if (packed == 0u)
+        return 0.0;
+    uint3 mantissa = uint3(packed & 0x1ffu, (packed >> 9u) & 0x1ffu,
+                           (packed >> 18u) & 0x1ffu);
+    int exponentValue = (int)((packed >> 27u) & 0x1fu) - 15;
+    return (float3)mantissa * exp2((float)exponentValue - 9.0);
+}
+
+uint GIHash(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16u);
+}
+
+float2 GIRandom2(uint seed)
+{
+    return float2(GIHash(seed), GIHash(seed ^ 0x9e3779b9u)) * (1.0 / 4294967296.0);
+}
+
+float3 GICosineHemisphere(float3 normal, float2 randomValue)
+{
+    float radius = sqrt(randomValue.x);
+    float angle = 6.28318530718 * randomValue.y;
+    float3 helper = abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent = normalize(cross(helper, normal));
+    float3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (radius * cos(angle)) +
+                     bitangent * (radius * sin(angle)) +
+                     normal * sqrt(max(0.0, 1.0 - randomValue.x)));
+}
+
+float3 GILobeAxis(uint lobe)
+{
+    if (lobe == 0u) return float3(1.0, 0.0, 0.0);
+    if (lobe == 1u) return float3(-1.0, 0.0, 0.0);
+    if (lobe == 2u) return float3(0.0, 1.0, 0.0);
+    if (lobe == 3u) return float3(0.0, -1.0, 0.0);
+    if (lobe == 4u) return float3(0.0, 0.0, 1.0);
+    return float3(0.0, 0.0, -1.0);
+}
+
+float3 GIReadDirectionalCell(uint physicalBrick, uint localCell, uint hitLayer,
+                             float3 outgoingDirection)
+{
+    uint cellAddress = physicalBrick * GI_CELLS_PER_BRICK + localCell;
+    uint validity = hitLayer == 0u ? _GIStaticValidity[cellAddress] : _GIDynamicValidity[cellAddress];
+    float confidence = (validity & 0xffu) / 255.0;
+    if (confidence <= 0.0)
+        return 0.0;
+    float3 direction = normalize(outgoingDirection);
+    float3 weights = abs(direction);
+    uint xLobe = direction.x >= 0.0 ? 0u : 1u;
+    uint yLobe = direction.y >= 0.0 ? 2u : 3u;
+    uint zLobe = direction.z >= 0.0 ? 4u : 5u;
+    uint baseAddress = physicalBrick * GI_RADIANCE_WORDS_PER_BRICK + localCell * GI_RADIANCE_LOBE_COUNT;
+    float3 x = GIUnpackRgb9E5(hitLayer == 0u ? _GIStaticRadiance[baseAddress + xLobe]
+                                             : _GIDynamicRadiance[baseAddress + xLobe]);
+    float3 y = GIUnpackRgb9E5(hitLayer == 0u ? _GIStaticRadiance[baseAddress + yLobe]
+                                             : _GIDynamicRadiance[baseAddress + yLobe]);
+    float3 z = GIUnpackRgb9E5(hitLayer == 0u ? _GIStaticRadiance[baseAddress + zLobe]
+                                             : _GIDynamicRadiance[baseAddress + zLobe]);
+    return (x * weights.x + y * weights.y + z * weights.z) * confidence;
+}
+
+float3 GIReadCachedRadiance(float3 hitPosition, uint hitLayer, uint hitLevel,
+                            float3 outgoingDirection)
+{
+    GIClipmapLevelData level = _GIClipmapLevels[hitLevel];
+    int3 worldCell = (int3)floor(hitPosition / level.cellSize);
+    int physicalBrick;
+    uint localCell;
+    bool resolved = hitLayer == 0u
+        ? GIResolvePhysicalBrick(level, _GIStaticPageTable, worldCell, physicalBrick, localCell)
+        : GIResolvePhysicalBrick(level, _GIDynamicPageTable, worldCell, physicalBrick, localCell);
+    if (!resolved)
+        return 0.0;
+    return GIReadDirectionalCell((uint)physicalBrick, localCell, hitLayer, outgoingDirection);
+}
+
+bool GITraceScene(float3 origin, float3 direction, float maxDistance, uint preferredLevel,
+                  out float hitT, out uint hitLayer, out uint hitLevel)
+{
+    uint packedSurface;
+    uint traceSteps;
+    return GITraceUnifiedClipmaps(
+        _GIClipmapLevels,
+        _GIStaticPageTable, _GIStaticOccupancy, _GIStaticSurface, _GIStaticDistance,
+        _GIDynamicPageTable, _GIDynamicOccupancy, _GIDynamicSurface, _GIDynamicDistance,
+        origin, direction, maxDistance, preferredLevel,
+        hitT, packedSurface, hitLayer, hitLevel, traceSteps);
+}
+
+float GILocalLightVisibility(float3 worldPosition, float3 normal, float3 lightDirection,
+                             float lightDistance, float cellSize, uint preferredLevel)
+{
+    if (_GIEnableRadianceShadows == 0u)
+        return 1.0;
+    float hitT;
+    uint hitLayer;
+    uint hitLevel;
+    float bias = cellSize * 1.75;
+    float traceDistance = min(_GIRadianceShadowDistance, max(0.0, lightDistance - bias));
+    if (traceDistance <= 0.0)
+        return 1.0;
+    return GITraceScene(worldPosition + normal * bias, lightDirection, traceDistance,
+                        preferredLevel, hitT, hitLayer, hitLevel) ? 0.0 : 1.0;
+}
+
+[numthreads(8, 8, 8)]
+void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIRadianceDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIRadianceDirtyBricks[groupId.x];
+    uint localCell = GILocalCellIndex(threadId);
+    uint outputAddress = physicalBrick * GI_CELLS_PER_BRICK + localCell;
+    if (!GITargetCellOccupied(physicalBrick, localCell))
+    {
+        uint emptyBase = physicalBrick * GI_RADIANCE_WORDS_PER_BRICK +
+                         localCell * GI_RADIANCE_LOBE_COUNT;
+        [unroll]
+        for (uint emptyLobe = 0u; emptyLobe < GI_RADIANCE_LOBE_COUNT; emptyLobe++)
+            _GITargetRadianceScratch[emptyBase + emptyLobe] = 0u;
+        _GITargetValidityScratch[outputAddress] = 0u;
+        return;
+    }
+
+    uint packedSurface = _GITargetSurface[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell];
+    float3 normal = GIUnpackSurfaceNormal(packedSurface);
+    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
+    float3 baseColor = 0.6;
+    float3 emissive = 0.0;
+    float roughness = 0.5;
+    float metallic = 0.0;
+    uint materialRevision = 0u;
+    if (materialIndex < _GIMaterialCount)
+    {
+        GIMaterialData material = _GIMaterials[materialIndex];
+        baseColor = material.baseColor.rgb;
+        emissive = material.emissive.rgb;
+        roughness = material.surface.x;
+        metallic = material.surface.y;
+        materialRevision = material.revision;
+        uint packedUv = _GITargetSurfaceUV[physicalBrick * GI_SURFACE_UV_WORDS_PER_BRICK + localCell];
+        float2 uv = float2(f16tof32(packedUv & 0xffffu), f16tof32(packedUv >> 16u));
+        float mipLevel = min((float)_GITargetBrickData[physicalBrick].level, 6.0);
+        if (materialIndex < _GITextureSliceCount && (material.flags & 8u) != 0u)
+            baseColor *= _GIBaseColorTextures.SampleLevel(
+                sampler_LinearRepeat, float3(uv * material.baseMapST.xy + material.baseMapST.zw,
+                                             materialIndex), mipLevel).rgb;
+        if (materialIndex < _GITextureSliceCount && (material.flags & 16u) != 0u)
+            emissive *= _GIEmissionTextures.SampleLevel(
+                sampler_LinearRepeat, float3(uv * material.emissionMapST.xy + material.emissionMapST.zw,
+                                             materialIndex), mipLevel).rgb;
+    }
+
+    GIGpuClipmapBrickData brick = _GITargetBrickData[physicalBrick];
+    GIClipmapLevelData level = _GIClipmapLevels[brick.level];
+    int3 worldCell = brick.worldBrick * GI_BRICK_SIZE + int3(threadId);
+    float3 worldPosition = ((float3)worldCell + 0.5) * level.cellSize;
+
+    float mainNoL = saturate(dot(normal, -_GIMainLightDirection));
+    float mainVisibility = 1.0;
+    if (_GIEnableRadianceShadows != 0u && mainNoL > 0.0)
+    {
+        float hitT;
+        uint hitLayer;
+        uint hitLevel;
+        mainVisibility = GITraceScene(
+            worldPosition + normal * (level.cellSize * 1.75), -_GIMainLightDirection,
+            _GIRadianceShadowDistance, brick.level, hitT, hitLayer, hitLevel) ? 0.0 : 1.0;
+    }
+
+    float skyVisibility = saturate(normal.y * 0.5 + 0.5);
+    float3 directIrradiance = _GISkyColor * (0.08 + 0.22 * skyVisibility) +
+                              _GIMainLightColor * (mainNoL * mainVisibility) * 0.35;
+    float3 specularLobes[GI_RADIANCE_LOBE_COUNT];
+    float3 f0 = lerp(0.04.xxx, baseColor, metallic);
+    float specularPower = lerp(128.0, 2.0, roughness * roughness);
+    float3 mainReflection = reflect(_GIMainLightDirection, normal);
+    [unroll]
+    for (uint initializeLobe = 0u; initializeLobe < GI_RADIANCE_LOBE_COUNT; initializeLobe++)
+    {
+        float alignment = pow(saturate(dot(GILobeAxis(initializeLobe), mainReflection)), specularPower);
+        specularLobes[initializeLobe] = f0 * _GIMainLightColor *
+            (alignment * mainNoL * mainVisibility * 0.35);
+    }
+
+    uint shadowedLightCount = 0u;
+    [loop]
+    for (uint lightIndex = 0u; lightIndex < _GILocalLightCount; lightIndex++)
+    {
+        GILocalLightData light = _GILocalLights[lightIndex];
+        float3 toLight = light.positionRange.xyz - worldPosition;
+        float distanceSquared = dot(toLight, toLight);
+        float lightDistance = sqrt(max(distanceSquared, 1e-8));
+        if (lightDistance >= light.positionRange.w)
+            continue;
+        float3 lightDirection = toLight / lightDistance;
+        float noL = saturate(dot(normal, lightDirection));
+        if (noL <= 0.0)
+            continue;
+
+        float normalizedDistance = lightDistance / max(light.positionRange.w, 1e-4);
+        float rangeWindow = saturate(1.0 - normalizedDistance * normalizedDistance);
+        float attenuation = rangeWindow * rangeWindow / max(distanceSquared, 0.01);
+        if (light.parameters.x > 0.5)
+        {
+            float coneCos = dot(light.directionOuterCos.xyz, -lightDirection);
+            float cone = smoothstep(light.directionOuterCos.w, light.parameters.y, coneCos);
+            attenuation *= cone;
+        }
+        if (attenuation <= 0.0)
+            continue;
+
+        float visibility = 1.0;
+        if (light.parameters.z > 0.5 && shadowedLightCount < _GIMaxShadowedLocalLights)
+        {
+            visibility = GILocalLightVisibility(worldPosition, normal, lightDirection,
+                                                lightDistance, level.cellSize, brick.level);
+            shadowedLightCount++;
+        }
+        directIrradiance += light.colorIntensity.rgb *
+                            (attenuation * noL * visibility * max(0.0, light.parameters.w));
+        float3 reflectedDirection = reflect(-lightDirection, normal);
+        [unroll]
+        for (uint localLobe = 0u; localLobe < GI_RADIANCE_LOBE_COUNT; localLobe++)
+        {
+            float alignment = pow(saturate(dot(GILobeAxis(localLobe), reflectedDirection)), specularPower);
+            specularLobes[localLobe] += f0 * light.colorIntensity.rgb *
+                (attenuation * noL * visibility * alignment * max(0.0, light.parameters.w));
+        }
+    }
+
+    float3 indirectRadiance = 0.0;
+    uint bounceRayCount = min(_GISecondaryBounceRays, 4u);
+    [loop]
+    for (uint rayIndex = 0u; rayIndex < bounceRayCount; rayIndex++)
+    {
+        uint seed = outputAddress ^ (_GIRadianceFrameIndex * 0x9e3779b9u) ^
+                    (rayIndex * 0x85ebca6bu);
+        float3 rayDirection = GICosineHemisphere(normal, GIRandom2(seed));
+        float hitT;
+        uint hitLayer;
+        uint hitLevel;
+        // Environment lighting is already injected by the explicit low-frequency sky term.
+        // A secondary miss therefore contributes no additional sky energy.
+        float3 incoming = 0.0;
+        if (GITraceScene(worldPosition + normal * (level.cellSize * 1.75), rayDirection,
+                         _GIRadianceShadowDistance, brick.level, hitT, hitLayer, hitLevel))
+            incoming = GIReadCachedRadiance(
+                worldPosition + normal * (level.cellSize * 1.75) + rayDirection * hitT,
+                hitLayer, hitLevel, -rayDirection);
+        indirectRadiance += incoming;
+    }
+    if (bounceRayCount > 0u)
+        indirectRadiance *= _GISecondaryBounceIntensity / (float)bounceRayCount;
+
+    float3 diffuseRadiance = emissive + baseColor * (directIrradiance + indirectRadiance);
+    uint previousValidity = _GITargetLayer == 0u
+        ? _GIStaticValidity[outputAddress] : _GIDynamicValidity[outputAddress];
+    uint previousRevision = previousValidity >> 16u;
+    uint previousConfidence = previousRevision == (materialRevision & 0xffffu)
+        ? (previousValidity & 0xffu) : 0u;
+    float effectiveHistory = saturate(_GIRadianceHistoryWeight) * (previousConfidence / 255.0);
+    uint radianceBase = physicalBrick * GI_RADIANCE_WORDS_PER_BRICK +
+                        localCell * GI_RADIANCE_LOBE_COUNT;
+    [unroll]
+    for (uint outputLobe = 0u; outputLobe < GI_RADIANCE_LOBE_COUNT; outputLobe++)
+    {
+        float hemisphere = dot(normal, GILobeAxis(outputLobe)) > -0.05 ? 1.0 : 0.0;
+        float3 nextRadiance = (diffuseRadiance + specularLobes[outputLobe]) * hemisphere;
+        uint previousPacked = _GITargetLayer == 0u
+            ? _GIStaticRadiance[radianceBase + outputLobe]
+            : _GIDynamicRadiance[radianceBase + outputLobe];
+        nextRadiance = lerp(nextRadiance, GIUnpackRgb9E5(previousPacked), effectiveHistory);
+        _GITargetRadianceScratch[radianceBase + outputLobe] =
+            GIPackRgb9E5(clamp(nextRadiance, 0.0, _GIRadianceClamp));
+    }
+    uint nextConfidence = min(255u, previousConfidence + 64u);
+    uint previousAge = previousRevision == (materialRevision & 0xffffu)
+        ? ((previousValidity >> 8u) & 0xffu) : 0u;
+    uint nextAge = min(255u, previousAge + 1u);
+    _GITargetValidityScratch[outputAddress] = nextConfidence | (nextAge << 8u) |
+                                              ((materialRevision & 0xffffu) << 16u);
+}
+
+[numthreads(8, 8, 8)]
+void CommitSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIRadianceDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIRadianceDirtyBricks[groupId.x];
+    uint localCell = GILocalCellIndex(threadId);
+    uint cellAddress = physicalBrick * GI_CELLS_PER_BRICK + localCell;
+    uint radianceBase = physicalBrick * GI_RADIANCE_WORDS_PER_BRICK +
+                        localCell * GI_RADIANCE_LOBE_COUNT;
+    [unroll]
+    for (uint lobe = 0u; lobe < GI_RADIANCE_LOBE_COUNT; lobe++)
+        _GITargetRadiance[radianceBase + lobe] = _GITargetRadianceScratch[radianceBase + lobe];
+    _GITargetValidity[cellAddress] = _GITargetValidityScratch[cellAddress];
+}

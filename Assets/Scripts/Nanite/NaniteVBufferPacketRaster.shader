@@ -1,12 +1,16 @@
 Shader "Nanite/VBufferPacketRaster"
 {
+    Properties
+    {
+        [HideInInspector] _NaniteCullMode ("Nanite Cull Mode", Float) = 0
+    }
     SubShader
     {
         Tags { "RenderType"="Opaque" "Queue"="Geometry+50" }
         Pass
         {
             Name "VBufferDepthTest"
-            Cull Back
+            Cull [_NaniteCullMode]
             ZTest LEqual
             ZWrite On
             Blend Off
@@ -98,12 +102,18 @@ Shader "Nanite/VBufferPacketRaster"
                 float3 posOS;
                 if (NaniteUsePackedPageGeometry())
                 {
-                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                    if (!NanitePackedLoadPosition(
+                            (uint)triId,
+                            (uint)NaniteResolveWindingCorner(input.vertexID, localToWorld),
+                            posOS))
                         posOS = asfloat(0x7FC00000u).xxx;
                 }
                 else
                 {
-                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    int logicalIndex = NaniteFetchLogicalIndexWinding(
+                        _Indices,
+                        input.vertexID,
+                        localToWorld);
                     posOS = DecodePositionOS(logicalIndex);
                 }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
@@ -140,11 +150,7 @@ Shader "Nanite/VBufferPacketRaster"
         Pass
         {
             Name "VBufferFormal"
-            // Procedural draws do not receive MeshRenderer's automatic winding
-            // correction. Imported/baked Pages may therefore arrive with the
-            // opposite front-face convention on D3D12. Keep the visibility pass
-            // two-sided; depth competition still selects the nearest surface.
-            Cull Off
+            Cull [_NaniteCullMode]
             ZTest LEqual
             ZWrite On
             Blend Off
@@ -155,6 +161,7 @@ Shader "Nanite/VBufferPacketRaster"
             #pragma vertex vert
             #pragma fragment frag
             #pragma multi_compile_local _ NANITE_COMPACT_VBUFFER
+            #pragma multi_compile_local _ NANITE_FLOAT2_VBUFFER
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "NaniteVBufferCommon.hlsl"
             #include "NaniteCompactDraw.hlsl"
@@ -166,6 +173,8 @@ Shader "Nanite/VBufferPacketRaster"
             StructuredBuffer<int> _TriangleInstance;
             StructuredBuffer<float4x4> _InstanceLocalToWorld;
             StructuredBuffer<uint> _ClusterVisible;
+            StructuredBuffer<uint> _IndexedTrianglePackets;
+            StructuredBuffer<uint> _IndexedCameraPacketSlice;
             #include "NanitePackedPage.hlsl"
 
             CBUFFER_START(NaniteRasterUniforms)
@@ -178,6 +187,10 @@ Shader "Nanite/VBufferPacketRaster"
             float _MaxSubMeshCount;
             int _UseIndexedClusterRaster;
             int _GeometryVertexCount;
+            int _IndexedTrianglePacketBase;
+            int _IndexedPacketInstanceBits;
+            uint _IndexedPacketInstanceMask;
+            int _UseIndexedPacketDynamicBase;
             CBUFFER_END
 
             int VertexStrideInt() { return max(3, (int)_VertexStride); }
@@ -187,6 +200,43 @@ Shader "Nanite/VBufferPacketRaster"
             int TriangleCountInt() { return max(0, (int)_TriangleCount); }
             int InstanceCountInt() { return max(0, (int)_InstanceCount); }
             int MaxSubMeshCountInt() { return max(1, (int)_MaxSubMeshCount); }
+
+            float4 ApplyDeterministicDepthTieBreak(float4 positionCS, int triId)
+            {
+                // Visible clusters are produced by GPU append queues, whose
+                // completion order is intentionally undefined.  With LEqual,
+                // exactly coplanar trim/material triangles otherwise choose a
+                // different VBuffer owner from frame to frame.  Preserve the
+                // ordinary MeshRenderer submesh ordering, then use the immutable
+                // triangle id as a stable tie break inside one material.  The
+                // offset is below a pixel's geometric depth resolution and only
+                // changes winners that are effectively equal-depth.
+                int subMesh = HasTriangleSubMeshInt() != 0
+                    ? max(0, _TriangleSubMesh[triId])
+                    : 0;
+                // A monotonic 16-bit triangle fraction leaves adjacent/copied
+                // triangle ids closer than one depth ULP, so a few coplanar
+                // pixels can still alternate with GPU queue order. Hash the full
+                // immutable id into resolvable buckets; material order remains
+                // the primary key and the result is independent of append order.
+                uint triangleRank = asuint(triId);
+                triangleRank = (triangleRank ^ 61u) ^ (triangleRank >> 16u);
+                triangleRank *= 9u;
+                triangleRank ^= triangleRank >> 4u;
+                triangleRank *= 0x27d4eb2du;
+                triangleRank ^= triangleRank >> 15u;
+                triangleRank &= 1023u;
+                float materialRank = ((float)subMesh +
+                    ((float)triangleRank + 0.5) / 1024.0) /
+                    (float)(MaxSubMeshCountInt() + 1);
+                const float kTieBreakDepth = 1.0e-5;
+                #if UNITY_REVERSED_Z
+                positionCS.z += positionCS.w * kTieBreakDepth * materialRank;
+                #else
+                positionCS.z -= positionCS.w * kTieBreakDepth * materialRank;
+                #endif
+                return positionCS;
+            }
 
             struct Attributes
             {
@@ -213,21 +263,35 @@ Shader "Nanite/VBufferPacketRaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
-                if (_UseIndexedClusterRaster > 0.5 && _GeometryVertexCount > 0.5)
+                if (_UseIndexedClusterRaster > 0.5)
                 {
-                    uint geometryVertexCount = (uint)_GeometryVertexCount;
-                    int instance = (int)(input.vertexID / geometryVertexCount);
-                    int logicalVertex = (int)(input.vertexID % geometryVertexCount);
+                    uint packetBase = _UseIndexedPacketDynamicBase != 0
+                        ? _IndexedCameraPacketSlice[0]
+                        : (uint)max(0, _IndexedTrianglePacketBase);
+                    uint packet = _IndexedTrianglePackets[packetBase + input.vertexID / 3u];
+                    int triId = (int)(packet >> (uint)_IndexedPacketInstanceBits);
+                    int instance = (int)(packet & _IndexedPacketInstanceMask);
+                    float4x4 localToWorld = _InstanceLocalToWorld[instance];
                     float3 posOS;
                     if (NaniteUsePackedPageGeometry())
-                        posOS = _NaniteResidentVertices[logicalVertex].positionOS;
+                    {
+                        if (!NanitePackedLoadPosition(
+                                (uint)triId,
+                                (uint)NaniteResolveWindingCorner(input.vertexID, localToWorld),
+                                posOS))
+                            posOS = asfloat(0x7FC00000u).xxx;
+                    }
                     else
+                    {
+                        int corner = NaniteResolveWindingCorner(input.vertexID, localToWorld);
+                        int logicalVertex = _Indices[triId * 3 + corner];
                         posOS = DecodePositionOS(logicalVertex);
-                    float3 posWS = mul(_InstanceLocalToWorld[instance], float4(posOS, 1.0)).xyz;
+                    }
+                    float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                     o.positionCS = TransformWorldToHClip(posWS);
+                    o.positionCS = ApplyDeterministicDepthTieBreak(o.positionCS, triId);
                     o.packedInstance = (float)instance;
-                    // Indexed raster resolves the exact triangle from SV_PrimitiveID.
-                    o.triId = 0u;
+                    o.triId = (uint)triId;
                     return o;
                 }
                 if (!NaniteCompactedTriangleValid(input.vertexID))
@@ -266,29 +330,36 @@ Shader "Nanite/VBufferPacketRaster"
                 float3 posOS;
                 if (NaniteUsePackedPageGeometry())
                 {
-                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                    if (!NanitePackedLoadPosition(
+                            (uint)triId,
+                            (uint)NaniteResolveWindingCorner(input.vertexID, localToWorld),
+                            posOS))
                         posOS = asfloat(0x7FC00000u).xxx;
                 }
                 else
                 {
-                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    int logicalIndex = NaniteFetchLogicalIndexWinding(
+                        _Indices,
+                        input.vertexID,
+                        localToWorld);
                     posOS = DecodePositionOS(logicalIndex);
                 }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                 o.positionCS = TransformWorldToHClip(posWS);
+                o.positionCS = ApplyDeterministicDepthTieBreak(o.positionCS, triId);
                 o.packedInstance = (float)instance;
                 return o;
             }
 
             #if defined(NANITE_COMPACT_VBUFFER)
             uint2 frag(Varyings i, uint primitiveId : SV_PrimitiveID) : SV_Target
+            #elif defined(NANITE_FLOAT2_VBUFFER)
+            float2 frag(Varyings i, uint primitiveId : SV_PrimitiveID) : SV_Target
             #else
             float4 frag(Varyings i, uint primitiveId : SV_PrimitiveID) : SV_Target
             #endif
             {
-                int triId = _UseIndexedClusterRaster > 0.5
-                    ? NaniteResolveTriangleIdFromPrimitive(primitiveId)
-                    : (int)i.triId;
+                int triId = (int)i.triId;
                 int subMeshId = 0;
                 if (HasTriangleSubMeshInt() != 0)
                     subMeshId = max(0, _TriangleSubMesh[triId]);
@@ -296,6 +367,12 @@ Shader "Nanite/VBufferPacketRaster"
 
                 #if defined(NANITE_COMPACT_VBUFFER)
                 return NaniteEncodeCompactVBufferIds(instanceId, triId);
+                #elif defined(NANITE_FLOAT2_VBUFFER)
+                return NaniteEncodeFloat2VBufferIds(
+                    instanceId,
+                    triId,
+                    InstanceCountInt(),
+                    TriangleCountInt());
                 #else
                 float depth01 = NanitePackDepth01(i.positionCS);
                 return NaniteEncodeVBufferIds(
@@ -316,7 +393,7 @@ Shader "Nanite/VBufferPacketRaster"
         Pass
         {
             Name "DebugColorViz"
-            Cull Back
+            Cull Off
             ZTest LEqual
             ZWrite On
             Blend Off
@@ -419,12 +496,18 @@ Shader "Nanite/VBufferPacketRaster"
                 float3 posOS;
                 if (NaniteUsePackedPageGeometry())
                 {
-                    if (!NanitePackedLoadPosition((uint)triId, (uint)NaniteResolveCorner(input.vertexID), posOS))
+                    if (!NanitePackedLoadPosition(
+                            (uint)triId,
+                            (uint)NaniteResolveWindingCorner(input.vertexID, localToWorld),
+                            posOS))
                         posOS = asfloat(0x7FC00000u).xxx;
                 }
                 else
                 {
-                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    int logicalIndex = NaniteFetchLogicalIndexWinding(
+                        _Indices,
+                        input.vertexID,
+                        localToWorld);
                     posOS = DecodePositionOS(logicalIndex);
                 }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
@@ -488,15 +571,23 @@ Shader "Nanite/VBufferPacketRaster"
             #pragma fragment fragHybridMerge
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "NaniteVBufferCommon.hlsl"
 
             Texture2D<uint> _NaniteSoftwareDepth;
             Texture2D<uint> _NaniteSoftwareWinner;
             StructuredBuffer<uint3> _NaniteSoftwareClusters;
             StructuredBuffer<uint> _NaniteSoftwareTileList;
+            StructuredBuffer<int> _TriangleSubMesh;
             uint _NaniteSoftwareScreenWidth;
             uint _NaniteSoftwareScreenHeight;
             uint _NaniteSoftwareTileCountX;
             uint _NaniteSoftwareTileSize;
+            float _NaniteHybridFloat2VBuffer;
+            float _UseNormalizedIds;
+            float _TriangleCount;
+            float _InstanceCount;
+            float _MaxSubMeshCount;
+            float _HasTriangleSubMesh;
 
             struct Attributes
             {
@@ -512,27 +603,17 @@ Shader "Nanite/VBufferPacketRaster"
             Varyings vertHybridTiles(Attributes input)
             {
                 Varyings output;
-                uint tileIndex = _NaniteSoftwareTileList[input.instanceID];
-                uint tileCountX = max(1u, _NaniteSoftwareTileCountX);
-                uint2 tileCoord = uint2(tileIndex % tileCountX, tileIndex / tileCountX);
-                uint cornerIndex = input.vertexID % 6u;
-                float2 corner = float2(
-                    (cornerIndex == 1u || cornerIndex >= 4u) ? 1.0 : 0.0,
-                    (cornerIndex == 2u || cornerIndex == 3u || cornerIndex == 5u) ? 1.0 : 0.0);
-                float tileSize = max(1.0, (float)_NaniteSoftwareTileSize);
-                float2 screenSize = max(
-                    float2(_NaniteSoftwareScreenWidth, _NaniteSoftwareScreenHeight),
-                    1.0.xx);
-                float2 pixelMin = float2(tileCoord) * tileSize;
-                float2 pixelMax = min(pixelMin + tileSize, screenSize);
-                float2 uv = lerp(pixelMin, pixelMax, corner) / screenSize;
-                float2 ndc = uv * 2.0 - 1.0;
-                ndc.y = -ndc.y;
-                output.positionCS = float4(ndc, UNITY_RAW_FAR_CLIP_VALUE, 1.0);
+                // A full-screen merge is the portable correctness baseline. The
+                // old instanced tile-quad merge consumed an indirect instance
+                // count that Unity could leave at zero across async-compute /
+                // graphics queues, so SW depth existed but no visibility IDs
+                // reached resolve. Empty pixels discard below; the expensive
+                // barycentric work remains confined to the compute tile queue.
+                output.positionCS = GetFullScreenTriangleVertexPosition(input.vertexID);
                 return output;
             }
 
-            uint2 fragHybridMerge(Varyings input, out float outputDepth : SV_Depth) : SV_Target
+            float2 fragHybridMerge(Varyings input, out float outputDepth : SV_Depth) : SV_Target
             {
                 uint2 pixel = uint2(input.positionCS.xy);
                 if (pixel.x >= _NaniteSoftwareScreenWidth ||
@@ -552,7 +633,15 @@ Shader "Nanite/VBufferPacketRaster"
 
                 outputDepth = asfloat(_NaniteSoftwareDepth.Load(int3(pixel, 0)));
                 uint triangleId = draw.x + triangleInCluster;
-                return uint2(draw.z + 1u, triangleId + 1u);
+                // Hybrid is negotiated only for the portable RG32F VBuffer.
+                // Keep this pass on one fixed return ABI: a shared material's
+                // local keyword state is not a safe render-graph contract when
+                // camera, shadow and resolve passes record/execute independently.
+                return NaniteEncodeFloat2VBufferIds(
+                    (int)draw.z,
+                    (int)triangleId,
+                    max(1, (int)_InstanceCount),
+                    max(1, (int)_TriangleCount));
             }
             ENDHLSL
         }

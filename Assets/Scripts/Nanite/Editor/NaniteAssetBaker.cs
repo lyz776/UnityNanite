@@ -105,6 +105,7 @@ namespace Nanite.Editor
             public int groupMipMismatch;
             public int invalidBoundsOrErrors;
             public int errorMonotonicityViolations;
+            public int geometrySphereContainmentViolations;
             public int parentSphereContainmentViolations;
             public int groupSphereContainmentViolations;
             public int parentMetadataMismatch;
@@ -121,6 +122,7 @@ namespace Nanite.Editor
                 groupMipMismatch != 0 ||
                 invalidBoundsOrErrors != 0 ||
                 errorMonotonicityViolations != 0 ||
+                geometrySphereContainmentViolations != 0 ||
                 parentSphereContainmentViolations != 0 ||
                 groupSphereContainmentViolations != 0 ||
                 parentMetadataMismatch != 0 ||
@@ -148,7 +150,8 @@ namespace Nanite.Editor
                     $"singletons={singletonGroups}, depth={maxMip}, boundaryVertexDup={boundaryDuplication:P2}\n" +
                     $"  DAG contract: membershipMissing={missingClusterMembership}, membershipDuplicate={duplicateClusterMembership}, " +
                     $"mipMismatch={groupMipMismatch}, invalid={invalidBoundsOrErrors}, " +
-                    $"errorMonotonic={errorMonotonicityViolations}, parentContainment={parentSphereContainmentViolations}, " +
+                    $"errorMonotonic={errorMonotonicityViolations}, geometryContainment={geometrySphereContainmentViolations}, " +
+                    $"parentContainment={parentSphereContainmentViolations}, " +
                     $"groupContainment={groupSphereContainmentViolations}, parentMetadata={parentMetadataMismatch}, " +
                     $"groupErrorRange={groupErrorRangeViolations}, triangleReduction={triangleReductionViolations}, " +
                     $"maxMip={maxMipMismatch}\n" +
@@ -226,6 +229,7 @@ namespace Nanite.Editor
                 var normals = mesh.normals;
                 var uvs = mesh.uv;
                 var tangents = mesh.tangents;
+                var buildGeometry = new NaniteBuildGeometry(vertices, normals, uvs, tangents);
                 int subMeshCount = mesh.subMeshCount;
 
                 Debug.Log($"[Nanite] Bake 开始: mesh={mesh.name}, vertices={vertices.Length}, subMeshes={subMeshCount}");
@@ -245,10 +249,7 @@ namespace Nanite.Editor
                     var triangles = mesh.GetTriangles(i);
                     sourceTriangleCount += triangles.Length / 3;
                     var subMesh = NaniteMeshBuilder.Build(
-                        vertices,
-                        normals,
-                        uvs,
-                        tangents,
+                        buildGeometry,
                         triangles,
                         () => sCancelRequested);
                     subMeshList.Add(subMesh);
@@ -261,6 +262,19 @@ namespace Nanite.Editor
                         $"maxMip={subMesh.maxMipLevel}, {subTimer.ElapsedMilliseconds} ms");
                 }
                 dagMs = stageTimer.ElapsedMilliseconds;
+
+                // Coarse LODs may own optimized vertices. Every downstream audit,
+                // Page estimate and Page pack must consume the same bake arena;
+                // falling back to mesh.vertices here would reinterpret generated
+                // indices and manifests as distance-dependent holes/UV corruption.
+                vertices = buildGeometry.positions.ToArray();
+                normals = buildGeometry.normals.ToArray();
+                uvs = buildGeometry.uvs.ToArray();
+                tangents = buildGeometry.tangents.ToArray();
+                CalculateMeshPositionGrid(
+                    vertices,
+                    out Vector3 meshPositionMin,
+                    out Vector3 meshPositionExtent);
 
                 HierarchyQualityAudit hierarchyAudit = AuditHierarchyQuality(
                     subMeshList,
@@ -280,7 +294,7 @@ namespace Nanite.Editor
                 var buildParts = BuildPartsFromGroups(subMeshList);
                 buildParts = OrderPartsForStreaming(buildParts);
                 int buildPartCount = buildParts.Count;
-                var pageRanges = PlanPageRanges(buildParts, subMeshList, TargetPageBytes);
+                var pageRanges = PlanPageRanges(buildParts, subMeshList, uvs, TargetPageBytes);
                 int pageCount = pageRanges.Count;
                 partMs = stageTimer.ElapsedMilliseconds;
 
@@ -338,6 +352,8 @@ namespace Nanite.Editor
 
                     if (!NanitePageBinaryCodec.TryEncode(
                             page,
+                            meshPositionMin,
+                            meshPositionExtent,
                             out byte[] binaryBlob,
                             out NanitePageBinaryStats binaryStats,
                             out string binaryError))
@@ -473,11 +489,9 @@ namespace Nanite.Editor
                     byte[] pageBlob = builtPages[pageIdx].blob;
                     Buffer.BlockCopy(pageBlob, 0, bulkPayload, bulkOffsets[pageIdx], pageBlob.Length);
                 }
-                string bulkBinaryPath = $"{basePath}_pages.bytes";
+                string streamingRelativePath = BuildStreamingRelativePath(mesh, meshAssetPath);
+                string bulkBinaryPath = "Assets/StreamingAssets/" + streamingRelativePath;
                 WriteBinaryAsset(bulkBinaryPath, bulkPayload);
-                var bulkBinaryAsset = AssetDatabase.LoadAssetAtPath<TextAsset>(bulkBinaryPath);
-                if (bulkBinaryAsset == null)
-                    throw new InvalidDataException($"Bulk Page payload could not be imported: {bulkBinaryPath}");
                 usedGeneratedAssets.Add(bulkBinaryPath);
 
                 for (int pageIdx = 0; pageIdx < pageCount; pageIdx++)
@@ -487,10 +501,11 @@ namespace Nanite.Editor
 
                     BuiltPage builtPage = builtPages[pageIdx];
                     builtPage.page.SetBinaryPayload(
-                        bulkBinaryAsset,
+                        null,
                         builtPage.stats,
                         bulkOffsets[pageIdx],
-                        builtPage.blob.Length);
+                        builtPage.blob.Length,
+                        streamingRelativePath);
                     if (!builtPage.page.StripLegacyGeometryPayload(out string stripError))
                         throw new InvalidDataException($"Page {pageIdx} legacy geometry strip failed: {stripError}");
 
@@ -653,6 +668,13 @@ namespace Nanite.Editor
                         audit.errorMonotonicityViolations++;
                     }
 
+                    float geometryContainmentTolerance = Mathf.Max(1e-4f, cluster.self.radius * 1e-4f);
+                    if (Vector3.Distance(cluster.geometry.center, cluster.self.center) + cluster.geometry.radius >
+                        cluster.self.radius + geometryContainmentTolerance)
+                    {
+                        audit.geometrySphereContainmentViolations++;
+                    }
+
                     float containmentTolerance = Mathf.Max(1e-4f, cluster.parent.radius * 1e-4f);
                     if (Vector3.Distance(cluster.self.center, cluster.parent.center) + cluster.self.radius >
                         cluster.parent.radius + containmentTolerance)
@@ -784,6 +806,23 @@ namespace Nanite.Editor
             !float.IsNaN(value.y) && !float.IsInfinity(value.y) &&
             !float.IsNaN(value.z) && !float.IsInfinity(value.z);
 
+        static void CalculateMeshPositionGrid(
+            Vector3[] vertices,
+            out Vector3 minimum,
+            out Vector3 extent)
+        {
+            if (vertices == null || vertices.Length == 0)
+                throw new InvalidDataException("Cannot quantize an empty Nanite mesh.");
+            minimum = vertices[0];
+            Vector3 maximum = vertices[0];
+            for (int vertexIndex = 1; vertexIndex < vertices.Length; vertexIndex++)
+            {
+                minimum = Vector3.Min(minimum, vertices[vertexIndex]);
+                maximum = Vector3.Max(maximum, vertices[vertexIndex]);
+            }
+            extent = maximum - minimum;
+        }
+
         static bool IsValidLodError(float value) =>
             !float.IsNaN(value) && !float.IsInfinity(value) && value >= 0f;
 
@@ -812,6 +851,7 @@ namespace Nanite.Editor
         static List<PageRange> PlanPageRanges(
             List<BuildPart> buildParts,
             List<NaniteSubMesh> subMeshes,
+            Vector2[] uvs,
             int targetBytes)
         {
             var ranges = new List<PageRange>();
@@ -822,6 +862,7 @@ namespace Nanite.Editor
             int clusterCount = 0;
             int indexCount = 0;
             int maxMip = 0;
+            int floatUvVertexCount = 0;
             int partIndex = 0;
 
             while (partIndex < buildParts.Count)
@@ -839,6 +880,7 @@ namespace Nanite.Editor
                     clusterCount = 0;
                     indexCount = 0;
                     maxMip = 0;
+                    floatUvVertexCount = 0;
                     uniqueVertices.Clear();
                     continue;
                 }
@@ -863,6 +905,7 @@ namespace Nanite.Editor
                     int probeClusters = clusterCount;
                     int probeIndices = indexCount;
                     int probeMaxMip = maxMip;
+                    int probeFloatUvVertexCount = floatUvVertexCount;
                     for (int probePartIndex = partIndex; probePartIndex < groupEnd; probePartIndex++)
                     {
                         BuildPart probePart = buildParts[probePartIndex];
@@ -874,7 +917,11 @@ namespace Nanite.Editor
                             probeClusters++;
                             probeIndices += cluster.indices.Length;
                             for (int i = 0; i < cluster.indices.Length; i++)
-                                probeVertices.Add(cluster.indices[i]);
+                            {
+                                int vertex = cluster.indices[i];
+                                if (probeVertices.Add(vertex) && VertexRequiresFloatUv(vertex, uvs))
+                                    probeFloatUvVertexCount++;
+                            }
                         }
                     }
 
@@ -884,7 +931,8 @@ namespace Nanite.Editor
                         probeIndices,
                         probeClusters,
                         probePartCount,
-                        probeMaxMip);
+                        probeMaxMip,
+                        probeFloatUvVertexCount > 0);
                     if (probeBytes > targetBytes || probePartCount > MaxPartPerPage)
                     {
                         ranges.Add(new PageRange { startPart = startPart, partCount = partCount });
@@ -893,6 +941,7 @@ namespace Nanite.Editor
                         clusterCount = 0;
                         indexCount = 0;
                         maxMip = 0;
+                        floatUvVertexCount = 0;
                         uniqueVertices.Clear();
                         continue;
                     }
@@ -902,6 +951,7 @@ namespace Nanite.Editor
                 addedVertices.Clear();
                 int addedClusters = 0;
                 int addedIndices = 0;
+                int addedFloatUvVertices = 0;
 
                 for (int c = 0; c < candidate.clusterIndices.Count; c++)
                 {
@@ -912,7 +962,11 @@ namespace Nanite.Editor
                     {
                         int vertex = cluster.indices[i];
                         if (uniqueVertices.Add(vertex))
+                        {
                             addedVertices.Add(vertex);
+                            if (VertexRequiresFloatUv(vertex, uvs))
+                                addedFloatUvVertices++;
+                        }
                     }
                 }
 
@@ -925,7 +979,8 @@ namespace Nanite.Editor
                     tentativeIndices,
                     tentativeClusters,
                     tentativeParts,
-                    tentativeMaxMip);
+                    tentativeMaxMip,
+                    floatUvVertexCount + addedFloatUvVertices > 0);
 
                 bool exceedsBudget = partCount > 0 && estimatedBytes > targetBytes;
                 bool exceedsPartLimit = partCount >= MaxPartPerPage;
@@ -939,10 +994,12 @@ namespace Nanite.Editor
                     clusterCount = 0;
                     indexCount = 0;
                     maxMip = 0;
+                    floatUvVertexCount = 0;
                     uniqueVertices.Clear();
                     continue;
                 }
 
+                floatUvVertexCount += addedFloatUvVertices;
                 partCount = tentativeParts;
                 clusterCount = tentativeClusters;
                 indexCount = tentativeIndices;
@@ -995,8 +1052,8 @@ namespace Nanite.Editor
                 }
             }
 
-            // One indivisible ClusterGroup can still exceed the real encoded size because the
-            // estimator assumes half UVs. In that case split Parts as the last-resort fallback.
+            // One indivisible ClusterGroup can still exceed the real encoded size because of
+            // conservative metadata/alignment estimates. Split Parts only as a last resort.
             return midpoint;
         }
 
@@ -1078,10 +1135,11 @@ namespace Nanite.Editor
             int indexCount,
             int clusterCount,
             int partCount,
-            int maxMip)
+            int maxMip,
+            bool floatUv)
         {
             long bytes = NanitePageBinaryCodec.HeaderSize;
-            bytes += (long)vertexCount * 20; // V1 half-UV vertex record; exact encoder enforces the hard limit.
+            bytes += (long)vertexCount * (floatUv ? 24 : 20);
             bytes += (long)indexCount * (vertexCount <= ushort.MaxValue ? 2 : 4);
             bytes += (long)clusterCount * NanitePageBinaryCodec.ClusterRecordBytes;
             bytes += (long)partCount * 48;
@@ -1090,6 +1148,14 @@ namespace Nanite.Editor
             bytes += (long)(maxMip + 1) * sizeof(int);
             bytes += 32; // Section alignment slack.
             return bytes >= int.MaxValue ? int.MaxValue : (int)bytes;
+        }
+
+        static bool VertexRequiresFloatUv(int vertexIndex, Vector2[] uvs)
+        {
+            if (uvs == null || (uint)vertexIndex >= (uint)uvs.Length)
+                return false;
+            Vector2 uv = uvs[vertexIndex];
+            return NanitePageBinaryCodec.UvRequiresFloatStorage(uv.x, uv.y);
         }
 
         static NaniteMeshPage BuildPage(
@@ -1203,11 +1269,14 @@ namespace Nanite.Editor
                 if (!string.IsNullOrEmpty(pagePath) &&
                     !string.Equals(pagePath, meshPath, StringComparison.OrdinalIgnoreCase))
                     paths.Add(pagePath);
-                if (page.BinaryPayload == null)
-                    continue;
-                string binaryPath = AssetDatabase.GetAssetPath(page.BinaryPayload);
-                if (!string.IsNullOrEmpty(binaryPath))
-                    paths.Add(binaryPath);
+                if (page.BinaryPayload != null)
+                {
+                    string binaryPath = AssetDatabase.GetAssetPath(page.BinaryPayload);
+                    if (!string.IsNullOrEmpty(binaryPath))
+                        paths.Add(binaryPath);
+                }
+                if (page.HasStreamingPayload)
+                    paths.Add("Assets/StreamingAssets/" + page.StreamingRelativePath);
             }
             return paths;
         }
@@ -1278,8 +1347,26 @@ namespace Nanite.Editor
             if (!fullPath.StartsWith(fullProjectRoot, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"Binary Page path escaped the Unity project: {assetPath}");
 
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath) ?? fullProjectRoot);
             File.WriteAllBytes(fullPath, bytes);
             AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate);
+        }
+
+        static string BuildStreamingRelativePath(Mesh mesh, string meshAssetPath)
+        {
+            string guid;
+            long localId;
+            if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(mesh, out guid, out localId) ||
+                string.IsNullOrEmpty(guid))
+            {
+                guid = AssetDatabase.AssetPathToGUID(meshAssetPath);
+                localId = mesh != null ? mesh.GetInstanceID() : 0;
+            }
+            if (string.IsNullOrEmpty(guid))
+                guid = Hash128.Compute(meshAssetPath ?? "NaniteMesh").ToString();
+
+            string local = unchecked((ulong)localId).ToString("X16");
+            return $"NanitePages/{guid}_{local}.npages";
         }
 
         static void UpdateProgress(string message, float progress)
@@ -1576,7 +1663,10 @@ namespace Nanite.Editor
                         coarseClusterStart = coarseStart,
                         coarseClusterCount = coarseCount,
                         mipLevel = sourceGroup?.mipLevel ?? 0,
-                        flags = rootSet ? NaniteHierarchyGroup.RootSetFlag : 0
+                        flags = (rootSet ? NaniteHierarchyGroup.RootSetFlag : 0) |
+                                (sourceGroup != null && sourceGroup.usesRobustUvGate
+                                    ? NaniteHierarchyGroup.RobustUvGateFlag
+                                    : 0)
                     };
                 }
             }
@@ -1604,6 +1694,7 @@ namespace Nanite.Editor
             if (sourceClusterIndices == null)
                 return;
 
+            var uniqueGeometryClusters = new HashSet<int>();
             for (int index = 0; index < sourceClusterIndices.Count; index++)
             {
                 NaniteHierarchyClusterRef clusterRef = ResolveSourceClusterRef(
@@ -1611,6 +1702,12 @@ namespace Nanite.Editor
                     subMeshIndex,
                     sourceClusterIndices[index],
                     context);
+                if (!uniqueGeometryClusters.Add(clusterRef.geometryClusterIndex))
+                {
+                    throw new InvalidDataException(
+                        $"Duplicate Geometry Cluster {clusterRef.geometryClusterIndex} in {context}. " +
+                        "A hierarchy edge must be a set; duplicate refs can schedule the same producer twice.");
+                }
                 clusterRef.refinementGroupIndex =
                     producerGroupByGeometryCluster[clusterRef.geometryClusterIndex];
                 destination.Add(clusterRef);

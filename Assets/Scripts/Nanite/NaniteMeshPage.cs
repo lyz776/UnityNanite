@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using UnityEngine;
 using UnityEngine.Serialization;
 
@@ -10,6 +11,7 @@ namespace Nanite
     {
         [Header("Versioned Page Payload")]
         [SerializeField] TextAsset binaryPayload;
+        [SerializeField] string streamingRelativePath;
         [SerializeField] int binaryPayloadOffset;
         [SerializeField] int binaryPayloadSize;
         [SerializeField] NanitePageBinaryStats binaryStats;
@@ -41,10 +43,11 @@ namespace Nanite
         {
             get
             {
-                EnsureLegacyPayload(out _);
-                return legacyIndices != null && legacyIndices.Length > 0
-                    ? legacyIndices
-                    : decodedIndices ?? Array.Empty<int>();
+                if (legacyIndices != null && legacyIndices.Length > 0)
+                    return legacyIndices;
+                if (decodedIndices == null || decodedIndices.Length == 0)
+                    EnsureLegacyPayload(out _);
+                return decodedIndices ?? Array.Empty<int>();
             }
             set
             {
@@ -58,10 +61,11 @@ namespace Nanite
         {
             get
             {
-                EnsureLegacyPayload(out _);
-                return legacyVertexData != null && legacyVertexData.Length > 0
-                    ? legacyVertexData
-                    : decodedVertexData ?? Array.Empty<float>();
+                if (legacyVertexData != null && legacyVertexData.Length > 0)
+                    return legacyVertexData;
+                if (decodedVertexData == null || decodedVertexData.Length == 0)
+                    EnsureLegacyPayload(out _);
+                return decodedVertexData ?? Array.Empty<float>();
             }
             set
             {
@@ -72,12 +76,16 @@ namespace Nanite
         }
 
         public TextAsset BinaryPayload => binaryPayload;
+        public string StreamingRelativePath => streamingRelativePath ?? string.Empty;
         public int BinaryPayloadOffset => Mathf.Max(0, binaryPayloadOffset);
         public int BinaryPayloadSize => binaryPayloadSize > 0
             ? binaryPayloadSize
             : (binaryPayload != null ? binaryPayload.bytes.Length : 0);
         public NanitePageBinaryStats BinaryStats => binaryStats;
-        public bool HasBinaryPayload => binaryPayload != null;
+        public int BinaryVertexCount => ResolveBinaryCount(vertex: true);
+        public int BinaryIndexCount => ResolveBinaryCount(vertex: false);
+        public bool HasStreamingPayload => !string.IsNullOrWhiteSpace(streamingRelativePath);
+        public bool HasBinaryPayload => binaryPayload != null || HasStreamingPayload;
 
         public bool HasLegacyPayload =>
             legacyVertexData != null && legacyVertexData.Length > 0 &&
@@ -92,9 +100,11 @@ namespace Nanite
             TextAsset payload,
             NanitePageBinaryStats stats,
             int payloadOffset = 0,
-            int payloadSize = -1)
+            int payloadSize = -1,
+            string relativeStreamingPath = null)
         {
             binaryPayload = payload;
+            streamingRelativePath = NormalizeStreamingRelativePath(relativeStreamingPath);
             binaryPayloadOffset = Mathf.Max(0, payloadOffset);
             binaryPayloadSize = payloadSize > 0
                 ? payloadSize
@@ -103,12 +113,65 @@ namespace Nanite
             ResetDecodeState();
         }
 
+        public bool TryResolveStreamingFilePath(out string fullPath, out string error)
+        {
+            fullPath = null;
+            error = null;
+            if (!HasStreamingPayload)
+            {
+                error = "Page has no StreamingAssets payload.";
+                return false;
+            }
+
+            try
+            {
+                string relative = NormalizeStreamingRelativePath(streamingRelativePath);
+                if (string.IsNullOrEmpty(relative) || Path.IsPathRooted(relative))
+                {
+                    error = $"Invalid StreamingAssets Page path: '{streamingRelativePath}'.";
+                    return false;
+                }
+
+                string root = Path.GetFullPath(Application.streamingAssetsPath);
+                string rootWithSeparator = root.TrimEnd(
+                    Path.DirectorySeparatorChar,
+                    Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                string candidate = Path.GetFullPath(Path.Combine(
+                    root,
+                    relative.Replace('/', Path.DirectorySeparatorChar)));
+                if (!candidate.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase))
+                {
+                    error = $"Streaming Page path escaped StreamingAssets: '{streamingRelativePath}'.";
+                    return false;
+                }
+
+                fullPath = candidate;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                error = $"Could not resolve StreamingAssets Page path '{streamingRelativePath}': {exception.Message}";
+                return false;
+            }
+        }
+
         public bool TryGetStoragePayload(out byte[] storagePayload, out string error)
         {
             storagePayload = null;
-            if (binaryPayload == null)
+            if (HasStreamingPayload)
             {
-                error = "Page has no binary payload.";
+                if (!TryResolveStreamingFilePath(out string fullPath, out error))
+                    return false;
+                return TryReadFileRange(
+                    fullPath,
+                    BinaryPayloadOffset,
+                    BinaryPayloadSize,
+                    out storagePayload,
+                    out error);
+            }
+            if (!HasBinaryPayload)
+            {
+                error = $"Page has no binary payload (streaming='{streamingRelativePath ?? "<null>"}', text={(binaryPayload != null)}).";
                 return false;
             }
 
@@ -153,14 +216,18 @@ namespace Nanite
         public bool TryDecodeBinaryPayload(out NanitePageDecodedData decoded, out string error)
         {
             decoded = null;
-            if (binaryPayload == null)
+            if (!HasBinaryPayload)
             {
-                error = "Page has no binary payload.";
+                error = $"Page has no binary payload (streaming='{streamingRelativePath ?? "<null>"}', text={(binaryPayload != null)}).";
                 return false;
             }
-            byte[] bulk = binaryPayload.bytes;
-            if (!TryResolveStorageRange(bulk, out int offset, out int size, out error) ||
-                !NanitePageStorageCodec.TryUnpack(bulk, offset, size, out byte[] packedPage, out error))
+            if (!TryGetStoragePayload(out byte[] storagePayload, out error) ||
+                !NanitePageStorageCodec.TryUnpack(
+                    storagePayload,
+                    0,
+                    storagePayload.Length,
+                    out byte[] packedPage,
+                    out error))
                 return false;
             return NanitePageBinaryCodec.TryDecode(packedPage, out decoded, out error);
         }
@@ -185,6 +252,7 @@ namespace Nanite
             if (!TryDecodeBinaryPayload(out NanitePageDecodedData decoded, out error))
             {
                 binaryDecodeError = error;
+                Debug.LogError($"[Nanite][PageIO] '{name}' decode failed: {error}", this);
                 return false;
             }
 
@@ -249,6 +317,76 @@ namespace Nanite
         {
             binaryDecodeAttempted = false;
             binaryDecodeError = null;
+        }
+
+        static string NormalizeStreamingRelativePath(string path) =>
+            string.IsNullOrWhiteSpace(path)
+                ? string.Empty
+                : path.Trim().Replace('\\', '/').TrimStart('/');
+
+        int ResolveBinaryCount(bool vertex)
+        {
+            if (binaryStats.formatVersion < 1 ||
+                binaryStats.formatVersion > NanitePageBinaryCodec.CurrentVersion)
+                return 0;
+            NanitePageBinaryFlags flags = (NanitePageBinaryFlags)binaryStats.flags;
+            int recordBytes = vertex
+                ? ((flags & NanitePageBinaryFlags.FloatUv) != 0 ? 24 : 20)
+                : ((flags & NanitePageBinaryFlags.Index16) != 0 ? 2 : 4);
+            int byteCount = vertex ? binaryStats.vertexBytes : binaryStats.indexBytes;
+            return byteCount > 0 && byteCount % recordBytes == 0
+                ? byteCount / recordBytes
+                : 0;
+        }
+
+        static bool TryReadFileRange(
+            string fullPath,
+            int offset,
+            int size,
+            out byte[] bytes,
+            out string error)
+        {
+            bytes = null;
+            error = null;
+            if (offset < 0 || size <= 0)
+            {
+                error = $"Invalid Page file range [{offset}, {offset + size}).";
+                return false;
+            }
+
+            try
+            {
+                using var stream = new FileStream(
+                    fullPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    64 * 1024,
+                    FileOptions.RandomAccess);
+                if ((long)offset + size > stream.Length)
+                {
+                    error = $"Page file range [{offset}, {(long)offset + size}) exceeds '{fullPath}' ({stream.Length} bytes).";
+                    return false;
+                }
+
+                stream.Seek(offset, SeekOrigin.Begin);
+                bytes = new byte[size];
+                int read = 0;
+                while (read < size)
+                {
+                    int count = stream.Read(bytes, read, size - read);
+                    if (count <= 0)
+                        throw new EndOfStreamException($"Unexpected EOF after {read}/{size} bytes.");
+                    read += count;
+                }
+                return true;
+            }
+            catch (Exception exception)
+            {
+                bytes = null;
+                error = $"Could not read Page range from '{fullPath}': {exception.Message}";
+                return false;
+            }
         }
     }
 }

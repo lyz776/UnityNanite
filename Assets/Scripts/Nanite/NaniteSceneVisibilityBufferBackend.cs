@@ -81,6 +81,7 @@ namespace Nanite
 
         readonly struct MaterialCompatibilityKey : IEquatable<MaterialCompatibilityKey>
         {
+            readonly int resolvePipeline;
             readonly int shader;
             readonly int state;
             readonly int baseMap;
@@ -88,9 +89,11 @@ namespace Nanite
             readonly int metallicMap;
             readonly int occlusionMap;
             readonly int emissionMap;
+            readonly int extension;
 
-            internal MaterialCompatibilityKey(Material material)
+            internal MaterialCompatibilityKey(Material material, int resolvePipeline)
             {
+                this.resolvePipeline = resolvePipeline;
                 shader = material != null && material.shader != null ? material.shader.GetInstanceID() : 0;
                 state = MaterialKeywordState(material);
                 baseMap = MaterialTextureId(material, "_BaseMap", "_MainTex");
@@ -98,13 +101,28 @@ namespace Nanite
                 metallicMap = MaterialTextureId(material, "_MetallicGlossMap");
                 occlusionMap = MaterialTextureId(material, "_OcclusionMap");
                 emissionMap = MaterialTextureId(material, "_EmissionMap");
+                extension = 0;
+                if (resolvePipeline > 0 &&
+                    NaniteMaterialResolveRegistry.TryGet(resolvePipeline, out INaniteMaterialResolveFamily family) &&
+                    family is INaniteMaterialResolveDataProvider provider)
+                {
+                    try
+                    {
+                        extension = provider.GetCompatibilityHash(material);
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.LogException(exception);
+                        extension = material != null ? material.GetInstanceID() : 0;
+                    }
+                }
             }
 
             public bool Equals(MaterialCompatibilityKey other) =>
-                shader == other.shader && state == other.state &&
+                resolvePipeline == other.resolvePipeline && shader == other.shader && state == other.state &&
                 baseMap == other.baseMap && normalMap == other.normalMap &&
                 metallicMap == other.metallicMap && occlusionMap == other.occlusionMap &&
-                emissionMap == other.emissionMap;
+                emissionMap == other.emissionMap && extension == other.extension;
 
             public override bool Equals(object obj) =>
                 obj is MaterialCompatibilityKey other && Equals(other);
@@ -113,13 +131,15 @@ namespace Nanite
             {
                 unchecked
                 {
-                    int hash = shader;
+                    int hash = resolvePipeline;
+                    hash = hash * 397 ^ shader;
                     hash = hash * 397 ^ state;
                     hash = hash * 397 ^ baseMap;
                     hash = hash * 397 ^ normalMap;
                     hash = hash * 397 ^ metallicMap;
                     hash = hash * 397 ^ occlusionMap;
-                    return hash * 397 ^ emissionMap;
+                    hash = hash * 397 ^ emissionMap;
+                    return hash * 397 ^ extension;
                 }
             }
         }
@@ -141,6 +161,7 @@ namespace Nanite
         readonly Dictionary<int, int> geometryMipByFirstTriangle = new Dictionary<int, int>(16384);
         readonly List<int> probeDirtyInstances = new List<int>(32);
         readonly List<Material> materialList = new List<Material>(128);
+        readonly List<int> materialResolvePipelines = new List<int>(128);
         readonly List<int> materialResolveFamilies = new List<int>(128);
         readonly List<int> materialCompatibilityBins = new List<int>(128);
         readonly List<int> compatibilityBinRepresentativeMaterialIds = new List<int>(64);
@@ -178,10 +199,15 @@ namespace Nanite
         ComputeBuffer clusterInstanceBuffer;
         ComputeBuffer geometryClusterBoundsBuffer;
         ComputeBuffer geometryClusterLongestEdgeBuffer;
-        GraphicsBuffer indexedDrawIndexBuffer;
+        GraphicsBuffer indexedTrianglePacketBuffer;
         GraphicsBuffer indexedDrawArgsBuffer;
+        GraphicsBuffer indexedAppendDrawArgsBuffer;
         GraphicsBuffer indexedFallbackDrawArgsBuffer;
+        GraphicsBuffer indexedOverflowClusterBuffer;
+        ComputeBuffer indexedOverflowCountBuffer;
         ComputeBuffer indexedBuildDispatchArgsBuffer;
+        ComputeBuffer indexedCameraBaseCountBuffer;
+        GraphicsBuffer indexedCameraPacketSliceBuffer;
         ComputeBuffer indexedFallbackResidentTableBuffer;
         ComputeBuffer indexedFallbackResidentVertexBuffer;
         ComputeBuffer indexedFallbackResidentIndexBuffer;
@@ -199,6 +225,7 @@ namespace Nanite
         int rebuildSignature;
         int registryRevision = -1;
         int lastInstanceUpdateFrame = -1;
+        int instanceTransformGeneration;
         int geometryGeneration;
         int vertexStride;
         int geometryVertexCount;
@@ -211,7 +238,9 @@ namespace Nanite
         int maxSubMeshCount;
         int indexedDrawBufferMaxMiB = 128;
         bool indexedDrawRequested = true;
-        int indexedDrawIndexCapacity;
+        int indexedTrianglePacketCapacity;
+        int indexedPacketInstanceBits;
+        uint indexedPacketInstanceMask;
         int indexedDrawClusterCapacity;
         int indexedShadowClusterCapacity;
         int indexedShadowDynamicSliceFrame = -1;
@@ -256,6 +285,18 @@ namespace Nanite
             indexCount > 0;
 
         public int MaterialCount => materialList.Count;
+        public bool RequiresTwoSidedRaster
+        {
+            get
+            {
+                for (int materialIndex = 0; materialIndex < materialList.Count; materialIndex++)
+                {
+                    if (MaterialFloat(materialList[materialIndex], "_Cull", 2f) < 0.5f)
+                        return true;
+                }
+                return false;
+            }
+        }
         public int MaxMaterialCount => kMaxMaterials;
         public int MaxSubMeshCount => maxSubMeshCount;
         public ComputeBuffer InstanceMaterialRangeBuffer => instanceMaterialRangeBuffer;
@@ -269,6 +310,8 @@ namespace Nanite
         public int GeometryVertexCount => geometryVertexCount;
         public int VirtualVertexCount => virtualVertexCount;
         public int GeometryGeneration => geometryGeneration;
+        public int InstanceTransformGeneration => instanceTransformGeneration;
+        public void RefreshInstanceTransforms() => UpdateInstanceTransforms();
         public int IndexedDrawBufferMaxMiB
         {
             get => indexedDrawBufferMaxMiB;
@@ -293,16 +336,24 @@ namespace Nanite
             }
         }
         public bool IndexedDrawAvailable =>
-            indexedDrawIndexBuffer != null &&
+            indexedTrianglePacketBuffer != null &&
             indexedDrawArgsBuffer != null &&
+            indexedAppendDrawArgsBuffer != null &&
             indexedFallbackDrawArgsBuffer != null &&
+            indexedOverflowClusterBuffer != null &&
+            indexedOverflowCountBuffer != null &&
             indexedBuildDispatchArgsBuffer != null &&
-            indexedDrawClusterCapacity > 0 &&
-            IndexedVertexDomainCount > 0 &&
-            (long)slots.Count * IndexedVertexDomainCount <= uint.MaxValue;
-        public GraphicsBuffer IndexedDrawIndexBuffer => indexedDrawIndexBuffer;
+            indexedCameraBaseCountBuffer != null &&
+            indexedCameraPacketSliceBuffer != null &&
+            indexedDrawClusterCapacity > 0;
+        public GraphicsBuffer IndexedTrianglePacketBuffer => indexedTrianglePacketBuffer;
+        public int IndexedPacketInstanceBits => indexedPacketInstanceBits;
+        public uint IndexedPacketInstanceMask => indexedPacketInstanceMask;
         public GraphicsBuffer IndexedDrawArgsBuffer => indexedDrawArgsBuffer;
+        public GraphicsBuffer IndexedAppendDrawArgsBuffer => indexedAppendDrawArgsBuffer;
         public GraphicsBuffer IndexedFallbackDrawArgsBuffer => indexedFallbackDrawArgsBuffer;
+        public GraphicsBuffer IndexedOverflowClusterBuffer => indexedOverflowClusterBuffer;
+        public GraphicsBuffer IndexedCameraPacketSliceBuffer => indexedCameraPacketSliceBuffer;
         public int IndexedDrawClusterCapacity => indexedDrawClusterCapacity;
         public int IndexedShadowClusterCapacity => indexedShadowClusterCapacity;
         public int IndexedShadowSharedClusterCapacity => indexedDrawClusterCapacity;
@@ -316,7 +367,10 @@ namespace Nanite
             indexedShadowSliceDataBuffer != null &&
             indexedShadowDynamicSliceFrame == Time.frameCount &&
             (indexedShadowReadyMask & (1 << cascadeIndex)) != 0;
-        public long IndexedDrawBufferBytes => (long)indexedDrawIndexCapacity * sizeof(uint);
+        public long IndexedDrawBufferBytes =>
+            (long)indexedTrianglePacketCapacity * sizeof(uint) +
+            (long)indexedDrawClusterCapacity * sizeof(uint);
+        public int IndexedTrianglePacketCapacity => indexedTrianglePacketCapacity;
         public GraphicsBuffer GetIndexedShadowDrawArgsBuffer(int cascadeIndex) =>
             cascadeIndex >= 0 && cascadeIndex < indexedShadowDrawArgsBuffers.Length
                 ? indexedShadowDrawArgsBuffers[cascadeIndex]
@@ -380,9 +434,16 @@ namespace Nanite
         public int LastQueuedPageCount => pagePool.LastQueuedPageCount;
         public uint LastMaxPageRequestPriority => pagePool.LastMaxRequestPriority;
         public int RootPageCount => pagePool.RootPageCount;
+        public int TotalStreamedPageCount => pagePool.TotalStreamedPageCount;
+        public int TotalEvictedPageCount => pagePool.TotalEvictedPageCount;
+        public int TotalRecycledAllocationCount => pagePool.TotalRecycledAllocationCount;
+        public int RetiredPageAllocationCount => pagePool.RetiredAllocationCount;
         public int PagePoolBytes => pagePool.PoolBytes;
         public int ResidentPagePayloadBytes => pagePool.ResidentBytes;
         public long ResidentGeometryBytes => pagePool.ResidentGeometryBytes;
+        public long TotalPageStorageBytesRead => pagePool.TotalStorageBytesRead;
+        public int TotalPageStorageReadOperations => pagePool.TotalStorageReadOperations;
+        public int StreamingFilePageCount => pagePool.StreamingFilePageCount;
         public long CompatibilityGeometryBytes =>
             (long)(vertexDataBuffer != null ? vertexDataBuffer.count : 0) * sizeof(float) +
             (long)(indexBuffer != null ? indexBuffer.count : 0) * sizeof(int);
@@ -428,13 +489,28 @@ namespace Nanite
         public ComputeBuffer GeometryClusterLongestEdgeBuffer => geometryClusterLongestEdgeBuffer;
         /// <summary>为 true 时跳过 CPU SetData，保留 GPU cull 直接写入的 clusterVisible。</summary>
         public bool GpuVisibleMaskReady { get; private set; }
+        public int GpuVisibleMaskCameraId { get; private set; }
         public bool HasPrevVisible =>
             hasPrevVisible &&
             prevClusterVisibleBuffer != null &&
             prevVisibleGeometryGeneration == geometryGeneration;
 
-        public void MarkGpuVisibleMaskReady() => GpuVisibleMaskReady = true;
-        public void ClearGpuVisibleMaskReady() => GpuVisibleMaskReady = false;
+        public bool IsGpuVisibleMaskReadyFor(Camera camera) =>
+            camera != null &&
+            GpuVisibleMaskReady &&
+            GpuVisibleMaskCameraId == camera.GetInstanceID();
+
+        public void MarkGpuVisibleMaskReady(Camera camera)
+        {
+            GpuVisibleMaskReady = camera != null;
+            GpuVisibleMaskCameraId = camera != null ? camera.GetInstanceID() : 0;
+        }
+
+        public void ClearGpuVisibleMaskReady()
+        {
+            GpuVisibleMaskReady = false;
+            GpuVisibleMaskCameraId = 0;
+        }
 
         public void InvalidatePrevVisible()
         {
@@ -495,6 +571,7 @@ namespace Nanite
             geometryIndexByMeshId.Clear();
             geometryMipByFirstTriangle.Clear();
             materialList.Clear();
+            materialResolvePipelines.Clear();
             materialResolveFamilies.Clear();
             materialCompatibilityBins.Clear();
             compatibilityBinRepresentativeMaterialIds.Clear();
@@ -505,7 +582,7 @@ namespace Nanite
             instanceMaterialRangeCpu = null;
             clusterVisibleCpu = null;
             instanceShCpu = null;
-            GpuVisibleMaskReady = false;
+            ClearGpuVisibleMaskReady();
             rebuildSignature = 0;
             registryRevision = -1;
             lastInstanceUpdateFrame = -1;
@@ -550,7 +627,7 @@ namespace Nanite
 
             rebuildSignature = signature;
             registryRevision = currentRevision;
-            GpuVisibleMaskReady = false;
+            ClearGpuVisibleMaskReady();
             InvalidatePrevVisible();
             return true;
         }
@@ -870,6 +947,7 @@ namespace Nanite
             geometryIndexByMeshId.Clear();
             geometryMipByFirstTriangle.Clear();
             materialList.Clear();
+            materialResolvePipelines.Clear();
             materialResolveFamilies.Clear();
             materialCompatibilityBins.Clear();
             compatibilityBinRepresentativeMaterialIds.Clear();
@@ -884,6 +962,7 @@ namespace Nanite
             int totalTriangles = 0;
             int totalVirtualVertices = 0;
             int totalVirtualTriangles = 0;
+            int totalVirtualClusters = 0;
             int totalClusters = 0;
             int totalGeometryClusters = 0;
             int maxClusterTriangles = 1;
@@ -936,8 +1015,9 @@ namespace Nanite
                         geometry.pageTriangleBase[pageIndex] = totalTriangles;
                         geometry.pageClusterBase[pageIndex] = totalGeometryClusters;
                         totalVertices += page.vertexCount;
-                        totalIndices += page.indiceArray.Length;
-                        totalTriangles += page.indiceArray.Length / 3;
+                        int pageIndexCount = GetPageIndexCount(page);
+                        totalIndices += pageIndexCount;
+                        totalTriangles += pageIndexCount / 3;
                         totalGeometryClusters += page.clusterArray != null ? page.clusterArray.Length : 0;
                         if (page.clusterArray != null)
                         {
@@ -978,11 +1058,14 @@ namespace Nanite
                     if (!IsValidPage(page) || slotGeometry.pageVertexBase[pageIndex] < 0)
                         continue;
 
-                    slot.pageClusterBase[pageIndex] = totalClusters;
+                    // Cluster geometry is immutable and shared by every instance.
+                    // The direct draw queue carries instanceId separately, so the
+                    // scene address must stay in the unique-geometry domain.
+                    slot.pageClusterBase[pageIndex] = slotGeometry.pageClusterBase[pageIndex];
                     slot.pageClusterCount[pageIndex] = page.clusterArray != null ? page.clusterArray.Length : 0;
-                    totalClusters += slot.pageClusterCount[pageIndex];
+                    totalVirtualClusters = checked(totalVirtualClusters + slot.pageClusterCount[pageIndex]);
                     totalVirtualVertices += page.vertexCount;
-                    totalVirtualTriangles += page.indiceArray.Length / 3;
+                    totalVirtualTriangles += GetPageIndexCount(page) / 3;
                 }
 
                 slots.Add(slot);
@@ -1007,9 +1090,17 @@ namespace Nanite
                         "[Nanite][PagePool] packed raster rejected because demand streaming is disabled; " +
                         "compatibility geometry remains active.");
                 }
-                else if (pagePool.EnsureResidentWorkingSetForPackedRaster(
-                        pageTranscodeShader,
-                        out string packedPageError))
+                // If the complete virtual set fits inside the configured pool, publish it
+                // once. Streaming a 66-page mesh through a 512-slot pool only introduces
+                // avoidable residency-driven LOD changes and asynchronous request overhead.
+                // Larger scenes keep the root-resident demand path unchanged.
+                else if ((pagePool.CanFitAllPages
+                              ? pagePool.EnsureAllPagesResidentForPackedRaster(
+                                  pageTranscodeShader,
+                                  out string packedPageError)
+                              : pagePool.EnsureResidentWorkingSetForPackedRaster(
+                                  pageTranscodeShader,
+                                  out packedPageError)))
                 {
                     UsePackedPageRaster = true;
                 }
@@ -1028,7 +1119,8 @@ namespace Nanite
             triangleCount = totalTriangles;
             virtualTriangleCount = totalVirtualTriangles;
             compactedClusterTriangleSlots = Mathf.Max(1, maxClusterTriangles);
-            clusterCount = totalClusters;
+            totalClusters = totalGeometryClusters;
+            clusterCount = totalGeometryClusters;
             maxSubMeshCount = Mathf.Max(1, maxSubMesh);
             instanceLocalToWorldCpu = new Matrix4x4[slots.Count];
             instanceMaterialRangeCpu = new InstanceMaterialRange[slots.Count];
@@ -1111,8 +1203,21 @@ namespace Nanite
                             mergedIndices[indexBase + index] = page.indiceArray[index] + vertexBase;
                     }
 
-                    int srcTriangleCount = page.indiceArray.Length / 3;
+                    int srcIndexCount = GetPageIndexCount(page);
+                    int srcTriangleCount = srcIndexCount / 3;
                     int[] triClusterLocal = BuildTriangleClusterMap(page, srcTriangleCount);
+                    if (!ValidatePageTriangleAddressContract(
+                            page,
+                            triClusterLocal,
+                            srcIndexCount,
+                            keepCompatibilityGeometry,
+                            out string triangleAddressError))
+                    {
+                        Debug.LogError(
+                            $"[Nanite][TriangleAddressContract] mesh={geometry.mesh.name} " +
+                            $"page={pageIndex}: {triangleAddressError}. Exact packet raster disabled.");
+                        return false;
+                    }
                     if (page.clusterArray != null)
                     {
                         for (int clusterIndex = 0; clusterIndex < page.clusterArray.Length; clusterIndex++)
@@ -1192,13 +1297,16 @@ namespace Nanite
                                 continue;
                             var cl = page.clusterArray[ci];
                             int firstTriangle = Mathf.Max(0, cl.indiceIndex / 3);
-                            int triangleLimit = page.indiceArray.Length / 3;
+                            int triangleLimit = GetPageIndexCount(page) / 3;
                             int triangleCountInCluster = Mathf.Min(
                                 Mathf.Max(0, cl.indiceCount / 3),
                                 Mathf.Max(0, triangleLimit - firstTriangle));
                             clusterFirstTriCpu[globalCluster] = (uint)(triangleBase + firstTriangle);
                             clusterTriCountCpu[globalCluster] = (uint)triangleCountInCluster;
-                            clusterInstanceCpu[globalCluster] = (uint)inst;
+                            // Legacy mask compaction stores one representative
+                            // instance. Production exact queues carry instanceId
+                            // explicitly and do not consume this field.
+                            clusterInstanceCpu[globalCluster] = 0u;
                         }
                     }
                 }
@@ -1285,7 +1393,7 @@ namespace Nanite
             indexedFallbackResidentVertexBuffer.SetData(new[] { new FallbackResidentVertex() });
             indexedFallbackResidentIndexBuffer.SetData(new uint[] { 0u });
 
-            AllocateIndexedDrawBuffers(totalClusters);
+            AllocateIndexedDrawBuffers(totalVirtualClusters);
 
             vertexDataBuffer.SetData(mergedVertices);
             indexBuffer.SetData(mergedIndices);
@@ -1328,6 +1436,11 @@ namespace Nanite
                 : 0;
         }
 
+        public int GetMaterialResolvePipeline(int materialId) =>
+            materialId >= 0 && materialId < materialResolvePipelines.Count
+                ? materialResolvePipelines[materialId]
+                : -1;
+
         public int CompatibilityBinCount => compatibilityBinRepresentativeMaterialIds.Count;
 
         public int GetMaterialCompatibilityBin(int materialId) =>
@@ -1346,6 +1459,8 @@ namespace Nanite
         public int GetCompatibilityBinStateFamily(int compatibilityBin)
         {
             int materialId = GetCompatibilityBinRepresentativeMaterialId(compatibilityBin);
+            if (GetMaterialResolvePipeline(materialId) != 0)
+                return 0;
             Material material = materialId >= 0 && materialId < materialList.Count
                 ? materialList[materialId]
                 : null;
@@ -1364,84 +1479,115 @@ namespace Nanite
 
         void AllocateIndexedDrawBuffers(int totalClusters)
         {
-            indexedDrawIndexCapacity = 0;
+            indexedTrianglePacketCapacity = 0;
+            indexedPacketInstanceBits = RequiredBits(Mathf.Max(0, slots.Count - 1));
+            indexedPacketInstanceMask = indexedPacketInstanceBits == 0
+                ? 0u
+                : ((1u << indexedPacketInstanceBits) - 1u);
             indexedDrawClusterCapacity = 0;
             indexedShadowClusterCapacity = 0;
             if (!indexedDrawRequested || totalClusters <= 0 || compactedClusterTriangleSlots <= 0 ||
-                compactedClusterTriangleSlots > 128 || IndexedVertexDomainCount <= 0)
+                compactedClusterTriangleSlots > 128)
                 return;
-            if ((long)slots.Count * IndexedVertexDomainCount > uint.MaxValue)
+            int triangleBits = RequiredBits(Mathf.Max(0, triangleCount - 1));
+            if (triangleBits + indexedPacketInstanceBits > 32)
                 return;
 
-            long indicesPerCluster = (long)compactedClusterTriangleSlots * 3L;
-            long budgetIndices = (long)Mathf.Max(16, indexedDrawBufferMaxMiB) * 1024L * 1024L / sizeof(uint);
-            // Draw queues contain (cluster, instance), not unique geometry
-            // clusters. Sizing from totalClusters alone under-allocates exactly
-            // when GPU Scene instancing is doing useful work (for example the
-            // 154-instance capture only admitted a small fraction of the
-            // configured budget). Four shadow queues coexist until atlas raster;
-            // camera/formal later reuse the complete allocation.
-            long virtualSceneClusters = Math.Min(
+            long packetsPerCluster = compactedClusterTriangleSlots;
+            // Exact procedural submission bit-packs triangleId and instanceId
+            // into one uint. The bit split is derived from the active GPU Scene;
+            // scenes exceeding 32 total bits remain on the compatibility path.
+            long budgetTriangles = (long)Mathf.Max(16, indexedDrawBufferMaxMiB) * 1024L * 1024L /
+                                   sizeof(uint);
+            // Rebuild has already expanded totalClusters across every GPU Scene
+            // instance. Multiplying by slots again creates an O(instance^2)
+            // overflow queue (154 cars previously allocated about 472 MiB).
+            long virtualSceneClusters = totalClusters;
+            long desiredPackets = Math.Min(
                 (long)int.MaxValue,
-                (long)totalClusters * Math.Max(1, slots.Count));
-            long desiredClusters = Math.Min(
-                (long)int.MaxValue / indicesPerCluster,
-                virtualSceneClusters * 4L);
-            long desiredIndices = desiredClusters * indicesPerCluster;
-            long allocatedIndices = Math.Min(desiredIndices, budgetIndices);
-            long capacityClusters = allocatedIndices / indicesPerCluster;
-            if (capacityClusters <= 0)
+                virtualSceneClusters * packetsPerCluster);
+            // One uint per actual triangle. 8,388,608 packets cover a complete
+            // 4K one-triangle-per-pixel budget; exact whole-cluster overflow is
+            // sent to a compact uint index queue instead of reserving 128 slots
+            // for every visible cluster.
+            const long targetPacketCapacity = 8L * 1024L * 1024L;
+            long allocatedPackets = Math.Min(
+                desiredPackets,
+                Math.Min(budgetTriangles, targetPacketCapacity));
+            if (allocatedPackets <= 0 || virtualSceneClusters <= 0)
                 return;
 
-            indexedDrawClusterCapacity = (int)Math.Min(int.MaxValue, capacityClusters);
-            indexedDrawIndexCapacity = checked((int)(capacityClusters * indicesPerCluster));
-            indexedShadowClusterCapacity = Mathf.Max(1, indexedDrawClusterCapacity / 4);
+            indexedDrawClusterCapacity = (int)Math.Min(int.MaxValue, virtualSceneClusters);
+            indexedTrianglePacketCapacity = checked((int)allocatedPackets);
+            indexedShadowClusterCapacity = indexedDrawClusterCapacity;
 
             try
             {
-                indexedDrawIndexBuffer = new GraphicsBuffer(
-                    GraphicsBuffer.Target.Index | GraphicsBuffer.Target.Raw,
-                    indexedDrawIndexCapacity,
+                indexedTrianglePacketBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    Mathf.Max(1, indexedTrianglePacketCapacity),
                     sizeof(uint));
                 indexedDrawArgsBuffer = new GraphicsBuffer(
                     GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
-                    5,
+                    4,
+                    sizeof(uint));
+                indexedAppendDrawArgsBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
+                    4,
                     sizeof(uint));
                 indexedFallbackDrawArgsBuffer = new GraphicsBuffer(
                     GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
                     4,
                     sizeof(uint));
+                indexedOverflowClusterBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Append,
+                    Mathf.Max(1, indexedDrawClusterCapacity),
+                    sizeof(uint));
+                indexedOverflowCountBuffer = new ComputeBuffer(
+                    1,
+                    sizeof(uint),
+                    ComputeBufferType.Structured);
                 indexedBuildDispatchArgsBuffer = new ComputeBuffer(
-                    3,
+                    4,
                     sizeof(uint),
                     ComputeBufferType.IndirectArguments);
-                indexedDrawArgsBuffer.SetData(new uint[] { 0u, 1u, 0u, 0u, 0u });
+                indexedCameraBaseCountBuffer = new ComputeBuffer(1, sizeof(uint));
+                indexedCameraPacketSliceBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    4,
+                    sizeof(uint));
+                indexedDrawArgsBuffer.SetData(new uint[] { 0u, 1u, 0u, 0u });
+                indexedAppendDrawArgsBuffer.SetData(new uint[] { 0u, 1u, 0u, 0u });
                 indexedFallbackDrawArgsBuffer.SetData(new uint[] { 0u, 1u, 0u, 0u });
-                indexedBuildDispatchArgsBuffer.SetData(new uint[] { 0u, 0u, 1u });
-                indexedShadowSliceDataBuffer = new ComputeBuffer(4, sizeof(uint) * 2);
-                indexedShadowSliceDataBuffer.SetData(new uint[8]);
+                indexedOverflowClusterBuffer.SetCounterValue(0u);
+                indexedOverflowCountBuffer.SetData(new uint[] { 0u });
+                indexedBuildDispatchArgsBuffer.SetData(new uint[] { 0u, 0u, 1u, 0u });
+                indexedCameraBaseCountBuffer.SetData(new uint[] { 0u });
+                indexedCameraPacketSliceBuffer.SetData(new uint[4]);
+                indexedShadowSliceDataBuffer = new ComputeBuffer(4, sizeof(uint) * 4);
+                indexedShadowSliceDataBuffer.SetData(new uint[16]);
                 for (int cascade = 0; cascade < indexedShadowDrawArgsBuffers.Length; cascade++)
                 {
                     indexedShadowDrawArgsBuffers[cascade] = new GraphicsBuffer(
                         GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
-                        5,
+                        4,
                         sizeof(uint));
                     indexedShadowFallbackDrawArgsBuffers[cascade] = new GraphicsBuffer(
                         GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
                         4,
                         sizeof(uint));
-                    indexedShadowDrawArgsBuffers[cascade].SetData(new uint[] { 0u, 1u, 0u, 0u, 0u });
+                    indexedShadowDrawArgsBuffers[cascade].SetData(new uint[] { 0u, 1u, 0u, 0u });
                     indexedShadowFallbackDrawArgsBuffers[cascade].SetData(new uint[] { 0u, 1u, 0u, 0u });
                     indexedShadowBuildDispatchArgsBuffers[cascade] = new ComputeBuffer(
-                        3,
+                        4,
                         sizeof(uint),
                         ComputeBufferType.IndirectArguments);
-                    indexedShadowBuildDispatchArgsBuffers[cascade].SetData(new uint[] { 0u, 0u, 1u });
+                    indexedShadowBuildDispatchArgsBuffers[cascade].SetData(new uint[] { 0u, 0u, 1u, 0u });
                 }
             }
             catch (Exception e)
             {
-                Debug.LogWarning($"[Nanite][IndexedRaster] transient index allocation failed; procedural fallback remains active. {e.Message}");
+                Debug.LogWarning($"[Nanite][PacketRaster] triangle-packet allocation failed; padded procedural fallback remains active. {e.Message}");
                 ReleaseIndexedDrawBuffers();
             }
         }
@@ -1451,6 +1597,7 @@ namespace Nanite
             ComputeShader shader,
             int prepareKernel,
             int buildKernel,
+            int finalizeOverflowKernel,
             ComputeBuffer drawClusters,
             ComputeBuffer drawCountArgs,
             int cascadeIndex = -1,
@@ -1458,14 +1605,13 @@ namespace Nanite
             bool allowProceduralFallback = true)
         {
             if (!IndexedDrawAvailable || cmd == null || shader == null ||
-                prepareKernel < 0 || buildKernel < 0 || drawClusters == null || drawCountArgs == null ||
+                prepareKernel < 0 || buildKernel < 0 || finalizeOverflowKernel < 0 ||
+                drawClusters == null || drawCountArgs == null ||
                 (!UsePackedPageRaster && indexBuffer == null))
                 return false;
 
             bool shadow = cascadeIndex >= 0 && cascadeIndex < 4;
             int capacityClusters = shadow ? indexedShadowClusterCapacity : indexedDrawClusterCapacity;
-            int indicesPerCluster = compactedClusterTriangleSlots * 3;
-            int baseIndex = shadow ? cascadeIndex * capacityClusters * indicesPerCluster : 0;
             GraphicsBuffer indexedArgs = shadow
                 ? indexedShadowDrawArgsBuffers[cascadeIndex]
                 : indexedDrawArgsBuffer;
@@ -1475,11 +1621,13 @@ namespace Nanite
             if (indexedArgs == null || fallbackArgs == null || capacityClusters <= 0)
                 return false;
 
+            cmd.SetBufferCounterValue(indexedOverflowClusterBuffer, 0u);
+
             cmd.SetComputeIntParam(shader, "_CompactedClusterTriangleSlots", compactedClusterTriangleSlots);
             int indexedVertexDomain = IndexedVertexDomainCount;
             cmd.SetComputeIntParam(shader, "_GeometryVertexCount", indexedVertexDomain);
             cmd.SetComputeIntParam(shader, "_UsePackedPageGeometry", UsePackedPageRaster ? 1 : 0);
-            cmd.SetComputeIntParam(shader, "_IndexedDrawBaseIndex", baseIndex);
+            cmd.SetComputeIntParam(shader, "_IndexedDrawBaseIndex", 0);
             cmd.SetComputeIntParam(shader, "_IndexedDrawCapacityClusters", capacityClusters);
             cmd.SetComputeIntParam(shader, "_IndexedDrawClusterOffset", Mathf.Max(0, clusterOffset));
             cmd.SetComputeIntParam(shader, "_IndexedAllowProceduralFallback", allowProceduralFallback ? 1 : 0);
@@ -1487,131 +1635,87 @@ namespace Nanite
             cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedDrawArgs", indexedArgs);
             cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedFallbackDrawArgs", fallbackArgs);
             cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedBuildDispatchArgs", indexedBuildDispatchArgsBuffer);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedCameraBaseCount", indexedCameraBaseCountBuffer);
             cmd.DispatchCompute(shader, prepareKernel, 1, 1, 1);
 
             cmd.SetComputeBufferParam(shader, buildKernel, "_VisibleDrawCountArgs", drawCountArgs);
             cmd.SetComputeBufferParam(shader, buildKernel, "_CompactedDrawClusters", drawClusters);
-            cmd.SetComputeBufferParam(
-                shader,
-                buildKernel,
-                "_Indices",
-                indexBuffer ?? clusterVisibleBuffer);
-            cmd.SetComputeBufferParam(shader, buildKernel, "_TrianglePageRefs", trianglePageRefBuffer);
-            if (pagePool.ResidentPageTableBuffer != null)
-            {
-                cmd.SetComputeBufferParam(shader, buildKernel, "_NaniteResidentPageTable", pagePool.ResidentPageTableBuffer);
-            }
-            else
-            {
-                cmd.SetComputeBufferParam(shader, buildKernel, "_NaniteResidentPageTable", indexedFallbackResidentTableBuffer);
-            }
-            if (pagePool.ResidentIndexBuffer != null)
-            {
-                cmd.SetComputeBufferParam(shader, buildKernel, "_NaniteResidentIndices", pagePool.ResidentIndexBuffer);
-            }
-            else
-            {
-                cmd.SetComputeBufferParam(shader, buildKernel, "_NaniteResidentIndices", indexedFallbackResidentIndexBuffer);
-            }
-            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawIndices", indexedDrawIndexBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedTrianglePackets", indexedTrianglePacketBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawArgs", indexedArgs);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedBuildDispatchArgs", indexedBuildDispatchArgsBuffer);
             // One group owns one cluster. Prepare writes an exact 2D indirect
             // dispatch, so empty/partial chunks no longer launch the complete
             // configured capacity only to return immediately.
             cmd.SetComputeIntParam(shader, "_IndexedDispatchGroupsX", 1024);
+            cmd.SetComputeIntParam(shader, "_IndexedPacketInstanceBits", indexedPacketInstanceBits);
+            cmd.SetComputeIntParam(shader, "_IndexedPacketInstanceMask", unchecked((int)indexedPacketInstanceMask));
+            cmd.SetComputeIntParam(shader, "_IndexedTrianglePacketCapacity", indexedTrianglePacketCapacity);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedOverflowClusterIndices", indexedOverflowClusterBuffer);
             cmd.DispatchCompute(shader, buildKernel, indexedBuildDispatchArgsBuffer, 0u);
+            FinalizeIndexedOverflowArgs(cmd, shader, finalizeOverflowKernel, fallbackArgs);
             return true;
         }
 
-        public bool DispatchIndexedShadowDrawQueues(
+        public bool DispatchIndexedDrawQueueAppend(
             UnsafeCommandBuffer cmd,
             ComputeShader shader,
             int prepareKernel,
             int buildKernel,
-            ComputeBuffer[] drawClusters,
-            ComputeBuffer[] drawCountArgs,
-            int cascadeCount)
+            int finalizeOverflowKernel,
+            ComputeBuffer drawClusters,
+            ComputeBuffer drawCountArgs,
+            bool allowProceduralFallback = true)
         {
-            indexedShadowDynamicSliceFrame = -1;
-            indexedShadowReadyMask = 0;
-            int activeCascades = Mathf.Clamp(cascadeCount, 0, 4);
             if (!IndexedDrawAvailable || cmd == null || shader == null ||
-                prepareKernel < 0 || buildKernel < 0 || activeCascades <= 0 ||
-                drawClusters == null || drawCountArgs == null ||
-                drawClusters.Length < 4 || drawCountArgs.Length < 4 ||
-                indexedShadowSliceDataBuffer == null ||
-                (!UsePackedPageRaster && indexBuffer == null))
+                prepareKernel < 0 || buildKernel < 0 || finalizeOverflowKernel < 0 ||
+                drawClusters == null || drawCountArgs == null)
                 return false;
 
-            for (int cascade = 0; cascade < 4; cascade++)
-            {
-                if (drawCountArgs[cascade] == null)
-                    return false;
-            }
-
             cmd.SetComputeIntParam(shader, "_CompactedClusterTriangleSlots", compactedClusterTriangleSlots);
-            cmd.SetComputeIntParam(shader, "_GeometryVertexCount", IndexedVertexDomainCount);
-            cmd.SetComputeIntParam(shader, "_UsePackedPageGeometry", UsePackedPageRaster ? 1 : 0);
-            cmd.SetComputeIntParam(shader, "_IndexedDrawTotalCapacityClusters", indexedDrawClusterCapacity);
-            cmd.SetComputeIntParam(shader, "_IndexedShadowReuseScratch", 0);
+            cmd.SetComputeIntParam(shader, "_IndexedDrawCapacityClusters", indexedDrawClusterCapacity);
+            cmd.SetComputeIntParam(shader, "_IndexedAllowProceduralFallback", allowProceduralFallback ? 1 : 0);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_VisibleDrawCountArgs", drawCountArgs);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedDrawArgsRead", indexedDrawArgsBuffer);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedAppendDrawArgs", indexedAppendDrawArgsBuffer);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedFallbackDrawArgs", indexedFallbackDrawArgsBuffer);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedBuildDispatchArgs", indexedBuildDispatchArgsBuffer);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedCameraBaseCountRead", indexedCameraBaseCountBuffer);
+            cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedCameraPacketSlice", indexedCameraPacketSliceBuffer);
+            cmd.DispatchCompute(shader, prepareKernel, 1, 1, 1);
 
-            for (int cascade = 0; cascade < activeCascades; cascade++)
-            {
-                if (drawClusters[cascade] == null ||
-                    indexedShadowDrawArgsBuffers[cascade] == null ||
-                    indexedShadowFallbackDrawArgsBuffers[cascade] == null ||
-                    indexedShadowBuildDispatchArgsBuffers[cascade] == null)
-                    return false;
-
-                cmd.SetComputeIntParam(shader, "_IndexedShadowCascadeIndex", cascade);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_VisibleDrawCountArgs", drawCountArgs[cascade]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedShadowVisibleDrawCountArgs0", drawCountArgs[0]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedShadowVisibleDrawCountArgs1", drawCountArgs[1]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedShadowVisibleDrawCountArgs2", drawCountArgs[2]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedShadowVisibleDrawCountArgs3", drawCountArgs[3]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedDrawArgs", indexedShadowDrawArgsBuffers[cascade]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedFallbackDrawArgs", indexedShadowFallbackDrawArgsBuffers[cascade]);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedShadowSliceData", indexedShadowSliceDataBuffer);
-                cmd.SetComputeBufferParam(shader, prepareKernel, "_IndexedShadowBuildDispatchArgs", indexedShadowBuildDispatchArgsBuffers[cascade]);
-                cmd.DispatchCompute(shader, prepareKernel, 1, 1, 1);
-
-                cmd.SetComputeBufferParam(shader, buildKernel, "_VisibleDrawCountArgs", drawCountArgs[cascade]);
-                cmd.SetComputeBufferParam(shader, buildKernel, "_CompactedDrawClusters", drawClusters[cascade]);
-                cmd.SetComputeBufferParam(shader, buildKernel, "_Indices", indexBuffer ?? clusterVisibleBuffer);
-                cmd.SetComputeBufferParam(shader, buildKernel, "_TrianglePageRefs", trianglePageRefBuffer);
-                cmd.SetComputeBufferParam(
-                    shader,
-                    buildKernel,
-                    "_NaniteResidentPageTable",
-                    pagePool.ResidentPageTableBuffer ?? indexedFallbackResidentTableBuffer);
-                if (pagePool.ResidentIndexBuffer != null)
-                {
-                    cmd.SetComputeBufferParam(
-                        shader,
-                        buildKernel,
-                        "_NaniteResidentIndices",
-                        pagePool.ResidentIndexBuffer);
-                }
-                else
-                {
-                    cmd.SetComputeBufferParam(
-                        shader,
-                        buildKernel,
-                        "_NaniteResidentIndices",
-                        indexedFallbackResidentIndexBuffer);
-                }
-                cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawIndices", indexedDrawIndexBuffer);
-                cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedShadowSliceData", indexedShadowSliceDataBuffer);
-                cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawArgs", indexedShadowDrawArgsBuffers[cascade]);
-                cmd.DispatchCompute(
-                    shader,
-                    buildKernel,
-                    indexedShadowBuildDispatchArgsBuffers[cascade],
-                    0u);
-            }
-
-            indexedShadowDynamicSliceFrame = Time.frameCount;
-            indexedShadowReadyMask = (1 << activeCascades) - 1;
+            cmd.SetComputeIntParam(shader, "_IndexedDispatchGroupsX", 1024);
+            cmd.SetComputeIntParam(shader, "_IndexedPacketInstanceBits", indexedPacketInstanceBits);
+            cmd.SetComputeIntParam(shader, "_IndexedPacketInstanceMask", unchecked((int)indexedPacketInstanceMask));
+            cmd.SetComputeIntParam(shader, "_IndexedTrianglePacketCapacity", indexedTrianglePacketCapacity);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_VisibleDrawCountArgs", drawCountArgs);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_CompactedDrawClusters", drawClusters);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedTrianglePackets", indexedTrianglePacketBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawArgs", indexedDrawArgsBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedAppendDrawArgs", indexedAppendDrawArgsBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedCameraBaseCountRead", indexedCameraBaseCountBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedCameraPacketSliceRead", indexedCameraPacketSliceBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedBuildDispatchArgs", indexedBuildDispatchArgsBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedOverflowClusterIndices", indexedOverflowClusterBuffer);
+            cmd.DispatchCompute(shader, buildKernel, indexedBuildDispatchArgsBuffer, 0u);
+            FinalizeIndexedOverflowArgs(
+                cmd,
+                shader,
+                finalizeOverflowKernel,
+                indexedFallbackDrawArgsBuffer);
             return true;
+        }
+
+        void FinalizeIndexedOverflowArgs(
+            UnsafeCommandBuffer cmd,
+            ComputeShader shader,
+            int finalizeKernel,
+            GraphicsBuffer fallbackArgs)
+        {
+            cmd.CopyCounterValue(indexedOverflowClusterBuffer, indexedOverflowCountBuffer, 0u);
+            cmd.SetComputeIntParam(shader, "_CompactedClusterTriangleSlots", compactedClusterTriangleSlots);
+            cmd.SetComputeBufferParam(shader, finalizeKernel, "_VisibleDrawCountArgs", indexedOverflowCountBuffer);
+            cmd.SetComputeBufferParam(shader, finalizeKernel, "_DrawArgs", fallbackArgs);
+            cmd.DispatchCompute(shader, finalizeKernel, 1, 1, 1);
         }
 
         /// <summary>
@@ -1624,12 +1728,13 @@ namespace Nanite
             ComputeShader shader,
             int prepareKernel,
             int buildKernel,
+            int finalizeOverflowKernel,
             ComputeBuffer drawClusters,
             ComputeBuffer drawCountArgs,
             int cascadeIndex)
         {
             if (!IndexedDrawAvailable || cmd == null || shader == null ||
-                prepareKernel < 0 || buildKernel < 0 ||
+                prepareKernel < 0 || buildKernel < 0 || finalizeOverflowKernel < 0 ||
                 drawClusters == null || drawCountArgs == null ||
                 cascadeIndex < 0 || cascadeIndex >= 4 ||
                 indexedShadowSliceDataBuffer == null ||
@@ -1648,6 +1753,8 @@ namespace Nanite
             GraphicsBuffer indexedArgs = indexedShadowDrawArgsBuffers[cascadeIndex];
             GraphicsBuffer fallbackArgs = indexedShadowFallbackDrawArgsBuffers[cascadeIndex];
             ComputeBuffer dispatchArgs = indexedShadowBuildDispatchArgsBuffers[cascadeIndex];
+
+            cmd.SetBufferCounterValue(indexedOverflowClusterBuffer, 0u);
 
             cmd.SetComputeIntParam(shader, "_CompactedClusterTriangleSlots", compactedClusterTriangleSlots);
             cmd.SetComputeIntParam(shader, "_GeometryVertexCount", IndexedVertexDomainCount);
@@ -1670,33 +1777,16 @@ namespace Nanite
 
             cmd.SetComputeBufferParam(shader, buildKernel, "_VisibleDrawCountArgs", drawCountArgs);
             cmd.SetComputeBufferParam(shader, buildKernel, "_CompactedDrawClusters", drawClusters);
-            cmd.SetComputeBufferParam(shader, buildKernel, "_Indices", indexBuffer ?? clusterVisibleBuffer);
-            cmd.SetComputeBufferParam(shader, buildKernel, "_TrianglePageRefs", trianglePageRefBuffer);
-            cmd.SetComputeBufferParam(
-                shader,
-                buildKernel,
-                "_NaniteResidentPageTable",
-                pagePool.ResidentPageTableBuffer ?? indexedFallbackResidentTableBuffer);
-            if (pagePool.ResidentIndexBuffer != null)
-            {
-                cmd.SetComputeBufferParam(
-                    shader,
-                    buildKernel,
-                    "_NaniteResidentIndices",
-                    pagePool.ResidentIndexBuffer);
-            }
-            else
-            {
-                cmd.SetComputeBufferParam(
-                    shader,
-                    buildKernel,
-                    "_NaniteResidentIndices",
-                    indexedFallbackResidentIndexBuffer);
-            }
-            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawIndices", indexedDrawIndexBuffer);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedTrianglePackets", indexedTrianglePacketBuffer);
+            cmd.SetComputeIntParam(shader, "_IndexedPacketInstanceBits", indexedPacketInstanceBits);
+            cmd.SetComputeIntParam(shader, "_IndexedPacketInstanceMask", unchecked((int)indexedPacketInstanceMask));
+            cmd.SetComputeIntParam(shader, "_IndexedTrianglePacketCapacity", indexedTrianglePacketCapacity);
             cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedShadowSliceData", indexedShadowSliceDataBuffer);
             cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedDrawArgs", indexedArgs);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedShadowBuildDispatchArgs", dispatchArgs);
+            cmd.SetComputeBufferParam(shader, buildKernel, "_IndexedOverflowClusterIndices", indexedOverflowClusterBuffer);
             cmd.DispatchCompute(shader, buildKernel, dispatchArgs, 0u);
+            FinalizeIndexedOverflowArgs(cmd, shader, finalizeOverflowKernel, fallbackArgs);
 
             indexedShadowReadyMask |= 1 << cascadeIndex;
             return true;
@@ -1709,6 +1799,18 @@ namespace Nanite
             // 单实例可安全使用兼容路径；多实例必须使用 compacted (triangle, instance) 列表。
             uint vertexCount = slots.Count == 1 ? (uint)indexCount : 0u;
             drawArgsBuffer.SetData(new uint[] { vertexCount, 1u, 0u, 0u });
+        }
+
+        static int RequiredBits(int maxValue)
+        {
+            uint value = (uint)Mathf.Max(0, maxValue);
+            int bits = 0;
+            while (value != 0u)
+            {
+                bits++;
+                value >>= 1;
+            }
+            return bits;
         }
 
         int lastShUploadFrame = -100000;
@@ -1724,7 +1826,8 @@ namespace Nanite
                     : EnsureFallbackMaterial();
                 bool emissionEnabled = MaterialEmissionEnabled(material);
                 bool hasEmissionMap = emissionEnabled && MaterialHasTexture(material, "_EmissionMap");
-                result[materialIndex] = new GpuMaterialData
+                bool doubleSided = MaterialFloat(material, "_Cull", 2f) < 0.5f;
+                GpuMaterialData materialData = new GpuMaterialData
                 {
                     baseColor = MaterialColor(material, "_BaseColor", "_Color", Color.white),
                     emissionColor = MaterialColor(material, "_EmissionColor", "_Color", Color.black),
@@ -1749,10 +1852,27 @@ namespace Nanite
                         emissionEnabled ? 1f : 0f),
                     feature0 = new Vector4(
                         material != null && material.IsKeywordEnabled("_SMOOTHNESS_TEXTURE_ALBEDO_CHANNEL_A") ? 1f : 0f,
-                        MaterialFloat(material, "_Cull", 2f) < 0.5f ? 1f : 0f,
+                        doubleSided ? 1f : 0f,
                         ComputeMaterialResolveFamily(material),
                         GetMaterialCompatibilityBin(materialIndex))
                 };
+                int resolvePipeline = materialIndex < materialResolvePipelines.Count
+                    ? materialResolvePipelines[materialIndex]
+                    : 0;
+                if (resolvePipeline > 0 &&
+                    NaniteMaterialResolveRegistry.TryGet(resolvePipeline, out INaniteMaterialResolveFamily family) &&
+                    family is INaniteMaterialResolveDataProvider provider)
+                {
+                    try
+                    {
+                        provider.Populate(material, ref materialData);
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.LogException(exception);
+                    }
+                }
+                result[materialIndex] = materialData;
             }
             return result;
         }
@@ -1771,7 +1891,7 @@ namespace Nanite
 
         static int ComputeMaterialResolveFamily(Material material)
         {
-            if (!SupportsFormalResolveMaterial(material))
+            if (!IsBuiltInUrpLitMaterial(material))
                 return 0;
             if (MaterialHasTexture(material, "_BaseMap") ||
                 MaterialHasTexture(material, "_MainTex") ||
@@ -1793,11 +1913,27 @@ namespace Nanite
         // on their native Renderer until they provide a dedicated Nanite family.
         public static bool SupportsFormalResolveMaterial(Material material)
         {
+            if (IsBuiltInUrpLitMaterial(material))
+                return true;
+            return NaniteMaterialResolveRegistry.TryResolve(material, out _);
+        }
+
+        static bool IsBuiltInUrpLitMaterial(Material material)
+        {
             if (material == null || material.shader == null)
                 return true;
             string shaderName = material.shader.name ?? string.Empty;
             return shaderName.Equals("Universal Render Pipeline/Lit", StringComparison.OrdinalIgnoreCase) ||
                    shaderName.EndsWith("/URP/Lit", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static int ResolveMaterialPipeline(Material material)
+        {
+            if (IsBuiltInUrpLitMaterial(material))
+                return 0;
+            return NaniteMaterialResolveRegistry.TryResolve(material, out int familyId)
+                ? familyId
+                : -1;
         }
 
         static int MaterialKeywordState(Material material)
@@ -1875,10 +2011,13 @@ namespace Nanite
             }
 
             if (transformDirty)
+            {
+                instanceTransformGeneration++;
                 UploadDirtyArrayRanges(
                     instanceLocalToWorldBuffer,
                     instanceLocalToWorldCpu,
                     probeDirtyInstances);
+            }
 
             // SH / LightProbe：每帧 7 次 SetData + GetInterpolatedProbe 很贵；变换脏或隔帧再刷。
             int refreshInterval = Mathf.Max(0, LightProbeRefreshInterval);
@@ -2050,12 +2189,14 @@ namespace Nanite
 
             int id = materialList.Count;
             materialList.Add(resolved);
-            int family = ComputeMaterialResolveFamily(resolved);
+            int resolvePipeline = ResolveMaterialPipeline(resolved);
+            materialResolvePipelines.Add(resolvePipeline);
+            int family = resolvePipeline == 0 ? ComputeMaterialResolveFamily(resolved) : 0;
             materialResolveFamilies.Add(family);
             int compatibilityBin = 0;
             if (family == 0)
             {
-                var keyForBin = new MaterialCompatibilityKey(resolved);
+                var keyForBin = new MaterialCompatibilityKey(resolved, resolvePipeline);
                 if (!compatibilityBinByKey.TryGetValue(keyForBin, out compatibilityBin))
                 {
                     compatibilityBin = compatibilityBinRepresentativeMaterialIds.Count + 1;
@@ -2121,12 +2262,26 @@ namespace Nanite
             proxy.naniteMesh.pageArray != null &&
             proxy.naniteMesh.pageArray.Length > 0;
 
-        static bool IsValidPage(NaniteMeshPage page) =>
-            page != null &&
-            page.vertexData != null &&
-            page.indiceArray != null &&
-            page.vertexCount > 0 &&
-            page.indiceArray.Length >= 3;
+        static bool IsValidPage(NaniteMeshPage page)
+        {
+            if (page == null || page.vertexCount <= 0 ||
+                page.clusterArray == null || page.clusterArray.Length == 0)
+                return false;
+            if (page.HasBinaryPayload && page.BinaryVertexCount == page.vertexCount &&
+                page.BinaryIndexCount >= 3)
+                return true;
+            return page.EnsureLegacyPayload(out _) && page.indiceArray.Length >= 3;
+        }
+
+        static int GetPageIndexCount(NaniteMeshPage page)
+        {
+            if (page == null)
+                return 0;
+            int binaryCount = page.BinaryIndexCount;
+            if (page.HasBinaryPayload && binaryCount > 0)
+                return binaryCount;
+            return page.EnsureLegacyPayload(out _) ? page.indiceArray.Length : 0;
+        }
 
         static int[] BuildTriangleClusterMap(NaniteMeshPage page, int triangleCount)
         {
@@ -2148,6 +2303,84 @@ namespace Nanite
             }
 
             return triCluster;
+        }
+
+        static bool ValidatePageTriangleAddressContract(
+            NaniteMeshPage page,
+            int[] triangleCluster,
+            int indexCount,
+            bool validateLogicalIndices,
+            out string error)
+        {
+            error = string.Empty;
+            if (page == null || triangleCluster == null)
+            {
+                error = "missing Page/index/triangle map";
+                return false;
+            }
+            if (indexCount < 3 || indexCount % 3 != 0 ||
+                triangleCluster.Length != indexCount / 3)
+            {
+                error = "index count is not a complete triangle domain";
+                return false;
+            }
+
+            if (validateLogicalIndices && !page.EnsureLegacyPayload(out string decodeError))
+            {
+                error = $"index payload decode failed: {decodeError}";
+                return false;
+            }
+            for (int index = 0; validateLogicalIndices && index < indexCount; index++)
+            {
+                int logicalVertex = page.indiceArray[index];
+                if ((uint)logicalVertex >= (uint)page.vertexCount)
+                {
+                    error = $"index[{index}]={logicalVertex} exceeds vertexCount={page.vertexCount}";
+                    return false;
+                }
+            }
+
+            var ownership = new int[triangleCluster.Length];
+            for (int triangle = 0; triangle < ownership.Length; triangle++)
+                ownership[triangle] = -1;
+            if (page.clusterArray == null || page.clusterArray.Length == 0)
+            {
+                error = "Page has no clusters";
+                return false;
+            }
+            for (int clusterIndex = 0; clusterIndex < page.clusterArray.Length; clusterIndex++)
+            {
+                NaniteCluster cluster = page.clusterArray[clusterIndex];
+                if (cluster.indiceIndex < 0 || cluster.indiceCount <= 0 ||
+                    cluster.indiceIndex % 3 != 0 || cluster.indiceCount % 3 != 0 ||
+                    cluster.indiceIndex > indexCount - cluster.indiceCount)
+                {
+                    error = $"cluster[{clusterIndex}] has invalid index range " +
+                            $"[{cluster.indiceIndex},{cluster.indiceCount}]";
+                    return false;
+                }
+                int firstTriangle = cluster.indiceIndex / 3;
+                int endTriangle = firstTriangle + cluster.indiceCount / 3;
+                for (int triangle = firstTriangle; triangle < endTriangle; triangle++)
+                {
+                    if (ownership[triangle] >= 0)
+                    {
+                        error = $"triangle[{triangle}] is owned by clusters " +
+                                $"{ownership[triangle]} and {clusterIndex}";
+                        return false;
+                    }
+                    ownership[triangle] = clusterIndex;
+                }
+            }
+            for (int triangle = 0; triangle < ownership.Length; triangle++)
+            {
+                if (ownership[triangle] < 0 || triangleCluster[triangle] != ownership[triangle])
+                {
+                    error = $"triangle[{triangle}] has no stable cluster owner";
+                    return false;
+                }
+            }
+            return true;
         }
 
         Material EnsureFallbackMaterial()
@@ -2258,14 +2491,24 @@ namespace Nanite
 
         void ReleaseIndexedDrawBuffers()
         {
-            indexedDrawIndexBuffer?.Dispose();
+            indexedTrianglePacketBuffer?.Dispose();
             indexedDrawArgsBuffer?.Dispose();
+            indexedAppendDrawArgsBuffer?.Dispose();
             indexedFallbackDrawArgsBuffer?.Dispose();
+            indexedOverflowClusterBuffer?.Dispose();
+            indexedOverflowCountBuffer?.Release();
             indexedBuildDispatchArgsBuffer?.Release();
-            indexedDrawIndexBuffer = null;
+            indexedCameraBaseCountBuffer?.Release();
+            indexedCameraPacketSliceBuffer?.Dispose();
+            indexedTrianglePacketBuffer = null;
             indexedDrawArgsBuffer = null;
+            indexedAppendDrawArgsBuffer = null;
             indexedFallbackDrawArgsBuffer = null;
+            indexedOverflowClusterBuffer = null;
+            indexedOverflowCountBuffer = null;
             indexedBuildDispatchArgsBuffer = null;
+            indexedCameraBaseCountBuffer = null;
+            indexedCameraPacketSliceBuffer = null;
             indexedShadowDynamicSliceFrame = -1;
             indexedShadowSliceDataBuffer?.Release();
             indexedShadowSliceDataBuffer = null;
@@ -2278,7 +2521,7 @@ namespace Nanite
                 indexedShadowBuildDispatchArgsBuffers[i]?.Release();
                 indexedShadowBuildDispatchArgsBuffers[i] = null;
             }
-            indexedDrawIndexCapacity = 0;
+            indexedTrianglePacketCapacity = 0;
             indexedDrawClusterCapacity = 0;
             indexedShadowClusterCapacity = 0;
         }

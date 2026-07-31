@@ -419,7 +419,7 @@ namespace Nanite
             float distance = Vector3.Distance(center, cameraPosition) - sphere.w;
             distance = Mathf.Max(distance, zNear);
             // 与 GPU 一致：按屏幕直径（像素）计。
-            return (2f * error * projectionScale) / distance;
+            return (error * projectionScale) / distance;
         }
 
         static Vector4 TransformSphere(in Vector4 localSphere, Matrix4x4 localToWorld, float maxScale)

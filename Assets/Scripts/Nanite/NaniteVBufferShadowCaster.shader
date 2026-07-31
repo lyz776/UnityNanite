@@ -4,6 +4,7 @@ Shader "Nanite/VBufferShadowCaster"
     {
         _Cutoff ("Alpha Cutoff", Range(0, 1)) = 0
         [NoScaleOffset] _BaseMap ("Base Map", 2D) = "white" {}
+        [HideInInspector] _NaniteCullMode ("Nanite Cull Mode", Float) = 0
     }
 
     SubShader
@@ -15,10 +16,7 @@ Shader "Nanite/VBufferShadowCaster"
             Name "NaniteShadowCaster"
             Tags { "LightMode" = "ShadowCaster" }
 
-            // This is a procedural draw, so Unity cannot apply the automatic
-            // winding correction used by MeshRenderer shadow casters. Match the
-            // Formal VBuffer path and keep Page geometry two-sided.
-            Cull Off
+            Cull [_NaniteCullMode]
             ZWrite On
             ZTest LEqual
             ColorMask 0
@@ -34,10 +32,13 @@ Shader "Nanite/VBufferShadowCaster"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl"
-            StructuredBuffer<uint2> _IndexedShadowSliceData;
+            StructuredBuffer<uint4> _IndexedShadowSliceData;
+            StructuredBuffer<uint> _IndexedTrianglePackets;
             int _UseIndexedShadowDynamicSlice;
             int _IndexedShadowCascadeIndex;
-            #define NANITE_COMPACT_CLUSTER_EXTRA_OFFSET (_UseIndexedShadowDynamicSlice != 0 ? _IndexedShadowSliceData[min((uint)_IndexedShadowCascadeIndex, 3u)].y : 0u)
+            int _IndexedPacketInstanceBits;
+            uint _IndexedPacketInstanceMask;
+            #define NANITE_COMPACT_CLUSTER_EXTRA_OFFSET ((_UseIndexedShadowDynamicSlice != 0 && _UseIndexedOverflowClusterIndices <= 0.5) ? _IndexedShadowSliceData[min((uint)_IndexedShadowCascadeIndex, 3u)].y : 0u)
             #include "NaniteCompactDraw.hlsl"
 
             // 与 URP ShadowCasterPass 一致：法线偏移需要当前阴影光方向/位置。
@@ -65,6 +66,7 @@ Shader "Nanite/VBufferShadowCaster"
             int _UseSceneInstanceBuffer;
             int _UseIndexedClusterRaster;
             int _GeometryVertexCount;
+            int _IndexedTrianglePacketBase;
 
             struct Attributes
             {
@@ -135,24 +137,31 @@ Shader "Nanite/VBufferShadowCaster"
             Varyings vert(Attributes input)
             {
                 Varyings o;
-                if (_UseIndexedClusterRaster != 0 && _GeometryVertexCount > 0)
+                if (_UseIndexedClusterRaster != 0)
                 {
-                    int instanceId = (int)(input.vertexID / (uint)_GeometryVertexCount);
-                    int logicalVertex = (int)(input.vertexID % (uint)_GeometryVertexCount);
+                    uint packetBase = _UseIndexedShadowDynamicSlice != 0
+                        ? _IndexedShadowSliceData[min((uint)_IndexedShadowCascadeIndex, 3u)].x
+                        : (uint)max(0, _IndexedTrianglePacketBase);
+                    uint packet = _IndexedTrianglePackets[packetBase + input.vertexID / 3u];
+                    int triId = (int)(packet >> (uint)_IndexedPacketInstanceBits);
+                    int instanceId = (int)(packet & _IndexedPacketInstanceMask);
                     float4x4 indexedLocalToWorld = _InstanceLocalToWorld[instanceId];
+                    int corner = NaniteResolveWindingCorner(input.vertexID, indexedLocalToWorld);
                     float3 indexedPositionOS;
                     float3 indexedNormalOS;
                     float2 indexedUvOS;
                     if (NaniteUsePackedPageGeometry())
                     {
-                        NaniteResidentVertex indexedResidentVertex =
-                            _NaniteResidentVertices[logicalVertex];
+                        NanitePackedVertex indexedResidentVertex;
+                        if (!NanitePackedLoadVertex((uint)triId, (uint)corner, indexedResidentVertex))
+                            indexedResidentVertex.positionOS = asfloat(0x7FC00000u).xxx;
                         indexedPositionOS = indexedResidentVertex.positionOS;
                         indexedNormalOS = indexedResidentVertex.normalOS;
                         indexedUvOS = indexedResidentVertex.uv;
                     }
                     else
                     {
+                        int logicalVertex = _Indices[triId * 3 + corner];
                         indexedPositionOS = DecodePositionOS(logicalVertex);
                         indexedNormalOS = DecodeNormalOS(logicalVertex);
                         indexedUvOS = DecodeUv(logicalVertex);
@@ -208,7 +217,7 @@ Shader "Nanite/VBufferShadowCaster"
                     NanitePackedVertex packedVertex;
                     if (!NanitePackedLoadVertex(
                             (uint)triId,
-                            (uint)NaniteResolveCorner(input.vertexID),
+                            (uint)NaniteResolveWindingCorner(input.vertexID, localToWorld),
                             packedVertex))
                     {
                         packedVertex.positionOS = asfloat(0x7FC00000u).xxx;
@@ -219,7 +228,10 @@ Shader "Nanite/VBufferShadowCaster"
                 }
                 else
                 {
-                    int logicalIndex = NaniteFetchLogicalIndex(_Indices, input.vertexID);
+                    int logicalIndex = NaniteFetchLogicalIndexWinding(
+                        _Indices,
+                        input.vertexID,
+                        localToWorld);
                     posOS = DecodePositionOS(logicalIndex);
                     normalOS = DecodeNormalOS(logicalIndex);
                     uvOS = DecodeUv(logicalIndex);
