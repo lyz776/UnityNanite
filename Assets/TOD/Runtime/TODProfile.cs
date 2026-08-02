@@ -154,9 +154,38 @@ namespace UnityNanite.TOD
     }
 
     [Serializable]
+    public sealed class TODCloudSecondaryLayerSettings
+    {
+        public bool enabled = true;
+        public TODFloatParameter opacity = new TODFloatParameter(0.42f);
+        public TODFloatParameter coverageOffset = new TODFloatParameter(-0.08f);
+        public TODFloatParameter altitude = new TODFloatParameter(9.5f);
+        public TODFloatParameter scale = new TODFloatParameter(0.52f);
+        public TODFloatParameter speedX = new TODFloatParameter(-0.0025f);
+        public TODFloatParameter speedY = new TODFloatParameter(0.0012f);
+        public TODFloatParameter fogBlend = new TODFloatParameter(0.3f);
+    }
+
+    [Serializable]
+    public sealed class TODCloudLightningSettings
+    {
+        public bool enabled;
+        public Texture2D glowTexture;
+        public TODColorParameter color =
+            new TODColorParameter(new Color(0.55f, 0.72f, 1.4f));
+        public TODFloatParameter intensity = new TODFloatParameter(4f);
+        public TODFloatParameter frequency = new TODFloatParameter(0.25f);
+        public TODFloatParameter duration = new TODFloatParameter(0.42f);
+        public TODFloatParameter scale = new TODFloatParameter(1.2f);
+        public TODFloatParameter glowSpeed = new TODFloatParameter(0.004f);
+    }
+
+    [Serializable]
     public sealed class TODCloudSettings
     {
         public bool enabled = true;
+        public Texture2D shapeTexture;
+        public Texture2D unevenTexture;
         public TODColorParameter color = new TODColorParameter(
             new Color(0.92f, 0.96f, 1f),
             true,
@@ -173,16 +202,18 @@ namespace UnityNanite.TOD
             new TODColorParameter(new Color(1.18f, 0.82f, 0.52f));
         public TODColorParameter backDarkColor =
             new TODColorParameter(new Color(0.24f, 0.29f, 0.40f));
-        public TODFloatParameter directionalColorAmount = new TODFloatParameter(0.82f);
+        // Kept serialized for old profiles. The editor now always treats the
+        // four directional colors as the authoritative palette.
+        public TODFloatParameter directionalColorAmount = new TODFloatParameter(1f);
         public TODColorParameter rimColor =
             new TODColorParameter(new Color(1.2f, 0.82f, 0.5f));
         public TODFloatParameter rimIntensity = new TODFloatParameter(0.62f);
-        public TODFloatParameter rimPower = new TODFloatParameter(3.5f);
-        public TODFloatParameter rimWidth = new TODFloatParameter(0.08f);
+        public TODFloatParameter rimPower = new TODFloatParameter(1f);
+        public TODFloatParameter rimWidth = new TODFloatParameter(0.025f);
         public TODFloatParameter opacity = new TODFloatParameter(0.68f);
         public TODFloatParameter coverage = new TODFloatParameter(0.58f);
-        public TODFloatParameter scale = new TODFloatParameter(6.2f);
-        public TODFloatParameter detailScale = new TODFloatParameter(3.4f);
+        public TODFloatParameter scale = new TODFloatParameter(1f);
+        public TODFloatParameter detailScale = new TODFloatParameter(12f);
         public TODFloatParameter softness = new TODFloatParameter(0.1f);
         public TODFloatParameter erosion = new TODFloatParameter(0.44f);
         public TODFloatParameter distortion = new TODFloatParameter(1.2f);
@@ -216,6 +247,8 @@ namespace UnityNanite.TOD
         public TODFloatParameter sunTransmission = new TODFloatParameter(0.75f);
         public TODFloatParameter sunTransmissionPower = new TODFloatParameter(3.2f);
         public TODFloatParameter undersideStrength = new TODFloatParameter(0.56f);
+        public TODCloudSecondaryLayerSettings layer2 = new TODCloudSecondaryLayerSettings();
+        public TODCloudLightningSettings lightning = new TODCloudLightningSettings();
         public TODCloudShadowSettings shadows = new TODCloudShadowSettings();
     }
 

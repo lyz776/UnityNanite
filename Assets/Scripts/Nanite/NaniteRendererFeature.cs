@@ -4100,8 +4100,16 @@ namespace Nanite
             }
 
             var colorDesc = renderGraph.GetTextureDesc(resourceData.activeColorTexture);
-            int fullScreenWidth = Mathf.Max(1, colorDesc.width);
-            int fullScreenHeight = Mathf.Max(1, colorDesc.height);
+            UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
+            // TextureDesc reports the RTHandle's persistent physical allocation. After a
+            // 4K Game view has increased the RTHandle reference size, a smaller Scene/Game
+            // viewport still renders only scaledWidth x scaledHeight pixels in its upper-left
+            // region. Using the physical allocation here made VBuffer Texture.Load work by
+            // accident, while barycentrics, UV gradients and normals were reconstructed from
+            // a folded screen coordinate. Always size the formal buffers and inverse viewport
+            // from the current camera's logical render area.
+            int fullScreenWidth = Mathf.Max(1, cameraData.scaledWidth);
+            int fullScreenHeight = Mathf.Max(1, cameraData.scaledHeight);
             // 半分辨率路径尚未稳定（采样/深度 upsample 易花屏）；强制走全分辨率恢复正确画面。
             bool halfResVBuffer = false;
             int formalScreenWidth = halfResVBuffer ? Mathf.Max(1, fullScreenWidth / 2) : fullScreenWidth;

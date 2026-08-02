@@ -27,6 +27,8 @@ namespace RealtimeGI
         GraphicsBuffer occupancyBuffer;
         GraphicsBuffer surfaceBuffer;
         GraphicsBuffer surfaceUvBuffer;
+        GraphicsBuffer surfaceIdentityBuffer;
+        GraphicsBuffer surfaceKeyBuffer;
         GraphicsBuffer distanceBuffer;
         GraphicsBuffer dirtyBrickBuffer;
         GraphicsBuffer brickDataBuffer;
@@ -40,6 +42,8 @@ namespace RealtimeGI
         public GraphicsBuffer OccupancyBuffer => occupancyBuffer;
         public GraphicsBuffer SurfaceBuffer => surfaceBuffer;
         public GraphicsBuffer SurfaceUvBuffer => surfaceUvBuffer;
+        public GraphicsBuffer SurfaceIdentityBuffer => surfaceIdentityBuffer;
+        public GraphicsBuffer SurfaceKeyBuffer => surfaceKeyBuffer;
         public GraphicsBuffer DistanceBuffer => distanceBuffer;
         public GraphicsBuffer DirtyBrickBuffer => dirtyBrickBuffer;
         public GraphicsBuffer BrickDataBuffer => brickDataBuffer;
@@ -70,6 +74,10 @@ namespace RealtimeGI
                 this.capacity * GIClipmapConstants.SurfaceWordsPerBrick, 4, debugName + " Surface");
             surfaceUvBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.SurfaceUvWordsPerBrick, 4, debugName + " Surface UV0");
+            surfaceIdentityBuffer = NewBuffer(
+                this.capacity * GIClipmapConstants.SurfaceIdentityWordsPerBrick, 4, debugName + " Surface Identity");
+            surfaceKeyBuffer = NewBuffer(
+                this.capacity * GIClipmapConstants.SurfaceKeyWordsPerBrick, 4, debugName + " Surface Candidate Key");
             distanceBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.DistanceWordsPerBrick, 4, debugName + " Distance");
             radianceBuffer = NewBuffer(
@@ -280,6 +288,8 @@ namespace RealtimeGI
             occupancyBuffer?.Release();
             surfaceBuffer?.Release();
             surfaceUvBuffer?.Release();
+            surfaceIdentityBuffer?.Release();
+            surfaceKeyBuffer?.Release();
             distanceBuffer?.Release();
             dirtyBrickBuffer?.Release();
             brickDataBuffer?.Release();
@@ -290,6 +300,8 @@ namespace RealtimeGI
             occupancyBuffer = null;
             surfaceBuffer = null;
             surfaceUvBuffer = null;
+            surfaceIdentityBuffer = null;
+            surfaceKeyBuffer = null;
             distanceBuffer = null;
             dirtyBrickBuffer = null;
             brickDataBuffer = null;

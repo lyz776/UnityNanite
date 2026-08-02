@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 01f85d53766efe14ea8dd3d999fe5669, type: 3}
   m_Name: Default TOD Profile
   m_EditorClassIdentifier: Assembly-CSharp::UnityNanite.TOD.TODProfile
-  generatedPresetVersion: 10
+  generatedPresetVersion: 12
   sky:
     lightBottom:
       useGradient: 1
@@ -174,14 +174,14 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     horizonWidth:
-      useCurve: 0
-      constant: 0.085
+      useCurve: 1
+      constant: 0.299
       curve:
         serializedVersion: 2
         m_Curve:
         - serializedVersion: 3
-          time: 0
-          value: 0.085
+          time: 5.8231297
+          value: 0.14837873
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -189,8 +189,17 @@ MonoBehaviour:
           inWeight: 0
           outWeight: 0
         - serializedVersion: 3
-          time: 24
-          value: 0.085
+          time: 10.881988
+          value: 0.199
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 18.068027
+          value: 0.146
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -201,8 +210,8 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     horizonIntensity:
-      useCurve: 0
-      constant: 0.68
+      useCurve: 1
+      constant: 2.2
       curve:
         serializedVersion: 2
         m_Curve:
@@ -216,8 +225,35 @@ MonoBehaviour:
           inWeight: 0
           outWeight: 0
         - serializedVersion: 3
-          time: 24
-          value: 0.68
+          time: 6.367347
+          value: 1.964315
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 11.156463
+          value: 1.0549355
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 18.557823
+          value: 1.741633
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 23.891157
+          value: 0.69212604
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -229,7 +265,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     exposure:
       useCurve: 0
-      constant: 1
+      constant: 0.8
       curve:
         serializedVersion: 2
         m_Curve:
@@ -375,14 +411,68 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     horizonSunGlow:
-      useCurve: 0
+      useCurve: 1
       constant: 0.42
       curve:
         serializedVersion: 2
         m_Curve:
         - serializedVersion: 3
           time: 0
-          value: 0.42
+          value: 0
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 3.9727893
+          value: 0
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 5.170068
+          value: 8
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 7.455782
+          value: 0
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 16.745342
+          value: 0
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 17.52381
+          value: 1.8772352
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 19.210884
+          value: 0.01637793
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -391,7 +481,7 @@ MonoBehaviour:
           outWeight: 0
         - serializedVersion: 3
           time: 24
-          value: 0.42
+          value: 0
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -403,7 +493,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     horizonSunGlowPower:
       useCurve: 0
-      constant: 10
+      constant: 16.6
       curve:
         serializedVersion: 2
         m_Curve:
@@ -490,7 +580,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     sunScatterPower:
       useCurve: 0
-      constant: 34
+      constant: 64
       curve:
         serializedVersion: 2
         m_Curve:
@@ -685,7 +775,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     sunWashPower:
       useCurve: 0
-      constant: 2.4
+      constant: 7.2
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1053,6 +1143,8 @@ MonoBehaviour:
         m_RotationOrder: 4
   clouds:
     enabled: 1
+    shapeTexture: {fileID: 2800000, guid: b7f9e52942f445d591782a67c91c31a4, type: 3}
+    unevenTexture: {fileID: 2800000, guid: d8a3c29f8d1245b9afad1be88266c74c, type: 3}
     color:
       useGradient: 1
       color: {r: 0.92, g: 0.96, b: 1, a: 1}
@@ -1253,7 +1345,7 @@ MonoBehaviour:
         m_NumAlphaKeys: 2
     directionalColorAmount:
       useCurve: 0
-      constant: 0.82
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1313,7 +1405,7 @@ MonoBehaviour:
         m_NumAlphaKeys: 2
     rimIntensity:
       useCurve: 0
-      constant: 0.62
+      constant: 7.7
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1340,7 +1432,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     rimPower:
       useCurve: 0
-      constant: 3.5
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1367,7 +1459,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     rimWidth:
       useCurve: 0
-      constant: 0.08
+      constant: 0.004
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1394,7 +1486,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     opacity:
       useCurve: 0
-      constant: 0.68
+      constant: 0.58
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1421,7 +1513,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     coverage:
       useCurve: 0
-      constant: 0.58
+      constant: 0.08
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1448,7 +1540,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     scale:
       useCurve: 0
-      constant: 6.2
+      constant: 1.6
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1475,7 +1567,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     detailScale:
       useCurve: 0
-      constant: 3.4
+      constant: 7
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1502,7 +1594,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     softness:
       useCurve: 0
-      constant: 0.1
+      constant: 0.282
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1529,7 +1621,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     erosion:
       useCurve: 0
-      constant: 0.44
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1556,7 +1648,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     distortion:
       useCurve: 0
-      constant: 1.2
+      constant: 0.94
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1583,7 +1675,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     speedX:
       useCurve: 0
-      constant: 0.006
+      constant: 0
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1610,7 +1702,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     speedY:
       useCurve: 0
-      constant: 0.002
+      constant: 0.001
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1637,7 +1729,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     altitude:
       useCurve: 0
-      constant: 6
+      constant: 1.3
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1664,7 +1756,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     thickness:
       useCurve: 0
-      constant: 1.25
+      constant: 8.6
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1691,7 +1783,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     densityMultiplier:
       useCurve: 0
-      constant: 1
+      constant: 4.84
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1718,7 +1810,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     horizonDensity:
       useCurve: 0
-      constant: 0.55
+      constant: 0.06
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1745,7 +1837,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     zenithDensity:
       useCurve: 0
-      constant: 1
+      constant: 0.13
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1772,7 +1864,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     latitudePosition:
       useCurve: 0
-      constant: 0.3
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1799,7 +1891,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     latitudeWidth:
       useCurve: 0
-      constant: 0.35
+      constant: 0.83
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1826,7 +1918,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     horizonFade:
       useCurve: 0
-      constant: 0.12
+      constant: 0.5
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1853,7 +1945,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     scatteringCoefficient:
       useGradient: 0
-      color: {r: 0.7, g: 0.72, b: 0.76, a: 1}
+      color: {r: 0, g: 0.375, b: 1, a: 1}
       gradient:
         serializedVersion: 2
         key0: {r: 0.7, g: 0.72, b: 0.76, a: 1}
@@ -1886,7 +1978,7 @@ MonoBehaviour:
         m_NumAlphaKeys: 2
     absorptionCoefficient:
       useGradient: 0
-      color: {r: 0.015, g: 0.02, b: 0.03, a: 1}
+      color: {r: 1, g: 1, b: 1, a: 1}
       gradient:
         serializedVersion: 2
         key0: {r: 0.015, g: 0.02, b: 0.03, a: 1}
@@ -1919,7 +2011,7 @@ MonoBehaviour:
         m_NumAlphaKeys: 2
     phaseForward:
       useCurve: 0
-      constant: 0.72
+      constant: 0.45
       curve:
         serializedVersion: 2
         m_Curve:
@@ -1946,7 +2038,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     phaseBackward:
       useCurve: 0
-      constant: -0.28
+      constant: -0.118
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2000,7 +2092,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     sunLighting:
       useCurve: 0
-      constant: 0.85
+      constant: 8
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2054,7 +2146,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     ambientColor:
       useGradient: 0
-      color: {r: 0.32, g: 0.42, b: 0.58, a: 1}
+      color: {r: 0, g: 0.61069715, b: 0.6313726, a: 1}
       gradient:
         serializedVersion: 2
         key0: {r: 0.32, g: 0.42, b: 0.58, a: 1}
@@ -2087,7 +2179,7 @@ MonoBehaviour:
         m_NumAlphaKeys: 2
     ambientIntensity:
       useCurve: 0
-      constant: 0.3
+      constant: 2.44
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2114,7 +2206,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     multipleScattering:
       useCurve: 0
-      constant: 0.34
+      constant: 2
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2168,7 +2260,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     lightWrap:
       useCurve: 0
-      constant: 0.36
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2195,7 +2287,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     selfShadowStrength:
       useCurve: 0
-      constant: 1.8
+      constant: 8
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2222,7 +2314,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     selfShadowDistance:
       useCurve: 0
-      constant: 0.4
+      constant: 0.13
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2249,7 +2341,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     stylization:
       useCurve: 0
-      constant: 0.62
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2276,7 +2368,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     lightSteps:
       useCurve: 0
-      constant: 4
+      constant: 8
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2303,7 +2395,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     lightStepSoftness:
       useCurve: 0
-      constant: 0.27
+      constant: 0.362
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2329,13 +2421,22 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     sunTransmission:
-      useCurve: 0
-      constant: 0.75
+      useCurve: 1
+      constant: 2.3
       curve:
         serializedVersion: 2
         m_Curve:
         - serializedVersion: 3
-          time: 0
+          time: 6.5306125
+          value: 8
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 11.776398
           value: 0.75
           inSlope: 0
           outSlope: 0
@@ -2344,8 +2445,8 @@ MonoBehaviour:
           inWeight: 0
           outWeight: 0
         - serializedVersion: 3
-          time: 24
-          value: 0.75
+          time: 18
+          value: 8
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -2356,14 +2457,14 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     sunTransmissionPower:
-      useCurve: 0
-      constant: 3.2
+      useCurve: 1
+      constant: 0.1
       curve:
         serializedVersion: 2
         m_Curve:
         - serializedVersion: 3
-          time: 0
-          value: 3.2
+          time: 6.367347
+          value: 16
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -2371,8 +2472,17 @@ MonoBehaviour:
           inWeight: 0
           outWeight: 0
         - serializedVersion: 3
-          time: 24
-          value: 3.2
+          time: 12.422359
+          value: 0.73
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 18.068027
+          value: 15.797181
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -2384,7 +2494,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     undersideStrength:
       useCurve: 0
-      constant: 0.56
+      constant: 1
       curve:
         serializedVersion: 2
         m_Curve:
@@ -2409,6 +2519,368 @@ MonoBehaviour:
         m_PreInfinity: 2
         m_PostInfinity: 2
         m_RotationOrder: 4
+    layer2:
+      enabled: 1
+      opacity:
+        useCurve: 0
+        constant: 0.17
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.42
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.42
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      coverageOffset:
+        useCurve: 0
+        constant: -1
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: -0.08
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: -0.08
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      altitude:
+        useCurve: 0
+        constant: 46.1
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 9.5
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 9.5
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      scale:
+        useCurve: 0
+        constant: 0.1
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.52
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.52
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      speedX:
+        useCurve: 0
+        constant: -0.0025
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: -0.0025
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: -0.0025
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      speedY:
+        useCurve: 0
+        constant: 0.0012
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.0012
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.0012
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      fogBlend:
+        useCurve: 0
+        constant: 1
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.3
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.3
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+    lightning:
+      enabled: 0
+      glowTexture: {fileID: 2800000, guid: ef7d4a5c99d43914da188b33edbecd99, type: 3}
+      color:
+        useGradient: 0
+        color: {r: 0.55, g: 0.72, b: 1.4, a: 1}
+        gradient:
+          serializedVersion: 2
+          key0: {r: 0.55, g: 0.72, b: 1.4, a: 1}
+          key1: {r: 0.55, g: 0.72, b: 1.4, a: 1}
+          key2: {r: 0, g: 0, b: 0, a: 0}
+          key3: {r: 0, g: 0, b: 0, a: 0}
+          key4: {r: 0, g: 0, b: 0, a: 0}
+          key5: {r: 0, g: 0, b: 0, a: 0}
+          key6: {r: 0, g: 0, b: 0, a: 0}
+          key7: {r: 0, g: 0, b: 0, a: 0}
+          ctime0: 0
+          ctime1: 65535
+          ctime2: 0
+          ctime3: 0
+          ctime4: 0
+          ctime5: 0
+          ctime6: 0
+          ctime7: 0
+          atime0: 0
+          atime1: 65535
+          atime2: 0
+          atime3: 0
+          atime4: 0
+          atime5: 0
+          atime6: 0
+          atime7: 0
+          m_Mode: 0
+          m_ColorSpace: -1
+          m_NumColorKeys: 2
+          m_NumAlphaKeys: 2
+      intensity:
+        useCurve: 0
+        constant: 4
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 4
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 4
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      frequency:
+        useCurve: 0
+        constant: 0.25
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.25
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.25
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      duration:
+        useCurve: 0
+        constant: 0.42
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.42
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.42
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      scale:
+        useCurve: 0
+        constant: 1.2
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 1.2
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 1.2
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
+      glowSpeed:
+        useCurve: 0
+        constant: 0.004
+        curve:
+          serializedVersion: 2
+          m_Curve:
+          - serializedVersion: 3
+            time: 0
+            value: 0.004
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          - serializedVersion: 3
+            time: 24
+            value: 0.004
+            inSlope: 0
+            outSlope: 0
+            tangentMode: 0
+            weightedMode: 0
+            inWeight: 0
+            outWeight: 0
+          m_PreInfinity: 2
+          m_PostInfinity: 2
+          m_RotationOrder: 4
     shadows:
       enabled: 1
       color:
@@ -2446,7 +2918,7 @@ MonoBehaviour:
           m_NumAlphaKeys: 2
       scale:
         useCurve: 0
-        constant: 0.0015
+        constant: 0.0026
         curve:
           serializedVersion: 2
           m_Curve:
@@ -2473,7 +2945,7 @@ MonoBehaviour:
           m_RotationOrder: 4
       sunnyStrength:
         useCurve: 0
-        constant: 0.22
+        constant: 0
         curve:
           serializedVersion: 2
           m_Curve:
@@ -2527,7 +2999,7 @@ MonoBehaviour:
           m_RotationOrder: 4
       softness:
         useCurve: 0
-        constant: 0.12
+        constant: 0.001
         curve:
           serializedVersion: 2
           m_Curve:
@@ -2554,7 +3026,7 @@ MonoBehaviour:
           m_RotationOrder: 4
       maxDistance:
         useCurve: 0
-        constant: 1800
+        constant: 10000
         curve:
           serializedVersion: 2
           m_Curve:
@@ -2587,10 +3059,10 @@ MonoBehaviour:
         serializedVersion: 2
         key0: {r: 0.12, g: 0.12, b: 0.18, a: 1}
         key1: {r: 0.12, g: 0.12, b: 0.18, a: 1}
-        key2: {r: 1.5, g: 0.22, b: 0.025, a: 0}
+        key2: {r: 2.0026178, g: 0.6167886, b: 0.29283562, a: 0}
         key3: {r: 1, g: 0.95, b: 0.84, a: 0}
         key4: {r: 1, g: 0.95, b: 0.84, a: 0}
-        key5: {r: 1.5, g: 0.22, b: 0.025, a: 0}
+        key5: {r: 2.0026178, g: 0.6167886, b: 0.29283562, a: 0}
         key6: {r: 0.12, g: 0.12, b: 0.18, a: 0}
         key7: {r: 0.12, g: 0.12, b: 0.18, a: 0}
         ctime0: 0
@@ -2630,7 +3102,7 @@ MonoBehaviour:
           outWeight: 0
         - serializedVersion: 3
           time: 5.5
-          value: 0
+          value: 0.26
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -2647,8 +3119,8 @@ MonoBehaviour:
           inWeight: 0
           outWeight: 0
         - serializedVersion: 3
-          time: 12
-          value: 1.2
+          time: 12.109464
+          value: 1
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -2666,7 +3138,7 @@ MonoBehaviour:
           outWeight: 0
         - serializedVersion: 3
           time: 18.5
-          value: 0
+          value: 0.4
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -3704,8 +4176,8 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     useOcclusion: 1
-    environmentOcclusion: 0
-    allowOffScreen: 0
+    environmentOcclusion: 1
+    allowOffScreen: 1
     occlusionRadius:
       useCurve: 0
       constant: 0.18
@@ -3916,14 +4388,14 @@ MonoBehaviour:
         m_PostInfinity: 2
         m_RotationOrder: 4
     bottomIntensity:
-      useCurve: 0
-      constant: 1
+      useCurve: 1
+      constant: 8
       curve:
         serializedVersion: 2
         m_Curve:
         - serializedVersion: 3
-          time: 0
-          value: 1
+          time: 6.5306125
+          value: 3
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -3931,8 +4403,17 @@ MonoBehaviour:
           inWeight: 0
           outWeight: 0
         - serializedVersion: 3
-          time: 24
-          value: 1
+          time: 12.109464
+          value: 1.22
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 17.741497
+          value: 3.0054238
           inSlope: 0
           outSlope: 0
           tangentMode: 0
@@ -3944,7 +4425,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     skyIntensity:
       useCurve: 0
-      constant: 0.18
+      constant: 0.36
       curve:
         serializedVersion: 2
         m_Curve:
@@ -3998,7 +4479,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     exponentialBlend:
       useCurve: 0
-      constant: 0
+      constant: 0.64
       curve:
         serializedVersion: 2
         m_Curve:
@@ -4079,7 +4560,7 @@ MonoBehaviour:
         m_RotationOrder: 4
     density:
       useCurve: 0
-      constant: 1
+      constant: 4
       curve:
         serializedVersion: 2
         m_Curve:

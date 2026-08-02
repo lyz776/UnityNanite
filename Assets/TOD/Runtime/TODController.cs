@@ -193,6 +193,11 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODStarsRotation", value.stars.rotation.Evaluate(hour));
 
             Shader.SetGlobalFloat("_TODCloudsEnabled", value.clouds.enabled ? 1f : 0f);
+            Shader.SetGlobalTexture("_TODCloudShapeTexture", value.clouds.shapeTexture);
+            Shader.SetGlobalTexture("_TODCloudUnevenTexture", value.clouds.unevenTexture);
+            Shader.SetGlobalFloat(
+                "_TODCloudTexturesEnabled",
+                value.clouds.shapeTexture != null && value.clouds.unevenTexture != null ? 1f : 0f);
             SetColor("_TODCloudColor", value.clouds.color.Evaluate(hour));
             SetColor("_TODCloudShadowColor", value.clouds.shadowColor.Evaluate(hour));
             SetColor("_TODCloudFrontLitColor", value.clouds.frontLitColor.Evaluate(hour));
@@ -201,7 +206,7 @@ namespace UnityNanite.TOD
             SetColor("_TODCloudBackDarkColor", value.clouds.backDarkColor.Evaluate(hour));
             Shader.SetGlobalFloat(
                 "_TODCloudDirectionalColorAmount",
-                Mathf.Clamp01(value.clouds.directionalColorAmount.Evaluate(hour)));
+                1f);
             SetColor("_TODCloudRimColor", value.clouds.rimColor.Evaluate(hour));
             Shader.SetGlobalFloat("_TODCloudRimIntensity", Mathf.Max(0f, value.clouds.rimIntensity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudRimPower", Mathf.Max(0.01f, value.clouds.rimPower.Evaluate(hour)));
@@ -257,6 +262,38 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat(
                 "_TODCloudUndersideStrength",
                 Mathf.Clamp01(value.clouds.undersideStrength.Evaluate(hour)));
+
+            TODCloudSecondaryLayerSettings layer2 =
+                value.clouds.layer2 ?? (value.clouds.layer2 = new TODCloudSecondaryLayerSettings());
+            Shader.SetGlobalFloat("_TODCloudLayer2Enabled", layer2.enabled ? 1f : 0f);
+            Shader.SetGlobalFloat("_TODCloudLayer2Opacity", Mathf.Clamp01(layer2.opacity.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudLayer2CoverageOffset",
+                Mathf.Clamp(layer2.coverageOffset.Evaluate(hour), -1f, 1f));
+            Shader.SetGlobalFloat("_TODCloudLayer2Altitude", Mathf.Max(0.1f, layer2.altitude.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudLayer2Scale", Mathf.Max(0.01f, layer2.scale.Evaluate(hour)));
+            Shader.SetGlobalVector("_TODCloudLayer2Speed", new Vector4(
+                layer2.speedX.Evaluate(hour), layer2.speedY.Evaluate(hour), 0f, 0f));
+            Shader.SetGlobalFloat("_TODCloudLayer2FogBlend", Mathf.Clamp01(layer2.fogBlend.Evaluate(hour)));
+
+            TODCloudLightningSettings lightning =
+                value.clouds.lightning ?? (value.clouds.lightning = new TODCloudLightningSettings());
+            Shader.SetGlobalFloat("_TODCloudLightningEnabled", lightning.enabled ? 1f : 0f);
+            Shader.SetGlobalTexture(
+                "_TODCloudLightningTexture",
+                lightning.glowTexture != null ? lightning.glowTexture : value.clouds.unevenTexture);
+            SetColor("_TODCloudLightningColor", lightning.color.Evaluate(hour));
+            Shader.SetGlobalFloat(
+                "_TODCloudLightningIntensity",
+                Mathf.Max(0f, lightning.intensity.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudLightningFrequency",
+                Mathf.Max(0.001f, lightning.frequency.Evaluate(hour)));
+            Shader.SetGlobalFloat(
+                "_TODCloudLightningDuration",
+                Mathf.Max(0.02f, lightning.duration.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudLightningScale", Mathf.Max(0.01f, lightning.scale.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudLightningGlowSpeed", lightning.glowSpeed.Evaluate(hour));
 
             Shader.SetGlobalFloat(
                 "_TODCloudShadowsEnabled",

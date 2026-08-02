@@ -22,14 +22,25 @@ Shader "Hidden/Unity Nanite/TOD Cloud Shadow"
 
             float _TODCloudsEnabled;
             float _TODCloudShadowsEnabled;
+            TEXTURE2D(_TODCloudShapeTexture);
+            SAMPLER(sampler_TODCloudShapeTexture);
+            TEXTURE2D(_TODCloudUnevenTexture);
+            SAMPLER(sampler_TODCloudUnevenTexture);
+            float _TODCloudTexturesEnabled;
             float _TODDayOrNight;
             float3 _TODSunDir;
             float _TODCloudAltitude;
             float _TODCloudCoverage;
+            float _TODCloudScale;
             float _TODCloudDetailScale;
             float _TODCloudErosion;
             float _TODCloudDistortion;
             float2 _TODCloudSpeed;
+            float _TODCloudLayer2Enabled;
+            float _TODCloudLayer2Opacity;
+            float _TODCloudLayer2CoverageOffset;
+            float _TODCloudLayer2Scale;
+            float2 _TODCloudLayer2Speed;
 
             float3 _TODCloudShadowTint;
             float _TODCloudShadowScale;
@@ -78,16 +89,73 @@ Shader "Hidden/Unity Nanite/TOD Cloud Shadow"
                 float2 warp = float2(
                     Fbm(cloudUV * 0.52 + 7.13),
                     Fbm(cloudUV * 0.52 + float2(31.7, 19.2))) - 0.5;
-                float broadShape = Fbm(cloudUV + warp * _TODCloudDistortion);
-                float fineShape = Fbm(
+                float proceduralShape = Fbm(cloudUV + warp * _TODCloudDistortion);
+                float proceduralDetail = Fbm(
                     cloudUV * _TODCloudDetailScale - warp * 0.75 +
                     float2(12.4, -8.1));
+                float2 textureWarp = SAMPLE_TEXTURE2D(
+                    _TODCloudUnevenTexture,
+                    sampler_TODCloudUnevenTexture,
+                    cloudUV * 0.55).rg - 0.5;
+                float2 shapedUV = cloudUV + textureWarp *
+                    (_TODCloudDistortion * 0.035 * _TODCloudTexturesEnabled);
+                float textureShape = SAMPLE_TEXTURE2D(
+                    _TODCloudShapeTexture,
+                    sampler_TODCloudShapeTexture,
+                    shapedUV).r;
+                float textureDetail = SAMPLE_TEXTURE2D(
+                    _TODCloudShapeTexture,
+                    sampler_TODCloudShapeTexture,
+                    shapedUV * _TODCloudDetailScale + 0.371).r;
+                float uneven = SAMPLE_TEXTURE2D(
+                    _TODCloudUnevenTexture,
+                    sampler_TODCloudUnevenTexture,
+                    cloudUV * 2.0).r;
+                uneven = pow(saturate(uneven), 4.0);
+                float broadShape = lerp(
+                    proceduralShape,
+                    saturate(textureShape + (uneven - 0.5) * 0.18),
+                    _TODCloudTexturesEnabled);
+                float fineShape = lerp(
+                    proceduralDetail,
+                    textureDetail,
+                    _TODCloudTexturesEnabled);
                 float erodedDetail = lerp(0.5, fineShape, _TODCloudErosion);
                 float density =
                     broadShape - (1.0 - erodedDetail) * _TODCloudErosion * 0.42;
                 float threshold = lerp(0.64, 0.30, _TODCloudCoverage);
                 float edge = max(0.004, _TODCloudShadowSoftness * 0.32);
-                return smoothstep(threshold - edge, threshold + edge, density);
+                float shadow = smoothstep(
+                    threshold - edge,
+                    threshold + edge,
+                    density);
+                float2 layer2Direction = float2(
+                    -cloudUV.y * 0.573576 + cloudUV.x * 0.819152,
+                    cloudUV.x * 0.573576 + cloudUV.y * 0.819152);
+                float2 layer2UV = layer2Direction *
+                    (_TODCloudLayer2Scale / max(0.01, _TODCloudScale)) +
+                    _Time.y * (_TODCloudLayer2Speed - _TODCloudSpeed) +
+                    float2(13.71, -8.43);
+                float layer2Shape = SAMPLE_TEXTURE2D(
+                    _TODCloudShapeTexture,
+                    sampler_TODCloudShapeTexture,
+                    layer2UV).r;
+                float layer2Detail = SAMPLE_TEXTURE2D(
+                    _TODCloudShapeTexture,
+                    sampler_TODCloudShapeTexture,
+                    layer2UV * _TODCloudDetailScale + 0.371).r;
+                float layer2Density = layer2Shape -
+                    (1.0 - layer2Detail) * _TODCloudErosion * 0.42;
+                float layer2Coverage = saturate(
+                    _TODCloudCoverage + _TODCloudLayer2CoverageOffset);
+                float layer2Threshold = lerp(0.64, 0.30, layer2Coverage);
+                float shadow2 = smoothstep(
+                    layer2Threshold - edge * 1.35,
+                    layer2Threshold + edge * 1.35,
+                    layer2Density) * _TODCloudLayer2Enabled *
+                    _TODCloudLayer2Opacity;
+                shadow = 1.0 - (1.0 - shadow) * (1.0 - shadow2);
+                return shadow * smoothstep(0.0, 0.02, _TODCloudCoverage);
             }
 
             half4 Frag(Varyings input) : SV_Target

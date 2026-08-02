@@ -16,6 +16,8 @@ namespace RealtimeGI
         public const int OccupancyWordsPerBrick = CellsPerBrick / 32;
         public const int SurfaceWordsPerBrick = CellsPerBrick;
         public const int SurfaceUvWordsPerBrick = CellsPerBrick;
+        public const int SurfaceIdentityWordsPerBrick = CellsPerBrick;
+        public const int SurfaceKeyWordsPerBrick = CellsPerBrick;
         public const int RadianceLobeCount = 6;
         public const int RadianceWordsPerBrick = CellsPerBrick * RadianceLobeCount;
         public const int ValidityWordsPerBrick = CellsPerBrick;
@@ -97,6 +99,7 @@ namespace RealtimeGI
         public readonly GraphicsBuffer staticOccupancy;
         public readonly GraphicsBuffer staticSurface;
         public readonly GraphicsBuffer staticSurfaceUv;
+        public readonly GraphicsBuffer staticSurfaceIdentity;
         public readonly GraphicsBuffer staticDistance;
         public readonly GraphicsBuffer staticRadiance;
         public readonly GraphicsBuffer staticValidity;
@@ -104,24 +107,30 @@ namespace RealtimeGI
         public readonly GraphicsBuffer dynamicOccupancy;
         public readonly GraphicsBuffer dynamicSurface;
         public readonly GraphicsBuffer dynamicSurfaceUv;
+        public readonly GraphicsBuffer dynamicSurfaceIdentity;
         public readonly GraphicsBuffer dynamicDistance;
         public readonly GraphicsBuffer dynamicRadiance;
         public readonly GraphicsBuffer dynamicValidity;
         public readonly int staticBrickCount;
         public readonly int dynamicBrickCount;
         public readonly int generation;
+        // Changes only when the lighting input/cache contents are invalidated.
+        // Unlike generation, this is safe for deciding whether temporal screen history can be reused.
+        public readonly int lightingRevision;
 
         internal GIClipmapGpuView(
             GraphicsBuffer levelData,
             GIClipmapLayer staticLayer,
             GIClipmapLayer dynamicLayer,
-            int generation)
+            int generation,
+            int lightingRevision)
         {
             this.levelData = levelData;
             staticPageTable = staticLayer?.PageTableBuffer;
             staticOccupancy = staticLayer?.OccupancyBuffer;
             staticSurface = staticLayer?.SurfaceBuffer;
             staticSurfaceUv = staticLayer?.SurfaceUvBuffer;
+            staticSurfaceIdentity = staticLayer?.SurfaceIdentityBuffer;
             staticDistance = staticLayer?.DistanceBuffer;
             staticRadiance = staticLayer?.RadianceBuffer;
             staticValidity = staticLayer?.ValidityBuffer;
@@ -129,20 +138,24 @@ namespace RealtimeGI
             dynamicOccupancy = dynamicLayer?.OccupancyBuffer;
             dynamicSurface = dynamicLayer?.SurfaceBuffer;
             dynamicSurfaceUv = dynamicLayer?.SurfaceUvBuffer;
+            dynamicSurfaceIdentity = dynamicLayer?.SurfaceIdentityBuffer;
             dynamicDistance = dynamicLayer?.DistanceBuffer;
             dynamicRadiance = dynamicLayer?.RadianceBuffer;
             dynamicValidity = dynamicLayer?.ValidityBuffer;
             staticBrickCount = staticLayer?.AllocatedCount ?? 0;
             dynamicBrickCount = dynamicLayer?.AllocatedCount ?? 0;
             this.generation = generation;
+            this.lightingRevision = lightingRevision;
         }
 
         public bool IsValid => levelData != null &&
                                staticPageTable != null && staticOccupancy != null &&
                                staticSurface != null && staticSurfaceUv != null && staticDistance != null &&
+                               staticSurfaceIdentity != null &&
                                staticRadiance != null && staticValidity != null &&
                                dynamicPageTable != null && dynamicOccupancy != null &&
                                dynamicSurface != null && dynamicSurfaceUv != null && dynamicDistance != null &&
+                               dynamicSurfaceIdentity != null &&
                                dynamicRadiance != null && dynamicValidity != null;
     }
 }

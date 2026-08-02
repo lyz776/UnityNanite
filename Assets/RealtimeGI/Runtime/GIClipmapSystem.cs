@@ -15,6 +15,10 @@ namespace RealtimeGI
     [RequireComponent(typeof(RealtimeGIScene))]
     public sealed class GIClipmapSystem : MonoBehaviour
     {
+        // Increment whenever the persistent radiance representation or update addressing changes.
+        // Including this in the lighting signature guarantees that stale cache contents are
+        // requeued instead of surviving a shader-only implementation update.
+        const int RadianceAlgorithmVersion = 11;
         public static GIClipmapSystem Active { get; private set; }
         [Header("Sources")]
         public RealtimeGIScene scene;
@@ -88,6 +92,7 @@ namespace RealtimeGI
         int updateRadianceKernel = -1;
         int commitRadianceKernel = -1;
         int lightingSignature;
+        int lightingRevision;
         bool initialized;
         bool originsInitialized;
         int lastUpdateFrame = -1;
@@ -97,12 +102,15 @@ namespace RealtimeGI
         int localLightCapacity;
         int radianceScratchCapacity;
         int validityScratchCapacity;
+        bool gpuForensicsIssued;
 
         static readonly int DirtyBricksId = Shader.PropertyToID("_GIDirtyBricks");
         static readonly int DirtyBrickCountId = Shader.PropertyToID("_GIDirtyBrickCount");
         static readonly int OccupancyId = Shader.PropertyToID("_GIOccupancy");
         static readonly int SurfaceId = Shader.PropertyToID("_GISurface");
         static readonly int SurfaceUvId = Shader.PropertyToID("_GISurfaceUV");
+        static readonly int SurfaceIdentityId = Shader.PropertyToID("_GISurfaceIdentity");
+        static readonly int SurfaceKeyId = Shader.PropertyToID("_GISurfaceKey");
         static readonly int DistanceId = Shader.PropertyToID("_GIDistance");
         static readonly int InstancesId = Shader.PropertyToID("_GIInstances");
         static readonly int MaterialBindingsId = Shader.PropertyToID("_GIMaterialBindings");
@@ -116,6 +124,7 @@ namespace RealtimeGI
         static readonly int InstanceIndexId = Shader.PropertyToID("_GIInstanceIndex");
         static readonly int TriangleBaseId = Shader.PropertyToID("_GITriangleBase");
         static readonly int MaxCellsId = Shader.PropertyToID("_GIMaxCellsPerTriangle");
+        static readonly int VoxelizePhaseId = Shader.PropertyToID("_GIVoxelizePhase");
         static readonly int RadianceId = Shader.PropertyToID("_GIRadiance");
         static readonly int ValidityId = Shader.PropertyToID("_GIValidity");
         static readonly int BrickDataId = Shader.PropertyToID("_GIBrickData");
@@ -126,20 +135,22 @@ namespace RealtimeGI
         static readonly int MaterialCountId = Shader.PropertyToID("_GIMaterialCount");
         static readonly int MainLightDirectionId = Shader.PropertyToID("_GIMainLightDirection");
         static readonly int MainLightColorId = Shader.PropertyToID("_GIMainLightColor");
-        static readonly int SkyColorId = Shader.PropertyToID("_GISkyColor");
         static readonly int TargetBrickDataId = Shader.PropertyToID("_GITargetBrickData");
         static readonly int TargetOccupancyId = Shader.PropertyToID("_GITargetOccupancy");
         static readonly int TargetSurfaceId = Shader.PropertyToID("_GITargetSurface");
         static readonly int TargetSurfaceUvId = Shader.PropertyToID("_GITargetSurfaceUV");
+        static readonly int TargetSurfaceIdentityId = Shader.PropertyToID("_GITargetSurfaceIdentity");
         static readonly int TargetRadianceId = Shader.PropertyToID("_GITargetRadiance");
         static readonly int TargetValidityId = Shader.PropertyToID("_GITargetValidity");
         static readonly int StaticPageTableId = Shader.PropertyToID("_GIStaticPageTable");
         static readonly int StaticOccupancyId = Shader.PropertyToID("_GIStaticOccupancy");
         static readonly int StaticSurfaceId = Shader.PropertyToID("_GIStaticSurface");
+        static readonly int StaticSurfaceIdentityId = Shader.PropertyToID("_GIStaticSurfaceIdentity");
         static readonly int StaticDistanceId = Shader.PropertyToID("_GIStaticDistance");
         static readonly int DynamicPageTableId = Shader.PropertyToID("_GIDynamicPageTable");
         static readonly int DynamicOccupancyId = Shader.PropertyToID("_GIDynamicOccupancy");
         static readonly int DynamicSurfaceId = Shader.PropertyToID("_GIDynamicSurface");
+        static readonly int DynamicSurfaceIdentityId = Shader.PropertyToID("_GIDynamicSurfaceIdentity");
         static readonly int DynamicDistanceId = Shader.PropertyToID("_GIDynamicDistance");
         static readonly int RadianceShadowDistanceId = Shader.PropertyToID("_GIRadianceShadowDistance");
         static readonly int EnableRadianceShadowsId = Shader.PropertyToID("_GIEnableRadianceShadows");
@@ -163,6 +174,7 @@ namespace RealtimeGI
         static readonly int TargetLayerId = Shader.PropertyToID("_GITargetLayer");
 
         public int Generation => generation;
+        public int LightingRevision => lightingRevision;
         public RealtimeGIScene Scene => scene;
         public int StaticBrickCount => staticBrickCount;
         public int DynamicBrickCount => dynamicBrickCount;
@@ -213,19 +225,33 @@ namespace RealtimeGI
 
             staticLayer.UpdateRequired(staticRequired, levelOrigins, false);
             staticLayer.MarkDirty(invalidatedStaticBricks);
-            dynamicLayer.UpdateRequired(dynamicRequired, levelOrigins, true);
+            // `UpdateRequired(..., true)` dirties every allocated dynamic brick.  The clear
+            // pass then resets its validity every frame, while only a bounded subset can be
+            // re-lit below.  Dynamic cache cells therefore never become readable when the
+            // number of bricks exceeds the per-frame radiance budget.  Newly required bricks
+            // are already dirtied by UpdateRequired; motion needs explicit dirty regions,
+            // rather than invalidating the complete dynamic pool every frame.
+            dynamicLayer.UpdateRequired(dynamicRequired, levelOrigins, false);
 
             Light sun = RenderSettings.sun;
             Vector3 lightDirection = sun != null
                 ? sun.transform.forward
                 : new Vector3(0.3f, -0.8f, 0.2f).normalized;
             Color lightColorValue = sun != null ? sun.color.linear * sun.intensity : Color.white;
-            Color skyColorValue = RenderSettings.ambientSkyColor.linear;
+            // Track the analytic TOD environment that the compute shader samples.
+            // Unity ambientSkyColor is intentionally not part of the GI contract.
+            Color skyColorValue =
+                (Shader.GetGlobalColor("_TODLightBottom") +
+                 Shader.GetGlobalColor("_TODLightMiddle") +
+                 Shader.GetGlobalColor("_TODLightTop") +
+                 Shader.GetGlobalColor("_TODHorizonColor")) * 0.25f;
+            skyColorValue *= Mathf.Max(0f, Shader.GetGlobalFloat("_TODSkyExposure"));
             int nextLightingSignature = ComputeLightingSignature(
                 lightDirection, lightColorValue, skyColorValue);
             if (nextLightingSignature != lightingSignature)
             {
                 lightingSignature = nextLightingSignature;
+                unchecked { lightingRevision++; }
                 staticLayer.EnqueueAllRadiance();
                 dynamicLayer.EnqueueAllRadiance();
                 remainingStaticBounceSweeps = Mathf.Max(0, staticBounceSweeps - 1);
@@ -274,6 +300,7 @@ namespace RealtimeGI
             cmd.EndSample("RealtimeGI/Clipmap Total");
             Graphics.ExecuteCommandBuffer(cmd);
             CommandBufferPool.Release(cmd);
+            RequestGpuForensicsOnce();
 
             staticBrickCount = staticLayer.AllocatedCount;
             dynamicBrickCount = dynamicLayer.AllocatedCount;
@@ -286,6 +313,121 @@ namespace RealtimeGI
             if (originsChanged || geometryRebuilt || invalidatedStaticBricks.Count > 0)
                 estimatedPoolMiB = EstimatePoolMiB();
             WarnOnDegradation();
+        }
+
+        // This is deliberately a one-shot, raw-buffer audit. It avoids every screen-space
+        // shader and reports whether the cache builder actually wrote the same physical cells
+        // that the ray tracer can hit.
+        void RequestGpuForensicsOnce()
+        {
+            if (gpuForensicsIssued || !Application.isPlaying || Time.frameCount < 30)
+                return;
+            gpuForensicsIssued = true;
+            LogRadianceSourceForensics();
+            RequestLayerForensics("Static", staticLayer);
+            RequestLayerForensics("Dynamic", dynamicLayer);
+        }
+
+        void LogRadianceSourceForensics()
+        {
+            int emissiveMaterialCount = 0;
+            float maximumEmissive = 0f;
+            IReadOnlyList<GIGpuMaterialData> materials = scene != null ? scene.CpuMaterials : null;
+            if (materials != null)
+            {
+                for (int i = 0; i < materials.Count; i++)
+                {
+                    Vector4 emissive = materials[i].emissive;
+                    float intensity = Mathf.Max(emissive.x, Mathf.Max(emissive.y, emissive.z));
+                    if (intensity <= 1e-5f)
+                        continue;
+                    emissiveMaterialCount++;
+                    maximumEmissive = Mathf.Max(maximumEmissive, intensity);
+                }
+            }
+            Light sun = RenderSettings.sun;
+            string sunInfo = sun == null
+                ? "none"
+                : $"{sun.name}, intensity={sun.intensity:F3}, color={sun.color.linear}";
+            Debug.Log($"[RealtimeGI][Forensics] Sources: materials={materials?.Count ?? 0}, " +
+                      $"emissiveMaterials={emissiveMaterialCount}, maxEmissive={maximumEmissive:F3}, " +
+                      $"sun={sunInfo}, localLights={activeLocalLightCount}, " +
+                      $"radianceShadows={enableRadianceShadows}.");
+        }
+
+        static void RequestLayerForensics(string layerName, GIClipmapLayer layer)
+        {
+            if (layer == null || layer.AllocatedCount == 0)
+            {
+                Debug.Log($"[RealtimeGI][Forensics] {layerName}: no allocated bricks.");
+                return;
+            }
+
+            AsyncGPUReadback.Request(layer.ValidityBuffer, validityRequest =>
+            {
+                if (validityRequest.hasError)
+                {
+                    Debug.LogError($"[RealtimeGI][Forensics] {layerName}: validity readback failed.");
+                    return;
+                }
+
+                var validity = validityRequest.GetData<uint>();
+                int validCellCount = 0;
+                int firstValidCell = -1;
+                uint maximumConfidence = 0u;
+                for (int i = 0; i < validity.Length; i++)
+                {
+                    uint confidence = validity[i] & 0xffu;
+                    if (confidence == 0u)
+                        continue;
+                    validCellCount++;
+                    maximumConfidence = Math.Max(maximumConfidence, confidence);
+                    if (firstValidCell < 0)
+                        firstValidCell = i;
+                }
+                if (firstValidCell < 0)
+                {
+                    Debug.LogError($"[RealtimeGI][Forensics] {layerName}: validity has 0 valid cells " +
+                                   $"across {validity.Length} cells.");
+                    return;
+                }
+
+                int physicalBrick = firstValidCell / GIClipmapConstants.CellsPerBrick;
+                int localCell = firstValidCell % GIClipmapConstants.CellsPerBrick;
+                uint rawValidity = validity[firstValidCell];
+                int occupancyOffset = (physicalBrick * GIClipmapConstants.OccupancyWordsPerBrick +
+                                       localCell / 32) * 4;
+                int radianceOffset = (physicalBrick * GIClipmapConstants.RadianceWordsPerBrick) * 4;
+                AsyncGPUReadback.Request(layer.OccupancyBuffer, 4, occupancyOffset, occupancyRequest =>
+                {
+                    if (occupancyRequest.hasError)
+                    {
+                        Debug.LogError($"[RealtimeGI][Forensics] {layerName}: occupancy readback failed.");
+                        return;
+                    }
+                    uint occupancyWord = occupancyRequest.GetData<uint>()[0];
+                    bool occupied = (occupancyWord & (1u << (localCell & 31))) != 0u;
+                    AsyncGPUReadback.Request(layer.RadianceBuffer,
+                        GIClipmapConstants.RadianceWordsPerBrick * 4, radianceOffset, radianceRequest =>
+                    {
+                        if (radianceRequest.hasError)
+                        {
+                            Debug.LogError($"[RealtimeGI][Forensics] {layerName}: radiance readback failed.");
+                            return;
+                        }
+                        var radiance = radianceRequest.GetData<uint>();
+                        int firstLobe = localCell * GIClipmapConstants.RadianceLobeCount;
+                        int nonZeroLobes = 0;
+                        for (int lobe = 0; lobe < GIClipmapConstants.RadianceLobeCount; lobe++)
+                            nonZeroLobes += radiance[firstLobe + lobe] != 0u ? 1 : 0;
+                        Debug.Log(
+                            $"[RealtimeGI][Forensics] {layerName}: validCells={validCellCount}, " +
+                            $"maxConfidence={maximumConfidence}, brick={physicalBrick}, cell={localCell}, " +
+                            $"occupied={occupied}, validity=0x{rawValidity:X8}, " +
+                            $"nonZeroLobes={nonZeroLobes}/6.");
+                    });
+                });
+            });
         }
 
         bool EnsureInitialized()
@@ -599,6 +741,8 @@ namespace RealtimeGI
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, OccupancyId, layer.OccupancyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceId, layer.SurfaceBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceUvId, layer.SurfaceUvBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceIdentityId, layer.SurfaceIdentityBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceKeyId, layer.SurfaceKeyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, DistanceId, layer.DistanceBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, RadianceId, layer.RadianceBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, ValidityId, layer.ValidityBuffer);
@@ -622,30 +766,39 @@ namespace RealtimeGI
             cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, OccupancyId, layer.OccupancyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceId, layer.SurfaceBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceUvId, layer.SurfaceUvBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceIdentityId, layer.SurfaceIdentityBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceKeyId, layer.SurfaceKeyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, DistanceId, layer.DistanceBuffer);
 
             IReadOnlyList<GIGpuInstanceData> instances = scene.CpuInstances;
             IReadOnlyList<GIGpuGeometryStreamData> ranges = geometryCache.Ranges;
-            for (int instanceIndex = 0; instanceIndex < instances.Count; instanceIndex++)
+            // Phase 0 atomically selects the closest deterministic triangle key for every cell.
+            // Phase 1 repeats the conservative coverage and commits only the selected candidate,
+            // keeping material, UV and instance identity from the same triangle.
+            for (int phase = 0; phase < 2; phase++)
             {
-                GIGpuInstanceData instance = instances[instanceIndex];
-                bool isDynamic = ((GIInstanceFlags)instance.flags & GIInstanceFlags.Dynamic) != 0;
-                if (isDynamic != dynamic || instance.geometryIndex >= ranges.Count)
-                    continue;
-                if (!SphereTouchesDirtyBrick(instance.worldBoundingSphere, layer))
-                    continue;
-                uint triangleCount = ranges[(int)instance.geometryIndex].triangleCount;
-                if (triangleCount == 0)
-                    continue;
-                cmd.SetComputeIntParam(clipmapBuildShader, InstanceIndexId, instanceIndex);
-                const uint maxTrianglesPerDispatch = 65535u * 64u;
-                uint triangleBase = 0;
-                while (triangleBase < triangleCount)
+                cmd.SetComputeIntParam(clipmapBuildShader, VoxelizePhaseId, phase);
+                for (int instanceIndex = 0; instanceIndex < instances.Count; instanceIndex++)
                 {
-                    uint batchCount = Math.Min(maxTrianglesPerDispatch, triangleCount - triangleBase);
-                    cmd.SetComputeIntParam(clipmapBuildShader, TriangleBaseId, (int)triangleBase);
-                    cmd.DispatchCompute(clipmapBuildShader, voxelizeKernel, Mathf.CeilToInt(batchCount / 64f), 1, 1);
-                    triangleBase += batchCount;
+                    GIGpuInstanceData instance = instances[instanceIndex];
+                    bool isDynamic = ((GIInstanceFlags)instance.flags & GIInstanceFlags.Dynamic) != 0;
+                    if (isDynamic != dynamic || instance.geometryIndex >= ranges.Count)
+                        continue;
+                    if (!SphereTouchesDirtyBrick(instance.worldBoundingSphere, layer))
+                        continue;
+                    uint triangleCount = ranges[(int)instance.geometryIndex].triangleCount;
+                    if (triangleCount == 0)
+                        continue;
+                    cmd.SetComputeIntParam(clipmapBuildShader, InstanceIndexId, instanceIndex);
+                    const uint maxTrianglesPerDispatch = 65535u * 64u;
+                    uint triangleBase = 0;
+                    while (triangleBase < triangleCount)
+                    {
+                        uint batchCount = Math.Min(maxTrianglesPerDispatch, triangleCount - triangleBase);
+                        cmd.SetComputeIntParam(clipmapBuildShader, TriangleBaseId, (int)triangleBase);
+                        cmd.DispatchCompute(clipmapBuildShader, voxelizeKernel, Mathf.CeilToInt(batchCount / 64f), 1, 1);
+                        triangleBase += batchCount;
+                    }
                 }
             }
         }
@@ -700,8 +853,6 @@ namespace RealtimeGI
             cmd.SetComputeVectorParam(radianceCacheShader, MainLightDirectionId, lightDirection);
             cmd.SetComputeVectorParam(radianceCacheShader, MainLightColorId,
                 new Vector4(lightColor.r, lightColor.g, lightColor.b, 0f));
-            cmd.SetComputeVectorParam(radianceCacheShader, SkyColorId,
-                new Vector4(skyColor.r, skyColor.g, skyColor.b, 0f));
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 RadianceDirtyBricksId, layer.RadianceDirtyBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
@@ -712,6 +863,15 @@ namespace RealtimeGI
                 TargetSurfaceId, layer.SurfaceBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 TargetSurfaceUvId, layer.SurfaceUvBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                TargetSurfaceIdentityId, layer.SurfaceIdentityBuffer);
+            // UpdateSurfaceRadiance reads the previous persistent cache before writing its
+            // compact staging result. These bindings are kernel-local in Unity; binding them
+            // only for CommitSurfaceRadiance left the update dispatch with undefined inputs.
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                TargetRadianceId, layer.RadianceBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                TargetValidityId, layer.ValidityBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 TargetRadianceScratchId, radianceScratchBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
@@ -733,6 +893,8 @@ namespace RealtimeGI
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 StaticSurfaceId, staticLayer.SurfaceBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                StaticSurfaceIdentityId, staticLayer.SurfaceIdentityBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 StaticDistanceId, staticLayer.DistanceBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 StaticRadianceId, staticLayer.RadianceBuffer);
@@ -744,6 +906,8 @@ namespace RealtimeGI
                 DynamicOccupancyId, dynamicLayer.OccupancyBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 DynamicSurfaceId, dynamicLayer.SurfaceBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                DynamicSurfaceIdentityId, dynamicLayer.SurfaceIdentityBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 DynamicDistanceId, dynamicLayer.DistanceBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
@@ -774,9 +938,19 @@ namespace RealtimeGI
             unchecked
             {
                 int hash = 17;
-                hash = hash * 31 + lightDirection.GetHashCode();
-                hash = hash * 31 + lightColor.GetHashCode();
-                hash = hash * 31 + skyColor.GetHashCode();
+                hash = hash * 31 + RadianceAlgorithmVersion;
+                // TOD modifies these floats every frame.  Quantisation requeues radiance only
+                // for a perceptible lighting change, instead of continuously invalidating the
+                // cache and the one-ray temporal reconstruction.
+                hash = hash * 31 + QuantizeLighting(lightDirection.x, 8f);
+                hash = hash * 31 + QuantizeLighting(lightDirection.y, 8f);
+                hash = hash * 31 + QuantizeLighting(lightDirection.z, 8f);
+                hash = hash * 31 + QuantizeLighting(lightColor.r, 4f);
+                hash = hash * 31 + QuantizeLighting(lightColor.g, 4f);
+                hash = hash * 31 + QuantizeLighting(lightColor.b, 4f);
+                hash = hash * 31 + QuantizeLighting(skyColor.r, 4f);
+                hash = hash * 31 + QuantizeLighting(skyColor.g, 4f);
+                hash = hash * 31 + QuantizeLighting(skyColor.b, 4f);
                 hash = hash * 31 + secondaryBounceRays;
                 hash = hash * 31 + secondaryBounceIntensity.GetHashCode();
                 hash = hash * 31 + radianceShadowDistance.GetHashCode();
@@ -800,6 +974,8 @@ namespace RealtimeGI
                 return hash;
             }
         }
+
+        static int QuantizeLighting(float value, float scale) => Mathf.RoundToInt(value * scale);
 
         bool SphereTouchesDirtyBrick(Vector4 sphere, GIClipmapLayer layer)
         {
@@ -827,6 +1003,8 @@ namespace RealtimeGI
                 GIClipmapConstants.OccupancyWordsPerBrick * 4L +
                 GIClipmapConstants.SurfaceWordsPerBrick * 4L +
                 GIClipmapConstants.SurfaceUvWordsPerBrick * 4L +
+                GIClipmapConstants.SurfaceIdentityWordsPerBrick * 4L +
+                GIClipmapConstants.SurfaceKeyWordsPerBrick * 4L +
                 GIClipmapConstants.DistanceWordsPerBrick * 4L +
                 GIClipmapConstants.RadianceWordsPerBrick * 4L +
                 GIClipmapConstants.ValidityWordsPerBrick * 4L +
@@ -862,7 +1040,7 @@ namespace RealtimeGI
 
         public bool TryGetGpuView(out GIClipmapGpuView view)
         {
-            view = new GIClipmapGpuView(levelDataBuffer, staticLayer, dynamicLayer, generation);
+            view = new GIClipmapGpuView(levelDataBuffer, staticLayer, dynamicLayer, generation, lightingRevision);
             return initialized && view.IsValid;
         }
 
@@ -906,6 +1084,7 @@ namespace RealtimeGI
             removedStaticInstances.Clear();
             invalidatedStaticBricks.Clear();
             lightingSignature = 0;
+            lightingRevision = 0;
             allocatedStaticCapacity = 0;
             allocatedDynamicCapacity = 0;
             localLightCapacity = 0;

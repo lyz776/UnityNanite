@@ -1,5 +1,44 @@
 %YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
+--- !u!114 &-6643794664479901761
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 31c35a5653c34aa78673086e7c2e6032, type: 3}
+  m_Name: RealtimeGIRendererFeature
+  m_EditorClassIdentifier: RealtimeGI::RealtimeGI.RealtimeGIRendererFeature
+  m_Active: 1
+  settings:
+    enableInSceneView: 1
+    enableDiffuse: 1
+    diffuseResolutionScale: 0.25
+    diffuseRaysPerProbe: 2
+    diffuseHistoryWeight: 0.98
+    diffuseIntensity: 1
+    maxTraceDistance: 150
+    screenTraceDistance: 12
+    diffuseSpatialSamples: 4
+    diffuseSpatialRadius: 4
+    enableSceneColorHistory: 0
+    enableSpecular: 1
+    specularResolutionScale: 0.5
+    specularHistoryWeight: 0.9
+    specularIntensity: 1
+    minSpecularRoughness: 0
+    maxSpecularRoughness: 0.8
+    specularSpatialSamples: 4
+    debugHitMaterialColor: 0
+    diffuseDebugStage: 0
+    enableTraceCounters: 0
+    traceCounterReadbackInterval: 10
+    pipelineVersion: 9
+    screenLightingShader: {fileID: 7200000, guid: 8ecfe36bca684db9be134731e21828c9, type: 3}
+    compositeShader: {fileID: 4800000, guid: 97a6c21fe47943a0a46becfd0f7a4230, type: 3}
 --- !u!114 &-1619528804519490273
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -41,10 +80,11 @@ MonoBehaviour:
     probeVolumeBlendStatesCS: {fileID: 7200000, guid: b9a23f869c4fd45f19c5ada54dd82176, type: 3}
   m_RendererFeatures:
   - {fileID: 7833122117494664109}
-  - {fileID: 0}
+  - {fileID: 279017014232383824}
   - {fileID: 6769014588011752513}
   - {fileID: -1619528804519490273}
-  m_RendererFeatureMap: ad6b866f10d7b46c50819c037f44df0341ace06de75ef05d1f4d1a07224786e9
+  - {fileID: -6643794664479901761}
+  m_RendererFeatureMap: ad6b866f10d7b46c50819c037f44df0341ace06de75ef05d1f4d1a07224786e9bf370af7f37fcca3
   m_UseNativeRenderPass: 1
   xrSystemData: {fileID: 0}
   postProcessData: {fileID: 11400000, guid: 41439944d30ece34e96484bdb6645b55, type: 2}
@@ -171,7 +211,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 45e5cfe15c6a0694188bf15701f8f61e, type: 3}
   m_Name: TODFogRendererFeature
   m_EditorClassIdentifier: Assembly-CSharp::UnityNanite.TOD.TODFogRendererFeature
-  m_Active: 0
+  m_Active: 1
   injectionPoint: 450
   sceneView: 1
 --- !u!114 &7833122117494664109

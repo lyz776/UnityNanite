@@ -838,29 +838,12 @@ Shader "Nanite/VBufferLitResolve"
                     inputData.normalWS,
                     inputData.viewDirectionWS,
                     inputData.normalizedScreenSpaceUV);
-                half3 reflectVector = reflect(-inputData.viewDirectionWS, inputData.normalWS);
-                half NoV = saturate(dot(inputData.normalWS, inputData.viewDirectionWS));
-                half fresnelTerm = Pow4(1.0h - NoV);
-                half mip = PerceptualRoughnessToMipmapLevel(brdfData.perceptualRoughness);
-
-                // Procedural resolve 下，unity_SpecCube0 可能未被正确绑定。
-                // 此时 GlobalIllumination 的 specular 分量会丢失，表现为 metallic 从 0->1 越来越黑。
-                half4 encodedProbe = half4(SAMPLE_TEXTURECUBE_LOD(unity_SpecCube0, samplerunity_SpecCube0, reflectVector, mip));
-                half3 probeSpecular = DecodeHDREnvironment(encodedProbe, unity_SpecCube0_HDR);
-                if (dot(probeSpecular, probeSpecular) < 1e-6h)
-                {
-                    half4 encodedEnv = half4(SAMPLE_TEXTURECUBE_LOD(_GlossyEnvironmentCubeMap, sampler_GlossyEnvironmentCubeMap, reflectVector, mip));
-                    half3 envSpecular = DecodeHDREnvironment(encodedEnv, _GlossyEnvironmentCubeMap_HDR);
-                    gi += envSpecular * EnvironmentBRDFSpecular(brdfData, fresnelTerm) * surfaceData.occlusion;
-                }
-
-                // 兜底：极端情况下 GI 全黑时，回退到环境BRDF整项。
-                if (dot(gi, gi) < 1e-6h)
-                {
-                    half4 encodedEnv = half4(SAMPLE_TEXTURECUBE_LOD(_GlossyEnvironmentCubeMap, sampler_GlossyEnvironmentCubeMap, reflectVector, mip));
-                    half3 envSpecular = DecodeHDREnvironment(encodedEnv, _GlossyEnvironmentCubeMap_HDR);
-                    gi = EnvironmentBRDF(brdfData, inputData.bakedGI, envSpecular, fresnelTerm) * surfaceData.occlusion;
-                }
+                // GlobalIllumination is the single owner of indirect light.  When the
+                // RealtimeGI deferred injection flag is active it deliberately returns
+                // zero here and the traced diffuse/specular terms are added later.  Do
+                // not resurrect unity_SpecCube0 or _GlossyEnvironmentCubeMap as a
+                // "black fallback": that bypassed the replacement contract and made
+                // Nanite surfaces keep reflection-probe / Unity skybox IBL forever.
 
                 GBufferFragOutput output = PackGBuffersBRDFData(
                     brdfData,

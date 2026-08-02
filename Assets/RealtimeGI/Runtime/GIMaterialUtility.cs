@@ -42,7 +42,11 @@ namespace RealtimeGI
             Color baseColor = material.HasProperty(BaseColorId)
                 ? material.GetColor(BaseColorId)
                 : material.HasProperty(ColorId) ? material.GetColor(ColorId) : Color.white;
-            Color emission = material.HasProperty(EmissionColorId)
+            // URP serializes _EmissionColor even while emission is disabled. In particular,
+            // Lit materials commonly retain a white value without the _EMISSION keyword.
+            // Treating that dormant value as radiance turns the whole surface cache white.
+            bool materialEmissionEnabled = material.IsKeywordEnabled("_EMISSION");
+            Color emission = materialEmissionEnabled && material.HasProperty(EmissionColorId)
                 ? material.GetColor(EmissionColorId)
                 : Color.black;
             float smoothness = material.HasProperty(SmoothnessId)
@@ -62,7 +66,9 @@ namespace RealtimeGI
             if (material.IsKeywordEnabled("_ALPHATEST_ON")) flags |= 4u;
             Texture baseMap = material.HasProperty(BaseMapId) ? material.GetTexture(BaseMapId) :
                 material.HasProperty(MainTexId) ? material.GetTexture(MainTexId) : null;
-            Texture emissionMap = material.HasProperty(EmissionMapId) ? material.GetTexture(EmissionMapId) : null;
+            Texture emissionMap = materialEmissionEnabled && material.HasProperty(EmissionMapId)
+                ? material.GetTexture(EmissionMapId)
+                : null;
             if (baseMap != null) flags |= 8u;
             if (emissionMap != null) flags |= 16u;
             Vector2 baseScale = material.HasProperty(BaseMapId) ? material.GetTextureScale(BaseMapId) :
@@ -120,7 +126,8 @@ namespace RealtimeGI
             for (int i = 0; i < materials.Length; i++)
             {
                 Material material = materials[i];
-                if (material != null && material.HasProperty(EmissionColorId) &&
+                if (material != null && material.IsKeywordEnabled("_EMISSION") &&
+                    material.HasProperty(EmissionColorId) &&
                     material.GetColor(EmissionColorId).maxColorComponent > 1e-5f)
                     return true;
             }

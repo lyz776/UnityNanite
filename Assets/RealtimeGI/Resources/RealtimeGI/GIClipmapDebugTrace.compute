@@ -7,10 +7,12 @@ StructuredBuffer<GIClipmapLevelData> _GIClipmapLevels;
 StructuredBuffer<int> _GIStaticPageTable;
 StructuredBuffer<uint> _GIStaticOccupancy;
 StructuredBuffer<uint> _GIStaticSurface;
+StructuredBuffer<uint> _GIStaticSurfaceIdentity;
 StructuredBuffer<uint> _GIStaticDistance;
 StructuredBuffer<int> _GIDynamicPageTable;
 StructuredBuffer<uint> _GIDynamicOccupancy;
 StructuredBuffer<uint> _GIDynamicSurface;
+StructuredBuffer<uint> _GIDynamicSurfaceIdentity;
 StructuredBuffer<uint> _GIDynamicDistance;
 RWTexture2D<float4> _GIResult;
 
@@ -56,15 +58,22 @@ void TraceDebug(uint3 dispatchId : SV_DispatchThreadID)
 
     float hitT;
     uint packedSurface;
+    uint hitIdentity;
     uint hitLayer;
     uint hitLevel;
+    int3 hitWorldCell;
+    int hitPhysicalBrick;
+    uint hitLocalCell;
     uint traceSteps;
     bool hit = GITraceUnifiedClipmaps(
         _GIClipmapLevels,
-        _GIStaticPageTable, _GIStaticOccupancy, _GIStaticSurface, _GIStaticDistance,
-        _GIDynamicPageTable, _GIDynamicOccupancy, _GIDynamicSurface, _GIDynamicDistance,
-        _GICameraPosition, direction, _GIMaxTraceDistance, 0u,
-        hitT, packedSurface, hitLayer, hitLevel, traceSteps);
+        _GIStaticPageTable, _GIStaticOccupancy, _GIStaticSurface, _GIStaticSurfaceIdentity,
+        _GIStaticDistance,
+        _GIDynamicPageTable, _GIDynamicOccupancy, _GIDynamicSurface, _GIDynamicSurfaceIdentity,
+        _GIDynamicDistance,
+        _GICameraPosition, direction, _GIMaxTraceDistance, 0u, 0u,
+        hitT, packedSurface, hitIdentity, hitLayer, hitLevel, hitWorldCell, hitPhysicalBrick,
+        hitLocalCell, traceSteps);
     if (!hit)
     {
         _GIResult[dispatchId.xy] = float4(0.015, 0.02, 0.03, 1.0);

@@ -13,13 +13,39 @@ namespace UnityNanite.TOD.Editor
         public const string DefaultProfilePath = "Assets/TOD/Profiles/Default TOD Profile.asset";
         public const string DefaultSkyMaterialPath = "Assets/TOD/Generated/TOD Dynamic Sky.mat";
         public const string DefaultPrefabPath = "Assets/TOD/Prefabs/TOD Rig.prefab";
+        private const string DefaultCloudShapePath =
+            "Assets/TOD/Textures/T_StylizedCloudShape.png";
+        private const string DefaultCloudUnevenPath =
+            "Assets/TOD/Textures/T_StylizedCloudUneven.png";
+        private const string DefaultCloudLightningPath =
+            "Assets/TOD/Textures/T_GlowPos.EXR";
         private const string DefaultLensFlareDataPath =
             "Packages/com.unity.render-pipelines.core/Runtime/RenderPipelineResources/Default Lens Flare (SRP).asset";
+
+        [InitializeOnLoadMethod]
+        private static void UpgradeDefaultProfileAfterReload()
+        {
+            EditorApplication.delayCall += () =>
+            {
+                TODProfile profile = AssetDatabase.LoadAssetAtPath<TODProfile>(DefaultProfilePath);
+                if (profile == null || profile.generatedPresetVersion >= 12)
+                    return;
+
+                EnsureCloudTextureImport(DefaultCloudShapePath);
+                EnsureCloudTextureImport(DefaultCloudUnevenPath);
+                EnsureCloudTextureImport(DefaultCloudLightningPath);
+                UpgradeGeneratedDefaultProfile(profile);
+                AssetDatabase.SaveAssets();
+            };
+        }
 
         [MenuItem("Tools/Unity Nanite/TOD/Install Project Defaults")]
         public static void InstallProjectDefaults()
         {
             EnsureFolders();
+            EnsureCloudTextureImport(DefaultCloudShapePath);
+            EnsureCloudTextureImport(DefaultCloudUnevenPath);
+            EnsureCloudTextureImport(DefaultCloudLightningPath);
             TODProfile profile = EnsureDefaultProfile();
             Material skyMaterial = EnsureSkyMaterial();
             EnsurePrefab(profile, skyMaterial);
@@ -78,6 +104,24 @@ namespace UnityNanite.TOD.Editor
                 AssetDatabase.CreateFolder(parent, name);
         }
 
+        private static void EnsureCloudTextureImport(string path)
+        {
+            TextureImporter importer = AssetImporter.GetAtPath(path) as TextureImporter;
+            if (importer == null)
+                return;
+
+            bool changed = importer.sRGBTexture ||
+                importer.wrapMode != TextureWrapMode.Repeat ||
+                importer.filterMode != FilterMode.Bilinear ||
+                !importer.mipmapEnabled;
+            importer.sRGBTexture = false;
+            importer.wrapMode = TextureWrapMode.Repeat;
+            importer.filterMode = FilterMode.Bilinear;
+            importer.mipmapEnabled = true;
+            if (changed)
+                importer.SaveAndReimport();
+        }
+
         private static TODProfile EnsureDefaultProfile()
         {
             TODProfile profile = AssetDatabase.LoadAssetAtPath<TODProfile>(DefaultProfilePath);
@@ -98,9 +142,42 @@ namespace UnityNanite.TOD.Editor
 
         private static void UpgradeGeneratedDefaultProfile(TODProfile profile)
         {
-            const int currentVersion = 10;
+            const int currentVersion = 12;
             if (profile.generatedPresetVersion >= currentVersion)
                 return;
+
+            // Version 12 adds the second high-cloud plane and the optional
+            // cloud-internal lightning controls while preserving tuned v11 data.
+            if (profile.generatedPresetVersion == 11)
+            {
+                profile.clouds.layer2 = new TODCloudSecondaryLayerSettings();
+                profile.clouds.lightning = new TODCloudLightningSettings
+                {
+                    glowTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudLightningPath)
+                };
+                profile.generatedPresetVersion = currentVersion;
+                EditorUtility.SetDirty(profile);
+                return;
+            }
+
+            // Version 11 only changes the high-cloud projection and texture
+            // inputs. Preserve every other value the user may already have
+            // tuned in the generated v10 profile.
+            if (profile.generatedPresetVersion == 10)
+            {
+                profile.clouds.shapeTexture =
+                    AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudShapePath);
+                profile.clouds.unevenTexture =
+                    AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudUnevenPath);
+                profile.clouds.directionalColorAmount = new TODFloatParameter(1f);
+                profile.clouds.rimPower = new TODFloatParameter(1f);
+                profile.clouds.rimWidth = new TODFloatParameter(0.025f);
+                profile.clouds.scale = new TODFloatParameter(1f);
+                profile.clouds.detailScale = new TODFloatParameter(12f);
+                profile.generatedPresetVersion = currentVersion;
+                EditorUtility.SetDirty(profile);
+                return;
+            }
 
             profile.sky.lightBottom = new TODColorParameter(
                 new Color(0.48f, 0.68f, 0.92f), true,
@@ -198,16 +275,18 @@ namespace UnityNanite.TOD.Editor
                 new TODColorParameter(new Color(1.18f, 0.82f, 0.52f));
             profile.clouds.backDarkColor =
                 new TODColorParameter(new Color(0.24f, 0.29f, 0.40f));
-            profile.clouds.directionalColorAmount = new TODFloatParameter(0.82f);
+            profile.clouds.shapeTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudShapePath);
+            profile.clouds.unevenTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudUnevenPath);
+            profile.clouds.directionalColorAmount = new TODFloatParameter(1f);
             profile.clouds.rimColor =
                 new TODColorParameter(new Color(1.2f, 0.82f, 0.5f));
             profile.clouds.rimIntensity = new TODFloatParameter(0.62f);
-            profile.clouds.rimPower = new TODFloatParameter(3.5f);
-            profile.clouds.rimWidth = new TODFloatParameter(0.08f);
+            profile.clouds.rimPower = new TODFloatParameter(1f);
+            profile.clouds.rimWidth = new TODFloatParameter(0.025f);
             profile.clouds.opacity = new TODFloatParameter(0.68f);
             profile.clouds.coverage = new TODFloatParameter(0.58f);
-            profile.clouds.scale = new TODFloatParameter(6.2f);
-            profile.clouds.detailScale = new TODFloatParameter(3.4f);
+            profile.clouds.scale = new TODFloatParameter(1f);
+            profile.clouds.detailScale = new TODFloatParameter(12f);
             profile.clouds.softness = new TODFloatParameter(0.1f);
             profile.clouds.erosion = new TODFloatParameter(0.44f);
             profile.clouds.distortion = new TODFloatParameter(1.2f);
@@ -241,6 +320,11 @@ namespace UnityNanite.TOD.Editor
             profile.clouds.sunTransmission = new TODFloatParameter(0.75f);
             profile.clouds.sunTransmissionPower = new TODFloatParameter(3.2f);
             profile.clouds.undersideStrength = new TODFloatParameter(0.56f);
+            profile.clouds.layer2 = new TODCloudSecondaryLayerSettings();
+            profile.clouds.lightning = new TODCloudLightningSettings
+            {
+                glowTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudLightningPath)
+            };
             profile.clouds.shadows = new TODCloudShadowSettings
             {
                 enabled = true,

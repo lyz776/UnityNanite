@@ -13,6 +13,8 @@ StructuredBuffer<uint> _GIDirtyBricks;
 RWStructuredBuffer<uint> _GIOccupancy;
 RWStructuredBuffer<uint> _GISurface;
 RWStructuredBuffer<uint> _GISurfaceUV;
+RWStructuredBuffer<uint> _GISurfaceIdentity;
+RWStructuredBuffer<uint> _GISurfaceKey;
 RWStructuredBuffer<uint> _GIDistance;
 RWStructuredBuffer<uint> _GIRadiance;
 RWStructuredBuffer<uint> _GIValidity;
@@ -32,6 +34,7 @@ uint _GIInstanceIndex;
 uint _GITriangleBase;
 uint _GIMaxCellsPerTriangle;
 uint _GIPropagationStep;
+uint _GIVoxelizePhase;
 
 [numthreads(128, 1, 1)]
 void ClearBricks(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
@@ -43,6 +46,8 @@ void ClearBricks(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
     {
         _GISurface[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
         _GISurfaceUV[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
+        _GISurfaceIdentity[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
+        _GISurfaceKey[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0xffffffffu;
     }
     if (threadId.x < GI_OCCUPANCY_WORDS_PER_BRICK)
         _GIOccupancy[physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + threadId.x] = 0u;
@@ -116,20 +121,51 @@ float3 GIBarycentric(float3 samplePosition, float3 a, float3 b, float3 c)
     return float3(1.0 - v - w, v, w);
 }
 
-void GIWriteCell(uint levelIndex, int3 worldCell, uint packedSurface, uint packedUv)
+uint GIHashCandidate(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+uint GIMakeCandidateKey(uint triangleIndex, uint sampleTag, float distanceToSurface, float cellSize)
+{
+    // Distance owns the high bits so the closest conservative sample wins. The low hash
+    // makes ties stable without depending on GPU wave/dispatch execution order.
+    uint quantizedDistance = (uint)round(saturate(distanceToSurface / max(cellSize, 1e-5)) * 4095.0);
+    uint stableHash = GIHashCandidate(
+        (_GIInstanceIndex + 1u) * 0x9e3779b9u ^ triangleIndex * 0x85ebca6bu ^ sampleTag * 0xc2b2ae35u);
+    return (quantizedDistance << 20u) | (stableHash & 0x000fffffu);
+}
+
+void GIWriteCell(uint levelIndex, int3 worldCell, uint packedSurface, uint packedUv,
+                 uint triangleIndex, uint sampleTag, float distanceToSurface)
 {
     GIClipmapLevelData level = _GIClipmapLevels[levelIndex];
     int physicalBrick;
     uint localCell;
     if (!GIResolvePhysicalBrick(level, _GIPageTable, worldCell, physicalBrick, localCell))
         return;
+    uint surfaceAddress = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
+    uint candidateKey = GIMakeCandidateKey(
+        triangleIndex, sampleTag, distanceToSurface, level.cellSize);
+    if (_GIVoxelizePhase == 0u)
+    {
+        uint ignored;
+        InterlockedMin(_GISurfaceKey[surfaceAddress], candidateKey, ignored);
+        return;
+    }
+    if (_GISurfaceKey[surfaceAddress] != candidateKey)
+        return;
+
+    _GISurface[surfaceAddress] = packedSurface;
+    _GISurfaceUV[surfaceAddress] = packedUv;
+    _GISurfaceIdentity[surfaceAddress] = _GIInstanceIndex + 1u;
     uint occupancyAddress = (uint)physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u;
     InterlockedOr(_GIOccupancy[occupancyAddress], 1u << (localCell & 31u));
-    uint surfaceAddress = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
-    uint previous;
-    InterlockedCompareExchange(_GISurface[surfaceAddress], 0u, packedSurface, previous);
-    if (previous == 0u)
-        _GISurfaceUV[surfaceAddress] = packedUv;
 }
 
 [numthreads(64, 1, 1)]
@@ -177,11 +213,15 @@ void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
             continue;
         if (candidateCount > _GIMaxCellsPerTriangle)
         {
-            GIWriteCell(levelIndex, (int3)floor(p0 / level.cellSize), packedSurface, GIPackHalf2(uv0));
-            GIWriteCell(levelIndex, (int3)floor(p1 / level.cellSize), packedSurface, GIPackHalf2(uv1));
-            GIWriteCell(levelIndex, (int3)floor(p2 / level.cellSize), packedSurface, GIPackHalf2(uv2));
+            GIWriteCell(levelIndex, (int3)floor(p0 / level.cellSize), packedSurface, GIPackHalf2(uv0),
+                        triangleIndex, 0u, 0.0);
+            GIWriteCell(levelIndex, (int3)floor(p1 / level.cellSize), packedSurface, GIPackHalf2(uv1),
+                        triangleIndex, 1u, 0.0);
+            GIWriteCell(levelIndex, (int3)floor(p2 / level.cellSize), packedSurface, GIPackHalf2(uv2),
+                        triangleIndex, 2u, 0.0);
             GIWriteCell(levelIndex, (int3)floor(((p0 + p1 + p2) / 3.0) / level.cellSize),
-                        packedSurface, GIPackHalf2((uv0 + uv1 + uv2) / 3.0));
+                        packedSurface, GIPackHalf2((uv0 + uv1 + uv2) / 3.0),
+                        triangleIndex, 3u, 0.0);
             continue;
         }
         float threshold = level.cellSize * 0.9;
@@ -197,7 +237,8 @@ void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
             {
                 float3 barycentric = GIBarycentric(closest, p0, p1, p2);
                 GIWriteCell(levelIndex, cell, packedSurface,
-                            GIPackHalf2(uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z));
+                            GIPackHalf2(uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z),
+                            triangleIndex, 0u, length(center - closest));
             }
         }
     }

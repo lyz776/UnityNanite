@@ -80,17 +80,17 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("星空", "stars.horizonFade", "地平线淡出", 0.001f, 0.5f),
             new TODParameterDescriptor("星空", "stars.rotation", "星空旋转"),
 
-            new TODParameterDescriptor("高空云 / 颜色", "clouds.color", "整体亮部基色", true),
-            new TODParameterDescriptor("高空云 / 颜色", "clouds.shadowColor", "整体暗部基色", true),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.color", "散射整体乘色", true),
+            // Legacy overall dark color and directional weight are retained in
+            // serialization but hidden here: the four directional colors are
+            // now the single authoritative artistic palette.
             new TODParameterDescriptor("高空云 / 颜色", "clouds.frontLitColor", "Front Lit 正面亮色", true),
             new TODParameterDescriptor("高空云 / 颜色", "clouds.frontDarkColor", "Front Dark 正面暗色", true),
             new TODParameterDescriptor("高空云 / 颜色", "clouds.backLitColor", "Back Lit 背光亮色", true),
             new TODParameterDescriptor("高空云 / 颜色", "clouds.backDarkColor", "Back Dark 背光暗色", true),
-            new TODParameterDescriptor("高空云 / 颜色", "clouds.directionalColorAmount", "四向染色权重", 0f, 1f),
             new TODParameterDescriptor("高空云 / 颜色", "clouds.rimColor", "Rim 边缘光颜色", true),
             new TODParameterDescriptor("高空云 / 颜色", "clouds.rimIntensity", "Rim 强度", 0f, 8f),
-            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimPower", "Rim 朝向聚焦", 0.1f, 16f),
-            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimWidth", "Rim 宽度", 0.001f, 0.35f),
+            new TODParameterDescriptor("高空云 / 颜色", "clouds.rimWidth", "Rim 受光偏移", 0.001f, 0.1f),
 
             new TODParameterDescriptor("高空云 / 形态", "clouds.opacity", "不透明度", 0f, 1f),
             new TODParameterDescriptor("高空云 / 形态", "clouds.coverage", "覆盖率", 0f, 1f),
@@ -132,6 +132,21 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("高空云 / 光学", "clouds.phaseBackward", "后向相位 G", -0.9f, 0f),
             new TODParameterDescriptor("高空云 / 光学", "clouds.phaseBlend", "双瓣相位混合", 0f, 1f),
             new TODParameterDescriptor("高空云 / 光学", "clouds.multipleScattering", "多重散射近似", 0f, 2f),
+
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.opacity", "第二层混合强度", 0f, 1f),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.coverageOffset", "覆盖率偏移", -1f, 1f),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.altitude", "第二层高度（km）", 0.1f, 50f),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.scale", "第二层尺度", 0.01f, 8f),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.speedX", "第二层速度 X"),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.speedY", "第二层速度 Y"),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.fogBlend", "远景雾化", 0f, 1f),
+
+            new TODParameterDescriptor("高空云 / 闪电", "clouds.lightning.color", "闪电云内发光颜色", true),
+            new TODParameterDescriptor("高空云 / 闪电", "clouds.lightning.intensity", "闪电强度", 0f, 32f),
+            new TODParameterDescriptor("高空云 / 闪电", "clouds.lightning.frequency", "每分钟闪电次数", 0.001f, 12f),
+            new TODParameterDescriptor("高空云 / 闪电", "clouds.lightning.duration", "单次持续时间", 0.02f, 3f),
+            new TODParameterDescriptor("高空云 / 闪电", "clouds.lightning.scale", "闪电分布尺度", 0.01f, 8f),
+            new TODParameterDescriptor("高空云 / 闪电", "clouds.lightning.glowSpeed", "发光纹理流速", -1f, 1f),
 
             new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.color", "阴影染色", true),
             new TODParameterDescriptor("高空云 / 云阴影", "clouds.shadows.scale", "世界空间尺度", 0.00001f, 0.02f),
@@ -511,6 +526,8 @@ namespace UnityNanite.TOD.Editor
         {
             string path = section == "星空" ? "stars.enabled" :
                 section == "高空云" ? "clouds.enabled" :
+                section == "高空云 / 第二层" ? "clouds.layer2.enabled" :
+                section == "高空云 / 闪电" ? "clouds.lightning.enabled" :
                 section == "高空云 / 云阴影" ? "clouds.shadows.enabled" :
                 section == "Lens Flare" ? "lensFlare.enabled" :
                 section == "雾" ? "fog.enabled" :
@@ -525,6 +542,25 @@ namespace UnityNanite.TOD.Editor
 
         private static void DrawSectionOptions(SerializedObject profileObject, string section)
         {
+            if (section == "高空云 / 形态")
+            {
+                EditorGUILayout.PropertyField(
+                    profileObject.FindProperty("clouds.shapeTexture"),
+                    new GUIContent("主形状贴图"));
+                EditorGUILayout.PropertyField(
+                    profileObject.FindProperty("clouds.unevenTexture"),
+                    new GUIContent("细节 / 不均匀贴图"));
+                return;
+            }
+
+            if (section == "高空云 / 闪电")
+            {
+                EditorGUILayout.PropertyField(
+                    profileObject.FindProperty("clouds.lightning.glowTexture"),
+                    new GUIContent("闪电位置 / 发光贴图"));
+                return;
+            }
+
             if (section != "Lens Flare")
                 return;
 

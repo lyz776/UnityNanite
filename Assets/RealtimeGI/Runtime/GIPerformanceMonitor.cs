@@ -31,6 +31,8 @@ namespace RealtimeGI
         [SerializeField] uint tracedRays;
         [SerializeField] float screenHitPercent;
         [SerializeField] float averageWorldSteps;
+        [SerializeField] float validRadianceCacheHitPercent;
+        [SerializeField] uint invalidRadianceCacheHits;
 
         Recorder clipmapRecorder;
         Recorder distanceRecorder;
@@ -87,6 +89,8 @@ namespace RealtimeGI
             tracedRays = counters.rays;
             screenHitPercent = counters.rays > 0 ? counters.screenHits * 100f / counters.rays : 0f;
             averageWorldSteps = counters.AverageWorldSteps;
+            validRadianceCacheHitPercent = counters.ValidCachePercent;
+            invalidRadianceCacheHits = counters.invalidCacheHits;
         }
 
         float Smooth(float previous, float next)

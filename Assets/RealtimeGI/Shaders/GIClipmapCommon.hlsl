@@ -86,29 +86,78 @@ uint GIReadConservativeDistance(
     return distanceWords[(uint)physicalBrick * GI_DISTANCE_WORDS_PER_BRICK + localCellIndex] & 0xffu;
 }
 
+bool GIRayBoxInterval(float3 rayOrigin, float3 rayDirection, float3 boundsMin, float3 boundsMax,
+                      float maxDistance, out float entryT, out float exitT)
+{
+    float3 safeDirection = float3(
+        abs(rayDirection.x) > 1e-7 ? rayDirection.x : (rayDirection.x >= 0.0 ? 1e-7 : -1e-7),
+        abs(rayDirection.y) > 1e-7 ? rayDirection.y : (rayDirection.y >= 0.0 ? 1e-7 : -1e-7),
+        abs(rayDirection.z) > 1e-7 ? rayDirection.z : (rayDirection.z >= 0.0 ? 1e-7 : -1e-7));
+    float3 t0 = (boundsMin - rayOrigin) / safeDirection;
+    float3 t1 = (boundsMax - rayOrigin) / safeDirection;
+    float3 nearT = min(t0, t1);
+    float3 farT = max(t0, t1);
+    entryT = max(0.0, max(nearT.x, max(nearT.y, nearT.z)));
+    exitT = min(maxDistance, min(farT.x, min(farT.y, farT.z)));
+    return exitT >= entryT;
+}
+
 // Per-Brick Chebyshev distance is an isotropic lower bound. A ray never jumps past the current
-// Brick boundary, so an occupied neighbour Brick cannot be skipped.
+// Brick boundary, so an occupied neighbour Brick cannot be skipped. The initial occupied run is
+// treated as the emitting surface and escaped before a hit can be reported.
 bool GITraceClipmapLayer(
     StructuredBuffer<GIClipmapLevelData> levels,
     StructuredBuffer<int> pageTable,
     StructuredBuffer<uint> occupancy,
     StructuredBuffer<uint> surface,
+    StructuredBuffer<uint> surfaceIdentity,
     StructuredBuffer<uint> distanceWords,
     float3 rayOrigin,
     float3 rayDirection,
     float maxDistance,
+    float minDistance,
     uint levelIndex,
+    uint sourceIdentity,
     out float hitT,
     out uint packedSurface,
-    out uint traceSteps)
+    out uint hitIdentity,
+    out int3 hitWorldCell,
+    out int hitPhysicalBrick,
+    out uint hitLocalCell,
+    out uint traceSteps,
+    out float traceEndT)
 {
     GIClipmapLevelData level = levels[levelIndex];
+    float3 boundsMin = (float3)(level.originBrick * GI_BRICK_SIZE) * level.cellSize;
+    float3 boundsMax = boundsMin + GI_CLIPMAP_RESOLUTION * level.cellSize;
+    float entryT;
+    float exitT;
+    bool intersectsLevel = GIRayBoxInterval(
+        rayOrigin, rayDirection, boundsMin, boundsMax, maxDistance, entryT, exitT);
     float minimumStep = level.cellSize * 0.75;
-    uint maxSteps = min(1024u, (uint)ceil(maxDistance / max(minimumStep, 1e-4)));
-    float t = 0.0;
+    float t = max(minDistance, entryT);
+    float segmentLength = max(0.0, exitT - t);
+    uint maxSteps = min(1024u, (uint)ceil(segmentLength / max(minimumStep, 1e-4)) + 1u);
+    // Initialise every out value before the trace loop. Besides satisfying the HLSL compiler's
+    // definite-assignment analysis, this keeps a degenerate zero-step trace deterministic.
+    hitT = maxDistance;
+    packedSurface = 0u;
+    hitIdentity = 0u;
+    hitWorldCell = 0;
+    hitPhysicalBrick = -1;
+    hitLocalCell = 0u;
     traceSteps = 0u;
+    traceEndT = intersectsLevel ? max(t, exitT) : minDistance;
+    if (!intersectsLevel || t > exitT)
+        return false;
+
+    uint escapedIdentity = sourceIdentity;
+    bool canInferSource = sourceIdentity == 0u && entryT <= level.cellSize * 0.25 &&
+                          minDistance <= level.cellSize * 0.25;
+    bool sourceRunSeen = false;
+    bool escapedSource = false;
     [loop]
-    for (uint step = 0; step <= maxSteps && t <= maxDistance; step++)
+    for (uint step = 0; step <= maxSteps && t <= exitT; step++)
     {
         traceSteps++;
         float3 position = rayOrigin + rayDirection * t;
@@ -117,10 +166,34 @@ bool GITraceClipmapLayer(
         uint localCell;
         if (GIReadOccupancy(level, pageTable, occupancy, worldCell, physicalBrick, localCell))
         {
+            uint cellIdentity = surfaceIdentity[
+                (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell];
+            if (!escapedSource)
+            {
+                if (!sourceRunSeen && canInferSource)
+                    escapedIdentity = cellIdentity;
+                bool isSource = escapedIdentity != 0u && cellIdentity == escapedIdentity;
+                if (isSource)
+                {
+                    sourceRunSeen = true;
+                    t += minimumStep;
+                    continue;
+                }
+                // If the ray started in empty space, a later occupied cell is a real hit.
+                escapedSource = true;
+            }
             hitT = t;
             packedSurface = surface[(uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell];
+            hitIdentity = cellIdentity;
+            hitWorldCell = worldCell;
+            hitPhysicalBrick = physicalBrick;
+            hitLocalCell = localCell;
             return true;
         }
+        if (!sourceRunSeen)
+            escapedSource = true;
+        else
+            escapedSource = true;
         // An unallocated sparse Brick is empty, so advance directly to its boundary.
         float safeCells = (float)GI_BRICK_SIZE;
         if (physicalBrick >= 0)
@@ -147,6 +220,10 @@ bool GITraceClipmapLayer(
     }
     hitT = maxDistance;
     packedSurface = 0u;
+    hitIdentity = 0u;
+    hitWorldCell = 0;
+    hitPhysicalBrick = -1;
+    hitLocalCell = 0u;
     return false;
 }
 
@@ -155,62 +232,101 @@ bool GITraceUnifiedClipmaps(
     StructuredBuffer<int> staticPageTable,
     StructuredBuffer<uint> staticOccupancy,
     StructuredBuffer<uint> staticSurface,
+    StructuredBuffer<uint> staticSurfaceIdentity,
     StructuredBuffer<uint> staticDistance,
     StructuredBuffer<int> dynamicPageTable,
     StructuredBuffer<uint> dynamicOccupancy,
     StructuredBuffer<uint> dynamicSurface,
+    StructuredBuffer<uint> dynamicSurfaceIdentity,
     StructuredBuffer<uint> dynamicDistance,
     float3 rayOrigin,
     float3 rayDirection,
     float maxDistance,
     uint preferredLevel,
+    uint sourceIdentity,
     out float hitT,
     out uint packedSurface,
+    out uint hitIdentity,
     out uint hitLayer,
     out uint hitLevel,
+    out int3 hitWorldCell,
+    out int hitPhysicalBrick,
+    out uint hitLocalCell,
     out uint traceSteps)
 {
     hitT = maxDistance;
     packedSurface = 0u;
+    hitIdentity = 0u;
     hitLayer = 0u;
     hitLevel = 0u;
+    hitWorldCell = 0;
+    hitPhysicalBrick = -1;
+    hitLocalCell = 0u;
     traceSteps = 0u;
     bool hit = false;
+    float continuationT = 0.0;
     uint firstLevel = min(preferredLevel, (uint)(GI_CLIPMAP_LEVEL_COUNT - 1));
     [loop]
     for (uint level = firstLevel; level < GI_CLIPMAP_LEVEL_COUNT; level++)
     {
         float staticT;
         uint staticPacked;
+        uint staticIdentity;
+        int3 staticCell;
+        int staticPhysicalBrick;
+        uint staticLocalCell;
         uint staticSteps;
+        float staticEndT;
         bool staticHit = GITraceClipmapLayer(
-            levels, staticPageTable, staticOccupancy, staticSurface, staticDistance,
-            rayOrigin, rayDirection, hitT, level, staticT, staticPacked, staticSteps);
+            levels, staticPageTable, staticOccupancy, staticSurface, staticSurfaceIdentity,
+            staticDistance, rayOrigin, rayDirection, hitT, continuationT, level, sourceIdentity,
+            staticT, staticPacked, staticIdentity, staticCell,
+            staticPhysicalBrick, staticLocalCell, staticSteps, staticEndT);
         float dynamicT;
         uint dynamicPacked;
+        uint dynamicIdentity;
+        int3 dynamicCell;
+        int dynamicPhysicalBrick;
+        uint dynamicLocalCell;
         uint dynamicSteps;
+        float dynamicEndT;
         bool dynamicHit = GITraceClipmapLayer(
-            levels, dynamicPageTable, dynamicOccupancy, dynamicSurface, dynamicDistance,
-            rayOrigin, rayDirection, hitT, level, dynamicT, dynamicPacked, dynamicSteps);
+            levels, dynamicPageTable, dynamicOccupancy, dynamicSurface, dynamicSurfaceIdentity,
+            dynamicDistance, rayOrigin, rayDirection, hitT, continuationT, level, sourceIdentity,
+            dynamicT, dynamicPacked, dynamicIdentity, dynamicCell,
+            dynamicPhysicalBrick, dynamicLocalCell, dynamicSteps, dynamicEndT);
         traceSteps += staticSteps + dynamicSteps;
         if (staticHit && staticT <= hitT)
         {
             hit = true;
             hitT = staticT;
             packedSurface = staticPacked;
+            hitIdentity = staticIdentity;
             hitLayer = 0u;
             hitLevel = level;
+            hitWorldCell = staticCell;
+            hitPhysicalBrick = staticPhysicalBrick;
+            hitLocalCell = staticLocalCell;
         }
         if (dynamicHit && dynamicT <= hitT)
         {
             hit = true;
             hitT = dynamicT;
             packedSurface = dynamicPacked;
+            hitIdentity = dynamicIdentity;
             hitLayer = 1u;
             hitLevel = level;
+            hitWorldCell = dynamicCell;
+            hitPhysicalBrick = dynamicPhysicalBrick;
+            hitLocalCell = dynamicLocalCell;
         }
         if (hit)
             return true;
+        // The finer level has authoritatively covered this ray segment. Coarser levels begin
+        // where it ended instead of restarting at the source and rediscovering the same voxel.
+        continuationT = max(continuationT, max(staticEndT, dynamicEndT));
+        if (continuationT >= maxDistance)
+            break;
     }
     return false;
 }

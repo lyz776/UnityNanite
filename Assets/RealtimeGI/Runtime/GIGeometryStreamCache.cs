@@ -8,11 +8,17 @@ namespace RealtimeGI
 {
     /// <summary>
     /// GI-owned compact triangle stream. It deliberately does not retain Nanite renderer buffers,
-    /// whose ownership and lifetime are changing independently. Nanite uses sourceMesh first and
-    /// root Page compatibility data only as a fallback.
+    /// whose ownership and lifetime are changing independently. Nanite geometry is reconstructed
+    /// from one complete hierarchy mip chosen for the GI voxel scale, rather than the ultra-coarse
+    /// root set or the full source mesh.
     /// </summary>
     public sealed class GIGeometryStreamCache : IDisposable
     {
+        // This stream is shared by every instance. Keeping the proxy bounded avoids multiplying a
+        // full source mesh by the instance count, while still retaining orders of magnitude more
+        // surface detail than a root Page (the dragon root is only 63 triangles).
+        const int MaxNaniteProxyTriangles = 16384;
+        const int GeometrySelectionVersion = 3;
         readonly List<Vector3> vertices = new List<Vector3>(65536);
         readonly List<Vector2> uvs = new List<Vector2>(65536);
         readonly List<uint> indices = new List<uint>(131072);
@@ -91,11 +97,48 @@ namespace RealtimeGI
             int uvStart = uvs.Count;
             int indexStart = indices.Count;
             int triangleStart = triangleSubMeshes.Count;
-            bool appendedAnyPage = false;
             bool hasRootMetadata = mesh.pageStreamingInfo != null && mesh.pageStreamingInfo.Length > 0;
 
-            // Root Pages are the stable coarse Nanite representation and avoid copying the full
-            // source mesh. Assets without valid root metadata use sourceMesh as a compatibility path.
+            // A single hierarchy mip is a complete, non-overlapping representation. Selecting only
+            // root Pages created metre-scale triangles which then became the visible GI colour blocks.
+            if (hasRootMetadata && mesh.pageArray != null)
+            {
+                int sourceTriangles = Mathf.Max(1, mesh.sourceTriangleCount);
+                int estimatedMip = Mathf.Clamp(
+                    Mathf.CeilToInt(Mathf.Log(
+                        Mathf.Max(1f, sourceTriangles / (float)MaxNaniteProxyTriangles), 2f)),
+                    0, Mathf.Max(0, mesh.maxMipLevel));
+                for (int targetMip = estimatedMip; targetMip <= mesh.maxMipLevel; targetMip++)
+                {
+                    Rollback(vertexStart, uvStart, indexStart, triangleStart);
+                    if (!AppendNaniteMip(mesh, targetMip))
+                        continue;
+                    int proxyTriangles = triangleSubMeshes.Count - triangleStart;
+                    if (proxyTriangles <= 0 || proxyTriangles > MaxNaniteProxyTriangles)
+                        continue;
+
+                    ranges.Add(new GIGpuGeometryStreamData
+                    {
+                        vertexOffset = (uint)vertexStart,
+                        indexOffset = (uint)indexStart,
+                        triangleOffset = (uint)triangleStart,
+                        indexCount = (uint)(indices.Count - indexStart),
+                        triangleCount = (uint)proxyTriangles,
+                        flags = 1u | ((uint)targetMip << 8)
+                    });
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                    Debug.Log(
+                        $"[RealtimeGI] Nanite GI proxy '{mesh.name}': mip={targetMip}, " +
+                        $"triangles={proxyTriangles} (source={sourceTriangles}, budget={MaxNaniteProxyTriangles}).");
+#endif
+                    return true;
+                }
+            }
+
+            // Compatibility fallback: a root representation is preferable to losing the object,
+            // but is no longer the normal path. Assets without readable Pages fall back to sourceMesh.
+            Rollback(vertexStart, uvStart, indexStart, triangleStart);
+            bool appendedRoot = false;
             if (hasRootMetadata && mesh.pageArray != null)
             {
                 for (int pageIndex = 0; pageIndex < mesh.pageArray.Length; pageIndex++)
@@ -104,28 +147,43 @@ namespace RealtimeGI
                         !mesh.pageStreamingInfo[pageIndex].IsRootPage)
                         continue;
                     NaniteMeshPage page = mesh.pageArray[pageIndex];
-                    if (page == null || !AppendNanitePage(page))
-                        continue;
-                    appendedAnyPage = true;
+                    appendedRoot |= page != null && AppendNanitePage(page, -1);
                 }
             }
-
-            if (!appendedAnyPage)
+            if (appendedRoot && triangleSubMeshes.Count > triangleStart)
             {
-                Rollback(vertexStart, uvStart, indexStart, triangleStart);
-                return mesh.sourceMesh != null && AppendMesh(mesh.sourceMesh);
+                ranges.Add(new GIGpuGeometryStreamData
+                {
+                    vertexOffset = (uint)vertexStart,
+                    indexOffset = (uint)indexStart,
+                    triangleOffset = (uint)triangleStart,
+                    indexCount = (uint)(indices.Count - indexStart),
+                    triangleCount = (uint)(triangleSubMeshes.Count - triangleStart),
+                    flags = 1u | 0x80000000u
+                });
+                Debug.LogWarning(
+                    $"[RealtimeGI] Nanite GI proxy '{mesh.name}' fell back to root Pages " +
+                    $"({triangleSubMeshes.Count - triangleStart} triangles). Re-bake readable hierarchy Pages " +
+                    "to avoid coarse world-space lighting partitions.");
+                return true;
             }
+            Rollback(vertexStart, uvStart, indexStart, triangleStart);
+            return mesh.sourceMesh != null && AppendMesh(mesh.sourceMesh);
+        }
 
-            ranges.Add(new GIGpuGeometryStreamData
+        bool AppendNaniteMip(NaniteMesh mesh, int targetMip)
+        {
+            bool appended = false;
+            int pageCount = Mathf.Min(mesh.pageArray.Length, mesh.pageStreamingInfo.Length);
+            for (int pageIndex = 0; pageIndex < pageCount; pageIndex++)
             {
-                vertexOffset = (uint)vertexStart,
-                indexOffset = (uint)indexStart,
-                triangleOffset = (uint)triangleStart,
-                indexCount = (uint)(indices.Count - indexStart),
-                triangleCount = (uint)(triangleSubMeshes.Count - triangleStart),
-                flags = 1u
-            });
-            return true;
+                NanitePageStreamingInfo info = mesh.pageStreamingInfo[pageIndex];
+                if (targetMip < info.minMip || targetMip > info.maxMip)
+                    continue;
+                NaniteMeshPage page = mesh.pageArray[pageIndex];
+                appended |= page != null && AppendNanitePage(page, targetMip);
+            }
+            return appended;
         }
 
         void Rollback(int vertexStart, int uvStart, int indexStart, int triangleStart)
@@ -140,8 +198,12 @@ namespace RealtimeGI
                 triangleSubMeshes.RemoveRange(triangleStart, triangleSubMeshes.Count - triangleStart);
         }
 
-        bool AppendNanitePage(NaniteMeshPage page)
+        bool AppendNanitePage(NaniteMeshPage page, int targetMip)
         {
+            int pageVertexStart = vertices.Count;
+            int pageUvStart = uvs.Count;
+            int pageIndexStart = indices.Count;
+            int pageTriangleStart = triangleSubMeshes.Count;
             try
             {
                 float[] sourceVertices = page.vertexData;
@@ -164,6 +226,7 @@ namespace RealtimeGI
 
                 int triangleCount = sourceIndices.Length / 3;
                 var subMeshByTriangle = new uint[triangleCount];
+                var includeTriangle = new bool[triangleCount];
                 if (page.clusterArray != null)
                 {
                     for (int clusterIndex = 0; clusterIndex < page.clusterArray.Length; clusterIndex++)
@@ -172,13 +235,28 @@ namespace RealtimeGI
                         int first = Mathf.Max(0, cluster.indiceIndex / 3);
                         int last = Mathf.Min(triangleCount, (cluster.indiceIndex + cluster.indiceCount + 2) / 3);
                         uint subMesh = (uint)Mathf.Max(0, cluster.subMeshId);
+                        int clusterMip = page.clusterMip != null && clusterIndex < page.clusterMip.Length
+                            ? page.clusterMip[clusterIndex]
+                            : (page.parts != null && cluster.partIndex >= 0 && cluster.partIndex < page.parts.Length
+                                ? page.parts[cluster.partIndex].mipLevel
+                                : -1);
+                        bool include = targetMip < 0 || clusterMip == targetMip;
                         for (int triangle = first; triangle < last; triangle++)
+                        {
                             subMeshByTriangle[triangle] = subMesh;
+                            includeTriangle[triangle] = include;
+                        }
                     }
+                }
+                else if (targetMip < 0)
+                {
+                    Array.Fill(includeTriangle, true);
                 }
 
                 for (int triangle = 0; triangle < triangleCount; triangle++)
                 {
+                    if (!includeTriangle[triangle])
+                        continue;
                     int indexOffset = triangle * 3;
                     int a = sourceIndices[indexOffset];
                     int b = sourceIndices[indexOffset + 1];
@@ -191,10 +269,16 @@ namespace RealtimeGI
                     indices.Add(vertexBase + (uint)c);
                     triangleSubMeshes.Add(subMeshByTriangle[triangle]);
                 }
+                if (triangleSubMeshes.Count == pageTriangleStart)
+                {
+                    Rollback(pageVertexStart, pageUvStart, pageIndexStart, pageTriangleStart);
+                    return false;
+                }
                 return true;
             }
             catch (Exception exception)
             {
+                Rollback(pageVertexStart, pageUvStart, pageIndexStart, pageTriangleStart);
                 Debug.LogWarning($"[RealtimeGI] Failed to decode Nanite Page '{page.name}': {exception.Message}");
                 return false;
             }
@@ -289,6 +373,7 @@ namespace RealtimeGI
             unchecked
             {
                 int hash = 17;
+                hash = hash * 31 + GeometrySelectionVersion;
                 IReadOnlyList<GIGpuGeometryData> data = scene.CpuGeometries;
                 hash = hash * 31 + data.Count;
                 for (int i = 0; i < data.Count; i++)

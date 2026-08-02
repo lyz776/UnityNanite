@@ -26,10 +26,12 @@ namespace RealtimeGI
         static readonly int StaticPageTableId = Shader.PropertyToID("_GIStaticPageTable");
         static readonly int StaticOccupancyId = Shader.PropertyToID("_GIStaticOccupancy");
         static readonly int StaticSurfaceId = Shader.PropertyToID("_GIStaticSurface");
+        static readonly int StaticSurfaceIdentityId = Shader.PropertyToID("_GIStaticSurfaceIdentity");
         static readonly int StaticDistanceId = Shader.PropertyToID("_GIStaticDistance");
         static readonly int DynamicPageTableId = Shader.PropertyToID("_GIDynamicPageTable");
         static readonly int DynamicOccupancyId = Shader.PropertyToID("_GIDynamicOccupancy");
         static readonly int DynamicSurfaceId = Shader.PropertyToID("_GIDynamicSurface");
+        static readonly int DynamicSurfaceIdentityId = Shader.PropertyToID("_GIDynamicSurfaceIdentity");
         static readonly int DynamicDistanceId = Shader.PropertyToID("_GIDynamicDistance");
         static readonly int ResultId = Shader.PropertyToID("_GIResult");
         static readonly int InverseViewProjectionId = Shader.PropertyToID("_GIInverseViewProjection");
@@ -85,10 +87,12 @@ namespace RealtimeGI
             debugTraceShader.SetBuffer(traceKernel, StaticPageTableId, view.staticPageTable);
             debugTraceShader.SetBuffer(traceKernel, StaticOccupancyId, view.staticOccupancy);
             debugTraceShader.SetBuffer(traceKernel, StaticSurfaceId, view.staticSurface);
+            debugTraceShader.SetBuffer(traceKernel, StaticSurfaceIdentityId, view.staticSurfaceIdentity);
             debugTraceShader.SetBuffer(traceKernel, StaticDistanceId, view.staticDistance);
             debugTraceShader.SetBuffer(traceKernel, DynamicPageTableId, view.dynamicPageTable);
             debugTraceShader.SetBuffer(traceKernel, DynamicOccupancyId, view.dynamicOccupancy);
             debugTraceShader.SetBuffer(traceKernel, DynamicSurfaceId, view.dynamicSurface);
+            debugTraceShader.SetBuffer(traceKernel, DynamicSurfaceIdentityId, view.dynamicSurfaceIdentity);
             debugTraceShader.SetBuffer(traceKernel, DynamicDistanceId, view.dynamicDistance);
             debugTraceShader.SetTexture(traceKernel, ResultId, result);
             debugTraceShader.Dispatch(traceKernel, Mathf.CeilToInt(width / 8f), Mathf.CeilToInt(height / 8f), 1);
