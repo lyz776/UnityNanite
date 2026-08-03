@@ -1905,3 +1905,34 @@ to a real 12-triangle root, has no five-direction monotonic regression and repor
 worst full-frame Nanite-versus-MeshRenderer MAE was 0.02643 RGB levels. No valid Player log
 contained a compile exception, invalid kernel, missing binding/resource, D3D12 removal or Page
 error. These results supersede the discarded full-source-UV footprint experiment.
+
+## Proxy material/editor closure (2026-08-03)
+
+The final Proxy usability work adds no Player-side Scene-picking Renderer or per-frame CPU mesh
+raycast. Editor material polling is throttled to 10 Hz and only examines materials referenced by
+active Proxies. Runtime scalar/color/ST edits upload the compact material table without changing
+`GeometryGeneration`; shader/keyword/texture changes rebuild resolve compatibility bins while Page
+storage and residency remain intact.
+
+The follow-up source-binding closure stores FBX material references in the baked asset and synchronizes
+an existing MeshFilter/MeshRenderer only during enable/validation or an explicit Inspector change.
+Scene outlines are submitted only by Editor `OnSceneGUI`; the click fallback yields to every active
+Transform handle. There is no new per-frame Player traversal, draw or material polling cost.
+
+The isolated material audit passed both paths. The isolated Editor audit compiled
+`Nanite.Editor.dll` with `LogAssemblyErrors (0ms)` and passed non-rendering selection state, CPU
+fallback picking, legacy Force-to-enum migration and disable restoration. The previously completed
+DX12 Player gate remained 484.96 FPS / 2.062 ms at 1280x720 with 154 instances, 7,298 Clusters,
+555,908 triangles, 77/77 resident Pages, and no invalid kernel, missing resource/binding, device
+removal or Page error. The last change after that Player gate is Editor-only selection/audit code
+plus serialization compatibility and does not alter the GPU draw path.
+
+The updated Windows smoke Player build completed successfully after the runtime source-material field
+and binding precedence were added (`Logs/proxy-source-binding-build.log`).
+
+Material scaling remains bounded and explicit: scalar-only variants are one table lookup; each
+distinct shader/keyword/texture compatibility bin can add one resolve binding/draw. Adaptive tile
+classification avoids executing every bin over the whole screen, but its compute dispatch is enabled
+only above the configured bin threshold. The hard scene material-ID limit is 65,535. Large projects
+should consolidate texture diversity with arrays/atlases or a bindless project resolve family rather
+than assuming unbounded unique textures have zero cost.

@@ -1,7 +1,7 @@
 #ifndef REALTIME_GI_SCENE_COMMON_INCLUDED
 #define REALTIME_GI_SCENE_COMMON_INCLUDED
 
-#define GI_SCENE_ABI_VERSION 2u
+#define GI_SCENE_ABI_VERSION 3u
 
 #define GI_INSTANCE_OCCLUDER      (1u << 0)
 #define GI_INSTANCE_CONTRIBUTOR   (1u << 1)
@@ -81,6 +81,16 @@ struct GIGeometryStreamData
     uint flags;
     uint padding0;
     uint padding1;
+};
+
+// 32 bytes. Instance-level emissive proposal plus Walker alias metadata.
+struct GIEmissiveAliasData
+{
+    float4 worldBoundingSphere;
+    float probability;
+    float aliasProbability;
+    uint aliasIndex;
+    uint objectId;
 };
 
 #endif

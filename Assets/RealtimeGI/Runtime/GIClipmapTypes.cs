@@ -103,6 +103,8 @@ namespace RealtimeGI
         public readonly GraphicsBuffer staticDistance;
         public readonly GraphicsBuffer staticRadiance;
         public readonly GraphicsBuffer staticValidity;
+        public readonly GraphicsBuffer staticLightCounts;
+        public readonly GraphicsBuffer staticLightIndices;
         public readonly GraphicsBuffer dynamicPageTable;
         public readonly GraphicsBuffer dynamicOccupancy;
         public readonly GraphicsBuffer dynamicSurface;
@@ -111,9 +113,16 @@ namespace RealtimeGI
         public readonly GraphicsBuffer dynamicDistance;
         public readonly GraphicsBuffer dynamicRadiance;
         public readonly GraphicsBuffer dynamicValidity;
+        public readonly GraphicsBuffer dynamicLightCounts;
+        public readonly GraphicsBuffer dynamicLightIndices;
+        public readonly GraphicsBuffer localLights;
+        public readonly int localLightCount;
+        public readonly int lightsPerBrick;
         public readonly int staticBrickCount;
         public readonly int dynamicBrickCount;
         public readonly int generation;
+        public readonly float skyIrradianceScale;
+        public readonly float mainLightBounceScale;
         // Changes only when the lighting input/cache contents are invalidated.
         // Unlike generation, this is safe for deciding whether temporal screen history can be reused.
         public readonly int lightingRevision;
@@ -122,8 +131,12 @@ namespace RealtimeGI
             GraphicsBuffer levelData,
             GIClipmapLayer staticLayer,
             GIClipmapLayer dynamicLayer,
+            GraphicsBuffer localLights,
+            int localLightCount,
             int generation,
-            int lightingRevision)
+            int lightingRevision,
+            float skyIrradianceScale,
+            float mainLightBounceScale)
         {
             this.levelData = levelData;
             staticPageTable = staticLayer?.PageTableBuffer;
@@ -134,6 +147,8 @@ namespace RealtimeGI
             staticDistance = staticLayer?.DistanceBuffer;
             staticRadiance = staticLayer?.RadianceBuffer;
             staticValidity = staticLayer?.ValidityBuffer;
+            staticLightCounts = staticLayer?.LightCountBuffer;
+            staticLightIndices = staticLayer?.LightIndexBuffer;
             dynamicPageTable = dynamicLayer?.PageTableBuffer;
             dynamicOccupancy = dynamicLayer?.OccupancyBuffer;
             dynamicSurface = dynamicLayer?.SurfaceBuffer;
@@ -142,10 +157,17 @@ namespace RealtimeGI
             dynamicDistance = dynamicLayer?.DistanceBuffer;
             dynamicRadiance = dynamicLayer?.RadianceBuffer;
             dynamicValidity = dynamicLayer?.ValidityBuffer;
+            dynamicLightCounts = dynamicLayer?.LightCountBuffer;
+            dynamicLightIndices = dynamicLayer?.LightIndexBuffer;
+            this.localLights = localLights;
+            this.localLightCount = localLightCount;
+            lightsPerBrick = staticLayer?.LightsPerBrick ?? 0;
             staticBrickCount = staticLayer?.AllocatedCount ?? 0;
             dynamicBrickCount = dynamicLayer?.AllocatedCount ?? 0;
             this.generation = generation;
             this.lightingRevision = lightingRevision;
+            this.skyIrradianceScale = skyIrradianceScale;
+            this.mainLightBounceScale = mainLightBounceScale;
         }
 
         public bool IsValid => levelData != null &&
@@ -153,9 +175,12 @@ namespace RealtimeGI
                                staticSurface != null && staticSurfaceUv != null && staticDistance != null &&
                                staticSurfaceIdentity != null &&
                                staticRadiance != null && staticValidity != null &&
+                               staticLightCounts != null && staticLightIndices != null &&
                                dynamicPageTable != null && dynamicOccupancy != null &&
                                dynamicSurface != null && dynamicSurfaceUv != null && dynamicDistance != null &&
                                dynamicSurfaceIdentity != null &&
-                               dynamicRadiance != null && dynamicValidity != null;
+                               dynamicRadiance != null && dynamicValidity != null &&
+                               dynamicLightCounts != null && dynamicLightIndices != null &&
+                               localLights != null;
     }
 }

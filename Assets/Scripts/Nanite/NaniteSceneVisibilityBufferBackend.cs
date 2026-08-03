@@ -223,6 +223,8 @@ namespace Nanite
         InstanceShData[] instanceShCpu;
 
         int rebuildSignature;
+        int materialBindingSignature;
+        int materialDataSignature;
         int registryRevision = -1;
         int lastInstanceUpdateFrame = -1;
         int instanceTransformGeneration;
@@ -584,6 +586,8 @@ namespace Nanite
             instanceShCpu = null;
             ClearGpuVisibleMaskReady();
             rebuildSignature = 0;
+            materialBindingSignature = 0;
+            materialDataSignature = 0;
             registryRevision = -1;
             lastInstanceUpdateFrame = -1;
             vertexStride = 0;
@@ -617,6 +621,29 @@ namespace Nanite
             int signature = ComputeSignature(proxies);
             if (signature == rebuildSignature && IsReady)
             {
+                int nextBindingSignature = ComputeMaterialBindingSignature();
+                if (nextBindingSignature != materialBindingSignature)
+                {
+                    // Shader, keyword or texture changes can alter resolve-family
+                    // admission and compatibility bins. Rebuild those mappings; the
+                    // immutable Page files remain resident in the Page pool.
+                    if (!Rebuild(proxies))
+                        return false;
+                    rebuildSignature = signature;
+                }
+                else
+                {
+                    GpuMaterialData[] materialData = BuildGpuMaterialData();
+                    int nextDataSignature = ComputeMaterialDataSignature(materialData);
+                    if (nextDataSignature != materialDataSignature)
+                    {
+                        // Scalar/color/ST edits do not change geometry or bins. Keep
+                        // them as one compact buffer upload instead of rebuilding the
+                        // complete GPU Scene.
+                        materialDataBuffer.SetData(materialData);
+                        materialDataSignature = nextDataSignature;
+                    }
+                }
                 registryRevision = currentRevision;
                 UpdateInstanceTransforms();
                 return true;
@@ -1415,6 +1442,8 @@ namespace Nanite
             instanceSubMeshMaterialBuffer.SetData(instanceSubMeshMaterialCpu);
             instanceMaterialRangeBuffer.SetData(instanceMaterialRangeCpu);
             materialDataBuffer.SetData(materialDataCpu);
+            materialBindingSignature = ComputeMaterialBindingSignature();
+            materialDataSignature = ComputeMaterialDataSignature(materialDataCpu);
             instanceShBuffer.SetData(instanceShCpu);
             // 默认空绘制；scene 路径必须先 compact，才能把唯一 geometry triangle 与 instance 正确配对。
             uint[] drawArgs = { 0u, 1u, 0u, 0u };
@@ -1877,6 +1906,57 @@ namespace Nanite
             return result;
         }
 
+        int ComputeMaterialBindingSignature()
+        {
+            unchecked
+            {
+                int hash = 17;
+                hash = hash * 31 + NaniteMaterialResolveRegistry.Revision;
+                hash = hash * 31 + materialList.Count;
+                for (int index = 0; index < materialList.Count; index++)
+                {
+                    Material material = materialList[index];
+                    int pipeline = ResolveMaterialPipeline(material);
+                    hash = hash * 31 + (material != null ? material.GetInstanceID() : 0);
+                    hash = hash * 31 + pipeline;
+                    hash = hash * 31 + new MaterialCompatibilityKey(material, pipeline).GetHashCode();
+                }
+                return hash;
+            }
+        }
+
+        static int ComputeMaterialDataSignature(GpuMaterialData[] data)
+        {
+            unchecked
+            {
+                int hash = data != null ? data.Length : 0;
+                if (data == null)
+                    return hash;
+                for (int index = 0; index < data.Length; index++)
+                {
+                    hash = HashVector(hash, data[index].baseColor);
+                    hash = HashVector(hash, data[index].emissionColor);
+                    hash = HashVector(hash, data[index].baseMapST);
+                    hash = HashVector(hash, data[index].surface0);
+                    hash = HashVector(hash, data[index].surface1);
+                    hash = HashVector(hash, data[index].surface2);
+                    hash = HashVector(hash, data[index].feature0);
+                }
+                return hash;
+            }
+        }
+
+        static int HashVector(int hash, Vector4 value)
+        {
+            unchecked
+            {
+                hash = hash * 397 ^ value.x.GetHashCode();
+                hash = hash * 397 ^ value.y.GetHashCode();
+                hash = hash * 397 ^ value.z.GetHashCode();
+                return hash * 397 ^ value.w.GetHashCode();
+            }
+        }
+
         static bool MaterialHasTexture(Material material, string propertyName)
         {
             if (material == null || !material.HasProperty(propertyName))
@@ -2249,9 +2329,12 @@ namespace Nanite
                 return proxy.resolveMaterials;
 
             var renderer = ResolveSourceRenderer(proxy);
-            if (renderer == null || renderer.sharedMaterials == null || renderer.sharedMaterials.Length == 0)
-                return new Material[0];
-            return renderer.sharedMaterials;
+            if (renderer != null && renderer.sharedMaterials != null && renderer.sharedMaterials.Length > 0)
+                return renderer.sharedMaterials;
+            if (proxy != null && proxy.naniteMesh != null &&
+                proxy.naniteMesh.sourceMaterials != null && proxy.naniteMesh.sourceMaterials.Length > 0)
+                return proxy.naniteMesh.sourceMaterials;
+            return new Material[0];
         }
 
         static bool IsValidProxy(NaniteRuntimeProxy proxy) =>

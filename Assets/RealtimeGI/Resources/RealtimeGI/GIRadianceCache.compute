@@ -1,21 +1,17 @@
 // Persistent radiance cache update and compact per-frame staging.
 #pragma kernel UpdateSurfaceRadiance
 #pragma kernel CommitSurfaceRadiance
+#pragma kernel BuildBrickLightLists
 #pragma target 5.0
 
 #include "../../Shaders/GISceneCommon.hlsl"
 #include "../../Shaders/GIClipmapCommon.hlsl"
 #include "../../Shaders/GITODSky.hlsl"
+#include "../../Shaders/GILightCommon.hlsl"
 
-struct GILocalLightData
-{
-    float4 positionRange;
-    float4 colorIntensity;
-    float4 directionOuterCos;
-    // x = type (0 point, 1 spot), y = inner cos, z = casts shadow,
-    // w = indirect multiplier.
-    float4 parameters;
-};
+// This compute shader does not include URP's math constants. Keep its radiometric
+// conversion constant local instead of relying on an include-order side effect.
+static const float GI_RADIANCE_PI = 3.14159265359;
 
 StructuredBuffer<uint> _GIRadianceDirtyBricks;
 StructuredBuffer<GIGpuClipmapBrickData> _GITargetBrickData;
@@ -29,6 +25,8 @@ RWStructuredBuffer<uint> _GITargetValidity;
 RWStructuredBuffer<uint> _GITargetValidityScratch;
 StructuredBuffer<GIMaterialData> _GIMaterials;
 StructuredBuffer<GILocalLightData> _GILocalLights;
+RWStructuredBuffer<uint> _GITargetLightCounts;
+RWStructuredBuffer<uint> _GITargetLightIndices;
 
 StructuredBuffer<GIClipmapLevelData> _GIClipmapLevels;
 StructuredBuffer<int> _GIStaticPageTable;
@@ -53,6 +51,7 @@ uint _GIRadianceDirtyBrickCount;
 uint _GIMaterialCount;
 uint _GILocalLightCount;
 uint _GIMaxShadowedLocalLights;
+uint _GIMaxLightsPerBrick;
 uint _GISecondaryBounceRays;
 uint _GIRadianceFrameIndex;
 uint _GITargetLayer;
@@ -61,6 +60,8 @@ float3 _GIMainLightDirection;
 float3 _GIMainLightColor;
 float _GIRadianceShadowDistance;
 float _GISecondaryBounceIntensity;
+float _GISkyIrradianceScale;
+float _GIMainLightBounceScale;
 float _GIRadianceHistoryWeight;
 float _GIRadianceClamp;
 uint _GIEnableRadianceShadows;
@@ -170,7 +171,10 @@ float3 GIReadDirectionalCell(uint physicalBrick, uint localCell, uint hitLayer,
                                              : _GIDynamicRadiance[baseAddress + yLobe]);
     float3 z = GIUnpackRgb9E5(hitLayer == 0u ? _GIStaticRadiance[baseAddress + zLobe]
                                              : _GIDynamicRadiance[baseAddress + zLobe]);
-    return (x * weights.x + y * weights.y + z * weights.z) * confidence;
+    // Confidence describes whether/how often this payload has been refreshed.  It is an
+    // interpolation/history weight, not radiometric throughput.  Multiplying the payload
+    // here made a freshly valid surface start at 25% brightness and brighten every sweep.
+    return x * weights.x + y * weights.y + z * weights.z;
 }
 
 float3 GIReadCachedRadiance(int physicalBrick, uint localCell, uint hitLayer,
@@ -219,6 +223,91 @@ float GILocalLightVisibility(float3 worldPosition, float3 normal, float3 lightDi
                                 preferredLevel, sourceIdentity, hitT, hitLayer, hitLevel,
                                 hitPhysicalBrick, hitLocalCell);
     return blocked ? 0.0 : 1.0;
+}
+
+float GILightBrickScore(GILocalLightData light, float3 brickMin, float3 brickMax)
+{
+    float3 closest = clamp(light.positionRange.xyz, brickMin, brickMax);
+    float3 delta = closest - light.positionRange.xyz;
+    if (dot(delta, delta) > light.positionRange.w * light.positionRange.w)
+        return -1.0;
+    float3 center = (brickMin + brickMax) * 0.5;
+    float3 toCenter = center - light.positionRange.xyz;
+    float distanceSquared = max(dot(toCenter, toCenter), 0.01);
+    float distance = sqrt(distanceSquared);
+    float normalizedDistance = distance / max(light.positionRange.w, 1e-4);
+    float coverage = saturate(1.0 - normalizedDistance * normalizedDistance);
+    if (light.parameters.x > 0.5 && distance > 1e-4)
+    {
+        float coneCos = dot(light.directionOuterCos.xyz, toCenter / distance);
+        float brickRadius = length(brickMax - brickMin) * 0.5;
+        float angularSlack = saturate(brickRadius / max(distance, brickRadius));
+        if (coneCos + angularSlack < light.directionOuterCos.w)
+            return -1.0;
+        coverage *= saturate((coneCos + angularSlack - light.directionOuterCos.w) /
+                             max(light.parameters.y - light.directionOuterCos.w, 1e-3));
+    }
+    float luminance = dot(max(0.0, light.colorIntensity.rgb),
+                          float3(0.2126, 0.7152, 0.0722));
+    return luminance * max(0.0, light.parameters.w) * coverage * coverage /
+           max(distanceSquared, 0.25);
+}
+
+[numthreads(1, 1, 1)]
+void BuildBrickLightLists(uint3 groupId : SV_GroupID)
+{
+    if (groupId.x >= _GIRadianceDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIRadianceDirtyBricks[groupId.x];
+    GIGpuClipmapBrickData brick = _GITargetBrickData[physicalBrick];
+    GIClipmapLevelData level = _GIClipmapLevels[brick.level];
+    float brickWorldSize = level.cellSize * GI_BRICK_SIZE;
+    float3 brickMin = (float3)brick.worldBrick * brickWorldSize;
+    float3 brickMax = brickMin + brickWorldSize;
+    uint capacity = min(_GIMaxLightsPerBrick, GI_MAX_LIGHTS_PER_BRICK);
+    float scores[GI_MAX_LIGHTS_PER_BRICK];
+    uint indices[GI_MAX_LIGHTS_PER_BRICK];
+    [unroll]
+    for (uint slot = 0u; slot < GI_MAX_LIGHTS_PER_BRICK; slot++)
+    {
+        scores[slot] = -1.0;
+        indices[slot] = 0u;
+    }
+    uint selected = 0u;
+    [loop]
+    for (uint lightIndex = 0u; lightIndex < _GILocalLightCount; lightIndex++)
+    {
+        float score = GILightBrickScore(_GILocalLights[lightIndex], brickMin, brickMax);
+        if (score <= 0.0 || capacity == 0u)
+            continue;
+        if (selected < capacity)
+        {
+            scores[selected] = score;
+            indices[selected] = lightIndex;
+            selected++;
+            continue;
+        }
+        uint minimumSlot = 0u;
+        float minimumScore = scores[0];
+        [loop]
+        for (uint searchSlot = 1u; searchSlot < capacity; searchSlot++)
+        {
+            if (scores[searchSlot] < minimumScore)
+            {
+                minimumScore = scores[searchSlot];
+                minimumSlot = searchSlot;
+            }
+        }
+        if (score > minimumScore)
+        {
+            scores[minimumSlot] = score;
+            indices[minimumSlot] = lightIndex;
+        }
+    }
+    _GITargetLightCounts[physicalBrick] = selected;
+    [loop]
+    for (uint writeSlot = 0u; writeSlot < selected; writeSlot++)
+        _GITargetLightIndices[physicalBrick * capacity + writeSlot] = indices[writeSlot];
 }
 
 [numthreads(8, 8, 8)]
@@ -306,35 +395,37 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
         mainVisibility = blocked ? 0.0 : 1.0;
     }
 
-    float3 directIrradiance = GIEvaluateTODDiffuseSky(normal) * 0.30 +
-                               _GIMainLightColor * (mainNoL * mainVisibility) * 0.35;
+    uint previousValidity = _GITargetLayer == 0u
+        ? _GIStaticValidity[targetCellAddress] : _GIDynamicValidity[targetCellAddress];
+    uint previousRevision = previousValidity >> 16u;
+    uint previousConfidence = previousRevision == (materialRevision & 0xffffu)
+        ? (previousValidity & 0xffu) : 0u;
+    // A one/few-ray cache update must not let the newest coloured bounce replace most of
+    // the cell in one frame.  The old serialized default (0.35) made a single red/cyan hit
+    // contribute 65%, which appeared as voxel-sized mottling in Final Gather.
+    float effectiveHistory = previousConfidence > 0u
+        ? max(0.65, saturate(_GIRadianceHistoryWeight)) : 0.0;
+
+    float3 directIrradiance = _GIMainLightColor *
+        (mainNoL * mainVisibility) * _GIMainLightBounceScale;
 
     uint shadowedLightCount = 0u;
+    uint brickLightCount = min(_GITargetLightCounts[physicalBrick], _GIMaxLightsPerBrick);
     [loop]
-    for (uint lightIndex = 0u; lightIndex < _GILocalLightCount; lightIndex++)
+    for (uint brickLight = 0u; brickLight < brickLightCount; brickLight++)
     {
-        GILocalLightData light = _GILocalLights[lightIndex];
-        float3 toLight = light.positionRange.xyz - worldPosition;
-        float distanceSquared = dot(toLight, toLight);
-        float lightDistance = sqrt(max(distanceSquared, 1e-8));
-        if (lightDistance >= light.positionRange.w)
+        uint lightIndex = _GITargetLightIndices[
+            physicalBrick * _GIMaxLightsPerBrick + brickLight];
+        if (lightIndex >= _GILocalLightCount)
             continue;
-        float3 lightDirection = toLight / lightDistance;
+        GILocalLightData light = _GILocalLights[lightIndex];
+        float3 lightDirection;
+        float lightDistance;
+        float attenuation = GILocalLightAttenuation(
+            light, worldPosition, lightDirection, lightDistance);
         float localDot = dot(normal, lightDirection);
         float noL = twoSided ? abs(localDot) : saturate(localDot);
-        if (noL <= 0.0)
-            continue;
-
-        float normalizedDistance = lightDistance / max(light.positionRange.w, 1e-4);
-        float rangeWindow = saturate(1.0 - normalizedDistance * normalizedDistance);
-        float attenuation = rangeWindow * rangeWindow / max(distanceSquared, 0.01);
-        if (light.parameters.x > 0.5)
-        {
-            float coneCos = dot(light.directionOuterCos.xyz, -lightDirection);
-            float cone = smoothstep(light.directionOuterCos.w, light.parameters.y, coneCos);
-            attenuation *= cone;
-        }
-        if (attenuation <= 0.0)
+        if (noL <= 0.0 || attenuation <= 0.0)
             continue;
 
         float visibility = 1.0;
@@ -345,35 +436,61 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
                                                 sourceIdentity);
             shadowedLightCount++;
         }
-        directIrradiance += light.colorIntensity.rgb *
+        directIrradiance += GILocalLightRadiance(light) *
                             (attenuation * noL * visibility * max(0.0, light.parameters.w));
     }
 
-    float3 indirectRadiance = 0.0;
+    float3 indirectIrradiance = 0.0;
     uint bounceRayCount = min(_GISecondaryBounceRays, 4u);
+    // Four directions seed a newly valid cell; subsequent sweeps use at least two. This is
+    // still amortized by the radiance-brick budget, but avoids writing binary 0/1 sky
+    // visibility and a single saturated bounce into a persistent Surface Cache cell.
+    uint minimumQualityRayCount = previousConfidence > 0u ? 2u : 4u;
+    uint visibilityRayCount = max(minimumQualityRayCount, bounceRayCount);
+    float visibleSkySamples = 0.0;
+    float2 sampleRotation = GIRandom2(
+        targetCellAddress ^ (_GITargetLayer * 0x68bc21ebu) ^ 0xa511e9b3u);
     [loop]
-    for (uint rayIndex = 0u; rayIndex < bounceRayCount; rayIndex++)
+    for (uint rayIndex = 0u; rayIndex < visibilityRayCount; rayIndex++)
     {
-        uint seed = targetCellAddress ^ (_GIRadianceFrameIndex * 0x9e3779b9u) ^
-                    (rayIndex * 0x85ebca6bu);
-        float3 rayDirection = GICosineHemisphere(normal, GIRandom2(seed));
+        float sequenceIndex = (float)(_GIRadianceFrameIndex * visibilityRayCount +
+                                      rayIndex + 1u);
+        float2 directionSample = frac(
+            sampleRotation + sequenceIndex * float2(0.754877666, 0.569840296));
+        float3 rayDirection = GICosineHemisphere(normal, directionSample);
         float hitT;
         uint hitLayer;
         uint hitLevel;
         int hitPhysicalBrick;
         uint hitLocalCell;
-        // Environment lighting is already injected by the explicit low-frequency sky term.
-        // A secondary miss therefore contributes no additional sky energy.
-        float3 incoming = 0.0;
-        if (GITraceScene(worldPosition + normal * (level.cellSize * 0.25), rayDirection,
-                         _GIRadianceShadowDistance, brick.level, sourceIdentity,
-                         hitT, hitLayer, hitLevel, hitPhysicalBrick, hitLocalCell))
-            incoming = GIReadCachedRadiance(
-                hitPhysicalBrick, hitLocalCell, hitLayer, -rayDirection);
-        indirectRadiance += incoming;
+        bool blocked = GITraceScene(
+            worldPosition + normal * (level.cellSize * 0.25), rayDirection,
+            _GIRadianceShadowDistance, brick.level, sourceIdentity,
+            hitT, hitLayer, hitLevel, hitPhysicalBrick, hitLocalCell);
+        if (!blocked)
+            visibleSkySamples += 1.0;
+        else if (bounceRayCount > 0u)
+        {
+            // Cosine sampling estimates irradiance as PI times incoming radiance.
+            indirectIrradiance += GIReadCachedRadiance(
+                hitPhysicalBrick, hitLocalCell, hitLayer, -rayDirection) * GI_RADIANCE_PI;
+        }
     }
     if (bounceRayCount > 0u)
-        indirectRadiance *= _GISecondaryBounceIntensity / (float)bounceRayCount;
+        indirectIrradiance *= _GISecondaryBounceIntensity / (float)visibilityRayCount;
+
+    float measuredSkyVisibility = visibleSkySamples / (float)visibilityRayCount;
+    float previousSkyVisibility = previousConfidence > 0u
+        ? ((previousValidity >> 8u) & 0xffu) / 255.0
+        : measuredSkyVisibility;
+    // Visibility is a separate transport term.  Do not lower sky energy globally to hide
+    // leaks: accumulate an amortized cosine visibility estimate per Surface cell instead.
+    float skyVisibilityHistory = previousConfidence > 0u
+        ? max(0.75, saturate(_GIRadianceHistoryWeight)) : 0.0;
+    float skyVisibility = lerp(
+        measuredSkyVisibility, previousSkyVisibility, skyVisibilityHistory);
+    directIrradiance += GIEvaluateTODDiffuseSky(normal) *
+                        (_GISkyIrradianceScale * skyVisibility);
 
     // The cache stores outgoing diffuse radiance, not irradiance.  Convert with the
     // Lambert 1/PI factor and remove the metallic portion from diffuse albedo.  The old
@@ -381,13 +498,7 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
     // into the diffuse cache, producing the red/cyan pollution seen across whole rows.
     float3 diffuseColor = baseColor * (1.0 - saturate(metallic));
     float3 diffuseRadiance = emissive +
-        diffuseColor * (directIrradiance + indirectRadiance) * 0.31830988618;
-    uint previousValidity = _GITargetLayer == 0u
-        ? _GIStaticValidity[targetCellAddress] : _GIDynamicValidity[targetCellAddress];
-    uint previousRevision = previousValidity >> 16u;
-    uint previousConfidence = previousRevision == (materialRevision & 0xffffu)
-        ? (previousValidity & 0xffu) : 0u;
-    float effectiveHistory = saturate(_GIRadianceHistoryWeight) * (previousConfidence / 255.0);
+        diffuseColor * (directIrradiance + indirectIrradiance) * (1.0 / GI_RADIANCE_PI);
     [unroll]
     for (uint outputLobe = 0u; outputLobe < GI_RADIANCE_LOBE_COUNT; outputLobe++)
     {
@@ -400,11 +511,12 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
         _GITargetRadianceScratch[scratchRadianceBase + outputLobe] =
             GIPackRgb9E5(clamp(nextRadiance, 0.0, _GIRadianceClamp));
     }
-    uint nextConfidence = min(255u, previousConfidence + 64u);
-    uint previousAge = previousRevision == (materialRevision & 0xffffu)
-        ? ((previousValidity >> 8u) & 0xffu) : 0u;
-    uint nextAge = min(255u, previousAge + 1u);
-    _GITargetValidityScratch[scratchCellAddress] = nextConfidence | (nextAge << 8u) |
+    // The middle byte stores temporally accumulated sky visibility. Confidence only gates
+    // readability and the high word remains the material revision.
+    uint nextConfidence = 255u;
+    uint packedSkyVisibility = (uint)round(saturate(skyVisibility) * 255.0);
+    _GITargetValidityScratch[scratchCellAddress] = nextConfidence |
+                                                   (packedSkyVisibility << 8u) |
                                                    ((materialRevision & 0xffffu) << 16u);
 }
 

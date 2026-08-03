@@ -3338,8 +3338,9 @@ namespace Nanite
                 {
                     Debug.LogWarning(
                         $"[Nanite][Material] '{proxy.name}' uses a shader outside the URP/Lit resolve family " +
-                        "and has no native MeshRenderer fallback. It remains on compatibility resolve; " +
-                        "author a Nanite shader family or provide the source MeshRenderer for exact output.",
+                        "and has no native MeshRenderer fallback. Forced Nanite fails closed and does not " +
+                        "shade it with incorrect URP/Lit semantics; author a Nanite shader family or " +
+                        "provide the source MeshRenderer and use Raster/Auto mode.",
                         proxy);
                 }
             }
@@ -3357,6 +3358,8 @@ namespace Nanite
                     renderer = proxy.GetComponentInChildren<Renderer>();
                 materials = renderer != null ? renderer.sharedMaterials : null;
             }
+            if (materials == null || materials.Length == 0)
+                materials = proxy.naniteMesh != null ? proxy.naniteMesh.sourceMaterials : null;
             if (materials == null)
                 return false;
             for (int i = 0; i < materials.Length; i++)

@@ -661,8 +661,9 @@ namespace Nanite
                         (column - (columns - 1) * 0.5f) * spacing,
                         0f,
                         (row - (rows - 1) * 0.5f) * spacing);
-                proxy.forceNaniteRendering = !autoAdmission && !rasterStress;
-                proxy.forceRasterRendering = !autoAdmission && rasterStress;
+                proxy.renderingMode = autoAdmission
+                    ? NaniteRenderingMode.Auto
+                    : (rasterStress ? NaniteRenderingMode.Raster : NaniteRenderingMode.Nanite);
                 if (rasterStress)
                     proxy.rasterFallbackMesh = proxy.naniteMesh.sourceMesh;
                 Material[] instanceMaterials = null;
@@ -1409,8 +1410,7 @@ namespace Nanite
 
             if (rasterReferenceCapture)
             {
-                subject.forceNaniteRendering = false;
-                subject.forceRasterRendering = true;
+                subject.renderingMode = NaniteRenderingMode.Raster;
                 subject.SetRasterFallbackActive(true);
                 subject.MarkRenderDataDirty();
             }
@@ -1420,8 +1420,7 @@ namespace Nanite
                 // ordinary MeshRenderer by the production cost model.  This
                 // harness is specifically validating the virtual-geometry cut,
                 // so make the subject unambiguously Nanite-owned.
-                subject.forceNaniteRendering = true;
-                subject.forceRasterRendering = false;
+                subject.renderingMode = NaniteRenderingMode.Nanite;
                 subject.SetRasterFallbackActive(false);
                 subject.MarkRenderDataDirty();
             }

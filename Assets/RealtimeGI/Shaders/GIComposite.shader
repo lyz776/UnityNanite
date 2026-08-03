@@ -43,7 +43,9 @@ Shader "Hidden/RealtimeGI/Composite"
                     ? max(gBuffer1.r, max(gBuffer1.g, gBuffer1.b))
                     : gBuffer1.r;
                 half3 brdfDiffuse = gBuffer0.rgb * (1.0h - saturate(reflectivity));
-                half3 indirectDiffuse = irradiance * brdfDiffuse * gBuffer1.a;
+                // The final gather estimates irradiance. Apply the Lambert BRDF exactly once
+                // here; the cache itself stores outgoing radiance.
+                half3 indirectDiffuse = irradiance * brdfDiffuse * (1.0h / PI) * gBuffer1.a;
                 return half4(max(0.0h, indirectDiffuse + indirectSpecular * gBuffer1.a), 0.0h);
             }
             ENDHLSL

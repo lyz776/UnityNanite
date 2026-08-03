@@ -116410,6 +116410,8 @@ MonoBehaviour:
   m_Name: dragon_871k_mesh
   m_EditorClassIdentifier: Nanite::Nanite.NaniteMesh
   sourceMesh: {fileID: -6053382344825935911, guid: 0c455d348b24ad44aa33b5f1c644d042, type: 3}
+  sourceMaterials:
+  - {fileID: 1309083258448698360, guid: 0c455d348b24ad44aa33b5f1c644d042, type: 3}
   sourceTriangleCount: 871198
   boundingSphere: {x: 0.16192496, y: 0.69532, z: 0.27752972, w: 6.5133753}
   subMeshCount: 1

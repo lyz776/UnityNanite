@@ -7,7 +7,8 @@ namespace RealtimeGI
 {
     /// <summary>
     /// Phase 1/2 sparse Clipmap builder. Static world Bricks persist across camera scrolling;
-    /// Dynamic Overlay Bricks are cleared and rebuilt from the current instance list every frame.
+    /// Dynamic Overlay Bricks are invalidated from changed old/new instance bounds and rebuilt
+    /// from the current instance list. Receiver-only motion does not touch the world cache.
     /// </summary>
     [ExecuteAlways]
     [DefaultExecutionOrder(11000)]
@@ -18,7 +19,7 @@ namespace RealtimeGI
         // Increment whenever the persistent radiance representation or update addressing changes.
         // Including this in the lighting signature guarantees that stale cache contents are
         // requeued instead of surviving a shader-only implementation update.
-        const int RadianceAlgorithmVersion = 11;
+        const int RadianceAlgorithmVersion = 16;
         public static GIClipmapSystem Active { get; private set; }
         [Header("Sources")]
         public RealtimeGIScene scene;
@@ -36,12 +37,19 @@ namespace RealtimeGI
         public bool enableRadianceShadows = true;
         [Min(1f)] public float radianceShadowDistance = 80f;
         [Header("Local lights and multi-bounce")]
-        [Range(0, 64)] public int maxLocalLights = 16;
+        [Tooltip("Upload safety cap only. Per-Brick GPU Top-K selection decides which lights affect each cache region.")]
+        [Range(64, 4096)] public int maxUploadedLocalLights = 2048;
+        [Range(8, 64)] public int maxLocalLightsPerBrick = 32;
         [Range(0, 8)] public int maxShadowedLocalLightsPerSurface = 2;
         [Range(0, 4)] public int secondaryBounceRays = 1;
         [Range(0f, 1f)] public float secondaryBounceIntensity = 0.55f;
+        [Tooltip("Exposure multiplier for physically normalized TOD sky irradiance. One is neutral; visibility is accumulated per Surface cell.")]
+        [Range(0f, 2f)] public float skyIrradianceScale = 1f;
+        [Tooltip("Directional-light energy available to indirect diffuse bounces. One is physically consistent with Unity light intensity.")]
+        [Range(0f, 2f)] public float mainLightBounceScale = 1f;
         [Range(1, 8)] public int staticBounceSweeps = 3;
-        [Range(0f, 0.95f)] public float radianceHistoryWeight = 0.35f;
+        [Tooltip("Surface Cache temporal stability. Values below 0.65 are internally clamped because sparse coloured bounce samples otherwise become voxel-sized blotches.")]
+        [Range(0f, 0.95f)] public float radianceHistoryWeight = 0.65f;
         [Min(0.1f)] public float radianceClamp = 32f;
         [Range(32, 512)] public int materialTextureResolution = 128;
         public bool automaticUpdate = true;
@@ -56,6 +64,7 @@ namespace RealtimeGI
         [SerializeField] int streamedTriangleCount;
         [SerializeField] int invalidGeometryCount;
         [SerializeField] int invalidatedStaticBrickCount;
+        [SerializeField] int invalidatedDynamicBrickCount;
         [SerializeField] int pendingStaticRadianceBricks;
         [SerializeField] int pendingDynamicRadianceBricks;
         [SerializeField] int updatedRadianceBricks;
@@ -74,6 +83,12 @@ namespace RealtimeGI
             new Dictionary<uint, StaticInstanceState>(256);
         readonly HashSet<uint> observedStaticInstances = new HashSet<uint>();
         readonly List<uint> removedStaticInstances = new List<uint>(64);
+        readonly HashSet<GIClipmapBrickKey> invalidatedDynamicBricks =
+            new HashSet<GIClipmapBrickKey>();
+        readonly Dictionary<uint, StaticInstanceState> previousDynamicInstances =
+            new Dictionary<uint, StaticInstanceState>(256);
+        readonly HashSet<uint> observedDynamicInstances = new HashSet<uint>();
+        readonly List<uint> removedDynamicInstances = new List<uint>(64);
         readonly List<GILocalLight> localLightScratch = new List<GILocalLight>(64);
         readonly List<GIGpuLocalLightData> gpuLocalLights = new List<GIGpuLocalLightData>(64);
 
@@ -90,6 +105,7 @@ namespace RealtimeGI
         int initializeDistanceKernel = -1;
         int propagateDistanceKernel = -1;
         int updateRadianceKernel = -1;
+        int buildBrickLightListsKernel = -1;
         int commitRadianceKernel = -1;
         int lightingSignature;
         int lightingRevision;
@@ -156,6 +172,9 @@ namespace RealtimeGI
         static readonly int EnableRadianceShadowsId = Shader.PropertyToID("_GIEnableRadianceShadows");
         static readonly int LocalLightsId = Shader.PropertyToID("_GILocalLights");
         static readonly int LocalLightCountId = Shader.PropertyToID("_GILocalLightCount");
+        static readonly int MaxLightsPerBrickId = Shader.PropertyToID("_GIMaxLightsPerBrick");
+        static readonly int TargetLightCountsId = Shader.PropertyToID("_GITargetLightCounts");
+        static readonly int TargetLightIndicesId = Shader.PropertyToID("_GITargetLightIndices");
         static readonly int MaxShadowedLocalLightsId = Shader.PropertyToID("_GIMaxShadowedLocalLights");
         static readonly int StaticRadianceId = Shader.PropertyToID("_GIStaticRadiance");
         static readonly int StaticValidityId = Shader.PropertyToID("_GIStaticValidity");
@@ -168,6 +187,8 @@ namespace RealtimeGI
         static readonly int TextureSliceCountId = Shader.PropertyToID("_GITextureSliceCount");
         static readonly int SecondaryBounceRaysId = Shader.PropertyToID("_GISecondaryBounceRays");
         static readonly int SecondaryBounceIntensityId = Shader.PropertyToID("_GISecondaryBounceIntensity");
+        static readonly int SkyIrradianceScaleId = Shader.PropertyToID("_GISkyIrradianceScale");
+        static readonly int MainLightBounceScaleId = Shader.PropertyToID("_GIMainLightBounceScale");
         static readonly int RadianceHistoryWeightId = Shader.PropertyToID("_GIRadianceHistoryWeight");
         static readonly int RadianceClampId = Shader.PropertyToID("_GIRadianceClamp");
         static readonly int RadianceFrameIndexId = Shader.PropertyToID("_GIRadianceFrameIndex");
@@ -222,6 +243,7 @@ namespace RealtimeGI
             streamedTriangleCount = geometryCache.TriangleCount;
             invalidGeometryCount = geometryCache.InvalidGeometryCount;
             BuildStaticInvalidationSet();
+            BuildDynamicInvalidationSet();
 
             staticLayer.UpdateRequired(staticRequired, levelOrigins, false);
             staticLayer.MarkDirty(invalidatedStaticBricks);
@@ -232,6 +254,7 @@ namespace RealtimeGI
             // are already dirtied by UpdateRequired; motion needs explicit dirty regions,
             // rather than invalidating the complete dynamic pool every frame.
             dynamicLayer.UpdateRequired(dynamicRequired, levelOrigins, false);
+            dynamicLayer.MarkDirty(invalidatedDynamicBricks);
 
             Light sun = RenderSettings.sun;
             Vector3 lightDirection = sun != null
@@ -251,9 +274,10 @@ namespace RealtimeGI
             if (nextLightingSignature != lightingSignature)
             {
                 lightingSignature = nextLightingSignature;
+                bool firstLightingUpdate = lightingRevision == 0;
                 unchecked { lightingRevision++; }
-                staticLayer.EnqueueAllRadiance();
-                dynamicLayer.EnqueueAllRadiance();
+                staticLayer.EnqueueAllRadiance(levelOrigins, true, firstLightingUpdate);
+                dynamicLayer.EnqueueAllRadiance(levelOrigins, true, firstLightingUpdate);
                 remainingStaticBounceSweeps = Mathf.Max(0, staticBounceSweeps - 1);
             }
             else if (staticLayer.DirtyBrickCount > 0)
@@ -264,7 +288,7 @@ namespace RealtimeGI
             // completely drained so the iteration is deterministic under a per-frame budget.
             if (staticLayer.PendingRadianceCount == 0 && remainingStaticBounceSweeps > 0)
             {
-                staticLayer.EnqueueAllRadiance();
+                staticLayer.EnqueueAllRadiance(levelOrigins, false);
                 remainingStaticBounceSweeps--;
             }
             staticLayer.PrepareRadianceUpdates(staticRadianceBricksPerFrame);
@@ -310,7 +334,8 @@ namespace RealtimeGI
             pendingDynamicRadianceBricks = dynamicLayer.PendingRadianceCount;
             updatedRadianceBricks = staticLayer.RadianceDirtyCount + dynamicLayer.RadianceDirtyCount;
             generation++;
-            if (originsChanged || geometryRebuilt || invalidatedStaticBricks.Count > 0)
+            if (originsChanged || geometryRebuilt || invalidatedStaticBricks.Count > 0 ||
+                invalidatedDynamicBricks.Count > 0)
                 estimatedPoolMiB = EstimatePoolMiB();
             WarnOnDegradation();
         }
@@ -464,6 +489,7 @@ namespace RealtimeGI
                 initializeDistanceKernel = clipmapBuildShader.FindKernel("InitializeDistance");
                 propagateDistanceKernel = clipmapBuildShader.FindKernel("PropagateDistance");
                 updateRadianceKernel = radianceCacheShader.FindKernel("UpdateSurfaceRadiance");
+                buildBrickLightListsKernel = radianceCacheShader.FindKernel("BuildBrickLightLists");
                 commitRadianceKernel = radianceCacheShader.FindKernel("CommitSurfaceRadiance");
                 geometryCache = new GIGeometryStreamCache();
                 materialTextureCache = new GIMaterialTextureCache();
@@ -489,6 +515,8 @@ namespace RealtimeGI
 
         void EnsureAuxiliaryBuffers()
         {
+            staticLayer?.EnsureLightLists(maxLocalLightsPerBrick, "GI Static");
+            dynamicLayer?.EnsureLightLists(maxLocalLightsPerBrick, "GI Dynamic");
             int scratchBricks = Mathf.Max(staticBrickCapacity, dynamicBrickCapacity);
             int requiredScratch = scratchBricks * GIClipmapConstants.RadianceWordsPerBrick;
             if (radianceScratchBuffer == null || radianceScratchCapacity < requiredScratch)
@@ -512,7 +540,7 @@ namespace RealtimeGI
                     name = "GI Validity Scratch"
                 };
             }
-            int requiredLights = Mathf.NextPowerOfTwo(Mathf.Max(1, maxLocalLights));
+            int requiredLights = Mathf.NextPowerOfTwo(Mathf.Max(1, maxUploadedLocalLights));
             if (localLightBuffer == null || localLightCapacity < requiredLights)
             {
                 localLightBuffer?.Release();
@@ -544,11 +572,10 @@ namespace RealtimeGI
                 if (candidate != null && candidate.IsSupported)
                     localLightScratch.Add(candidate);
             }
-            localLightScratch.Sort((a, b) =>
-                LocalLightScore(b, focusPosition).CompareTo(LocalLightScore(a, focusPosition)));
-
             gpuLocalLights.Clear();
-            int count = Mathf.Min(Mathf.Max(0, maxLocalLights), localLightScratch.Count);
+            // CPU only discovers components and uploads the stable ABI. Off-screen lights
+            // must remain available to world-cache rays; GPU Brick lists perform selection.
+            int count = Mathf.Min(Mathf.Max(0, maxUploadedLocalLights), localLightScratch.Count);
             for (int i = 0; i < count; i++)
             {
                 GILocalLight adapter = localLightScratch[i];
@@ -573,16 +600,6 @@ namespace RealtimeGI
             activeLocalLightCount = gpuLocalLights.Count;
             if (gpuLocalLights.Count > 0)
                 localLightBuffer.SetData(gpuLocalLights, 0, 0, gpuLocalLights.Count);
-        }
-
-        static float LocalLightScore(GILocalLight adapter, Vector3 focusPosition)
-        {
-            Light light = adapter.Source;
-            float distance = Vector3.Distance(light.transform.position, focusPosition);
-            float coverage = Mathf.Clamp01(1f - distance / Mathf.Max(0.01f, light.range));
-            Color color = light.color.linear;
-            return light.intensity * color.maxColorComponent *
-                   Mathf.Max(0.05f, adapter.indirectMultiplier) * (0.1f + coverage);
         }
 
         bool UpdateLevelOrigins(Vector3 focusPosition)
@@ -700,6 +717,52 @@ namespace RealtimeGI
             for (int i = 0; i < removedStaticInstances.Count; i++)
                 previousStaticInstances.Remove(removedStaticInstances[i]);
             invalidatedStaticBrickCount = invalidatedStaticBricks.Count;
+        }
+
+        void BuildDynamicInvalidationSet()
+        {
+            invalidatedDynamicBricks.Clear();
+            observedDynamicInstances.Clear();
+            IReadOnlyList<GIGpuInstanceData> instances = scene.CpuInstances;
+            IReadOnlyList<GIGpuGeometryData> geometries = scene.CpuGeometries;
+            IReadOnlyList<GIGpuMaterialBindingData> bindings = scene.CpuMaterialBindings;
+            for (int i = 0; i < instances.Count; i++)
+            {
+                GIGpuInstanceData instance = instances[i];
+                GIInstanceFlags flags = (GIInstanceFlags)instance.flags;
+                if ((flags & GIInstanceFlags.Dynamic) == 0 ||
+                    (flags & (GIInstanceFlags.Occluder | GIInstanceFlags.Contributor)) == 0)
+                    continue;
+
+                StaticInstanceState next = BuildStaticState(instance, geometries, bindings);
+                observedDynamicInstances.Add(instance.objectId);
+                if (!previousDynamicInstances.TryGetValue(
+                        instance.objectId, out StaticInstanceState previous))
+                {
+                    AddSphereBricks(instance.worldBoundingSphere, invalidatedDynamicBricks);
+                }
+                else if (previous.signature != next.signature || previous.sphere != next.sphere)
+                {
+                    // Clearing both footprints removes the trail left in a still-required
+                    // shared brick, then voxelization repopulates every current dynamic
+                    // contributor touching either footprint.
+                    AddSphereBricks(previous.sphere, invalidatedDynamicBricks);
+                    AddSphereBricks(next.sphere, invalidatedDynamicBricks);
+                }
+                previousDynamicInstances[instance.objectId] = next;
+            }
+
+            removedDynamicInstances.Clear();
+            foreach (KeyValuePair<uint, StaticInstanceState> pair in previousDynamicInstances)
+            {
+                if (observedDynamicInstances.Contains(pair.Key))
+                    continue;
+                AddSphereBricks(pair.Value.sphere, invalidatedDynamicBricks);
+                removedDynamicInstances.Add(pair.Key);
+            }
+            for (int i = 0; i < removedDynamicInstances.Count; i++)
+                previousDynamicInstances.Remove(removedDynamicInstances[i]);
+            invalidatedDynamicBrickCount = invalidatedDynamicBricks.Count;
         }
 
         static StaticInstanceState BuildStaticState(
@@ -837,6 +900,7 @@ namespace RealtimeGI
                 materialTextureCache != null ? materialTextureCache.SliceCount : 0);
             cmd.SetComputeIntParam(radianceCacheShader, EnableRadianceShadowsId, enableRadianceShadows ? 1 : 0);
             cmd.SetComputeIntParam(radianceCacheShader, LocalLightCountId, activeLocalLightCount);
+            cmd.SetComputeIntParam(radianceCacheShader, MaxLightsPerBrickId, layer.LightsPerBrick);
             cmd.SetComputeIntParam(radianceCacheShader, MaxShadowedLocalLightsId,
                 Mathf.Clamp(maxShadowedLocalLightsPerSurface, 0, 8));
             cmd.SetComputeIntParam(radianceCacheShader, SecondaryBounceRaysId,
@@ -846,6 +910,10 @@ namespace RealtimeGI
             cmd.SetComputeFloatParam(radianceCacheShader, RadianceShadowDistanceId, radianceShadowDistance);
             cmd.SetComputeFloatParam(radianceCacheShader, SecondaryBounceIntensityId,
                 Mathf.Clamp01(secondaryBounceIntensity));
+            cmd.SetComputeFloatParam(radianceCacheShader, SkyIrradianceScaleId,
+                Mathf.Max(0f, skyIrradianceScale));
+            cmd.SetComputeFloatParam(radianceCacheShader, MainLightBounceScaleId,
+                Mathf.Max(0f, mainLightBounceScale));
             cmd.SetComputeFloatParam(radianceCacheShader, RadianceHistoryWeightId,
                 Mathf.Clamp(radianceHistoryWeight, 0f, 0.95f));
             cmd.SetComputeFloatParam(radianceCacheShader, RadianceClampId,
@@ -880,6 +948,23 @@ namespace RealtimeGI
                 MaterialsId, view.materials);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 LocalLightsId, localLightBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                TargetLightCountsId, layer.LightCountBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
+                TargetLightIndicesId, layer.LightIndexBuffer);
+
+            cmd.SetComputeBufferParam(radianceCacheShader, buildBrickLightListsKernel,
+                RadianceDirtyBricksId, layer.RadianceDirtyBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, buildBrickLightListsKernel,
+                TargetBrickDataId, layer.BrickDataBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, buildBrickLightListsKernel,
+                LevelsId, levelDataBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, buildBrickLightListsKernel,
+                LocalLightsId, localLightBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, buildBrickLightListsKernel,
+                TargetLightCountsId, layer.LightCountBuffer);
+            cmd.SetComputeBufferParam(radianceCacheShader, buildBrickLightListsKernel,
+                TargetLightIndicesId, layer.LightIndexBuffer);
             cmd.SetComputeTextureParam(radianceCacheShader, updateRadianceKernel,
                 BaseColorTexturesId, materialTextureCache.BaseColorArray);
             cmd.SetComputeTextureParam(radianceCacheShader, updateRadianceKernel,
@@ -914,6 +999,8 @@ namespace RealtimeGI
                 DynamicRadianceId, dynamicLayer.RadianceBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 DynamicValidityId, dynamicLayer.ValidityBuffer);
+            cmd.DispatchCompute(radianceCacheShader, buildBrickLightListsKernel,
+                layer.RadianceDirtyCount, 1, 1);
             cmd.DispatchCompute(radianceCacheShader, updateRadianceKernel,
                 layer.RadianceDirtyCount, 1, 1);
 
@@ -953,9 +1040,12 @@ namespace RealtimeGI
                 hash = hash * 31 + QuantizeLighting(skyColor.b, 4f);
                 hash = hash * 31 + secondaryBounceRays;
                 hash = hash * 31 + secondaryBounceIntensity.GetHashCode();
+                hash = hash * 31 + skyIrradianceScale.GetHashCode();
+                hash = hash * 31 + mainLightBounceScale.GetHashCode();
                 hash = hash * 31 + radianceShadowDistance.GetHashCode();
                 hash = hash * 31 + (enableRadianceShadows ? 1 : 0);
                 hash = hash * 31 + maxShadowedLocalLightsPerSurface;
+                hash = hash * 31 + maxLocalLightsPerBrick;
                 hash = hash * 31 + staticBounceSweeps;
                 hash = hash * 31 + radianceHistoryWeight.GetHashCode();
                 hash = hash * 31 + radianceClamp.GetHashCode();
@@ -1015,7 +1105,9 @@ namespace RealtimeGI
                          Math.Max(staticBrickCapacity, dynamicBrickCapacity) *
                          (GIClipmapConstants.RadianceWordsPerBrick +
                           GIClipmapConstants.ValidityWordsPerBrick) * 4L +
-                         Math.Max(1, maxLocalLights) * GILightAbi.LocalLightStride;
+                         Math.Max(1, maxUploadedLocalLights) * GILightAbi.LocalLightStride +
+                         (staticBrickCapacity + dynamicBrickCapacity) *
+                         (4L + Math.Max(8, maxLocalLightsPerBrick) * 4L);
             return bytes / (1024f * 1024f);
         }
 
@@ -1040,7 +1132,10 @@ namespace RealtimeGI
 
         public bool TryGetGpuView(out GIClipmapGpuView view)
         {
-            view = new GIClipmapGpuView(levelDataBuffer, staticLayer, dynamicLayer, generation, lightingRevision);
+            view = new GIClipmapGpuView(
+                levelDataBuffer, staticLayer, dynamicLayer, localLightBuffer,
+                activeLocalLightCount, generation, lightingRevision,
+                Mathf.Max(0f, skyIrradianceScale), Mathf.Max(0f, mainLightBounceScale));
             return initialized && view.IsValid;
         }
 
@@ -1083,6 +1178,10 @@ namespace RealtimeGI
             observedStaticInstances.Clear();
             removedStaticInstances.Clear();
             invalidatedStaticBricks.Clear();
+            previousDynamicInstances.Clear();
+            observedDynamicInstances.Clear();
+            removedDynamicInstances.Clear();
+            invalidatedDynamicBricks.Clear();
             lightingSignature = 0;
             lightingRevision = 0;
             allocatedStaticCapacity = 0;

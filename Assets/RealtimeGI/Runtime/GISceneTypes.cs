@@ -40,12 +40,13 @@ namespace RealtimeGI
     /// </summary>
     public static class GISceneAbi
     {
-        public const uint Version = 2;
+        public const uint Version = 3;
         public const int InstanceStride = 176;
         public const int GeometryStride = 48;
         public const int MaterialStride = 96;
         public const int MaterialBindingStride = 16;
         public const int GeometryStreamStride = 32;
+        public const int EmissiveAliasStride = 32;
 
         static bool validated;
 
@@ -58,6 +59,7 @@ namespace RealtimeGI
             ValidateStride<GIGpuMaterialData>(MaterialStride, nameof(GIGpuMaterialData));
             ValidateStride<GIGpuMaterialBindingData>(MaterialBindingStride, nameof(GIGpuMaterialBindingData));
             ValidateStride<GIGpuGeometryStreamData>(GeometryStreamStride, nameof(GIGpuGeometryStreamData));
+            ValidateStride<GIGpuEmissiveAliasData>(EmissiveAliasStride, nameof(GIGpuEmissiveAliasData));
             validated = true;
         }
 
@@ -137,6 +139,20 @@ namespace RealtimeGI
         public uint padding1;
     }
 
+    /// <summary>
+    /// One instance-level emissive proposal. probability is the normalized source PMF;
+    /// aliasProbability/aliasIndex form a Walker alias table for O(1) GPU selection.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GIGpuEmissiveAliasData
+    {
+        public Vector4 worldBoundingSphere;
+        public float probability;
+        public float aliasProbability;
+        public uint aliasIndex;
+        public uint objectId;
+    }
+
     /// <summary>Transient view. Valid until the producing RealtimeGIScene rebuilds or disables.</summary>
     public readonly struct GISceneGpuView
     {
@@ -144,10 +160,12 @@ namespace RealtimeGI
         public readonly GraphicsBuffer geometries;
         public readonly GraphicsBuffer materials;
         public readonly GraphicsBuffer materialBindings;
+        public readonly GraphicsBuffer emissiveAliases;
         public readonly int instanceCount;
         public readonly int geometryCount;
         public readonly int materialCount;
         public readonly int materialBindingCount;
+        public readonly int emissiveAliasCount;
         public readonly uint abiVersion;
         public readonly int sceneRevision;
 
@@ -156,25 +174,30 @@ namespace RealtimeGI
             GraphicsBuffer geometries,
             GraphicsBuffer materials,
             GraphicsBuffer materialBindings,
+            GraphicsBuffer emissiveAliases,
             int instanceCount,
             int geometryCount,
             int materialCount,
             int materialBindingCount,
+            int emissiveAliasCount,
             int sceneRevision)
         {
             this.instances = instances;
             this.geometries = geometries;
             this.materials = materials;
             this.materialBindings = materialBindings;
+            this.emissiveAliases = emissiveAliases;
             this.instanceCount = instanceCount;
             this.geometryCount = geometryCount;
             this.materialCount = materialCount;
             this.materialBindingCount = materialBindingCount;
+            this.emissiveAliasCount = emissiveAliasCount;
             abiVersion = GISceneAbi.Version;
             this.sceneRevision = sceneRevision;
         }
 
         public bool IsValid =>
-            instances != null && geometries != null && materials != null && materialBindings != null;
+            instances != null && geometries != null && materials != null &&
+            materialBindings != null && emissiveAliases != null;
     }
 }

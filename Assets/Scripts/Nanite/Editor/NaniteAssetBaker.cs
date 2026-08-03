@@ -519,6 +519,7 @@ namespace Nanite.Editor
 
                 var naniteMesh = ScriptableObject.CreateInstance<NaniteMesh>();
                 naniteMesh.sourceMesh = mesh;
+                naniteMesh.sourceMaterials = ResolveSourceMaterials(mesh, meshAssetPath);
                 naniteMesh.sourceTriangleCount = sourceTriangleCount;
                 naniteMesh.subMeshCount = subMeshCount;
                 naniteMesh.maxMipLevel = maxMipLevel;
@@ -1279,6 +1280,74 @@ namespace Nanite.Editor
                     paths.Add("Assets/StreamingAssets/" + page.StreamingRelativePath);
             }
             return paths;
+        }
+
+        /// <summary>
+        /// Repairs older Nanite assets that predate source-material capture. The
+        /// sourceMesh reference already serializes the FBX GUID + local Mesh file ID;
+        /// this adds the matching renderer material slots from the imported model.
+        /// </summary>
+        public static bool EnsureSourceBindings(NaniteMesh naniteMesh)
+        {
+            if (naniteMesh == null || naniteMesh.sourceMesh == null ||
+                (naniteMesh.sourceMaterials != null && naniteMesh.sourceMaterials.Length > 0))
+                return false;
+
+            string sourcePath = AssetDatabase.GetAssetPath(naniteMesh.sourceMesh);
+            Material[] materials = ResolveSourceMaterials(naniteMesh.sourceMesh, sourcePath);
+            if (materials.Length == 0)
+                return false;
+            naniteMesh.sourceMaterials = materials;
+            EditorUtility.SetDirty(naniteMesh);
+            return true;
+        }
+
+        [MenuItem("Nanite/Repair Baked FBX Bindings")]
+        public static void RepairAllSourceBindingsBatch()
+        {
+            string[] guids = AssetDatabase.FindAssets("t:NaniteMesh");
+            int repaired = 0;
+            for (int index = 0; index < guids.Length; index++)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guids[index]);
+                NaniteMesh mesh = AssetDatabase.LoadAssetAtPath<NaniteMesh>(path);
+                if (EnsureSourceBindings(mesh))
+                    repaired++;
+            }
+            if (repaired > 0)
+                AssetDatabase.SaveAssets();
+            Debug.Log($"[Nanite][SourceBinding] scanned={guids.Length}, repaired={repaired}.");
+        }
+
+        static Material[] ResolveSourceMaterials(Mesh mesh, string sourcePath)
+        {
+            if (mesh == null || string.IsNullOrEmpty(sourcePath))
+                return Array.Empty<Material>();
+
+            GameObject model = AssetDatabase.LoadAssetAtPath<GameObject>(sourcePath);
+            if (model == null)
+                return Array.Empty<Material>();
+
+            MeshFilter[] filters = model.GetComponentsInChildren<MeshFilter>(true);
+            for (int index = 0; index < filters.Length; index++)
+            {
+                MeshFilter filter = filters[index];
+                if (filter == null || filter.sharedMesh != mesh)
+                    continue;
+                MeshRenderer renderer = filter.GetComponent<MeshRenderer>();
+                if (renderer != null && renderer.sharedMaterials != null && renderer.sharedMaterials.Length > 0)
+                    return renderer.sharedMaterials;
+            }
+
+            SkinnedMeshRenderer[] skinned = model.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            for (int index = 0; index < skinned.Length; index++)
+            {
+                SkinnedMeshRenderer renderer = skinned[index];
+                if (renderer != null && renderer.sharedMesh == mesh &&
+                    renderer.sharedMaterials != null && renderer.sharedMaterials.Length > 0)
+                    return renderer.sharedMaterials;
+            }
+            return Array.Empty<Material>();
         }
 
         static NaniteMesh SaveNaniteMeshAsset(NaniteMesh source, string assetPath)

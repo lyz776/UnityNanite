@@ -13,6 +13,7 @@ namespace RealtimeGI
     [DisallowMultipleComponent]
     public sealed class RealtimeGIScene : MonoBehaviour
     {
+        const int MaxEmissiveAliasCount = 32;
         [Tooltip("Build and upload the scene once per LateUpdate. Disable when an external renderer feature drives BuildNow.")]
         public bool automaticUpdate = true;
         public bool includeOrdinaryMeshes = true;
@@ -25,6 +26,7 @@ namespace RealtimeGI
         [SerializeField] int geometryCount;
         [SerializeField] int materialCount;
         [SerializeField] int materialBindingCount;
+        [SerializeField] int emissiveAliasCount;
         [SerializeField] int materialSlotOverflowCount;
 
         readonly Dictionary<int, Matrix4x4> previousTransforms = new Dictionary<int, Matrix4x4>(256);
@@ -37,16 +39,23 @@ namespace RealtimeGI
         readonly List<GIGpuGeometryData> cpuGeometries = new List<GIGpuGeometryData>(256);
         readonly List<GIGpuMaterialData> cpuMaterials = new List<GIGpuMaterialData>(256);
         readonly List<GIGpuMaterialBindingData> cpuMaterialBindings = new List<GIGpuMaterialBindingData>(512);
+        readonly List<GIGpuEmissiveAliasData> emissiveAliases = new List<GIGpuEmissiveAliasData>(64);
+        readonly List<float> emissiveWeights = new List<float>(64);
+        readonly List<float> aliasScaledWeights = new List<float>(64);
+        readonly List<int> aliasSmall = new List<int>(64);
+        readonly List<int> aliasLarge = new List<int>(64);
         GIMaterialSlotTable materialSlots;
 
         GraphicsBuffer instanceBuffer;
         GraphicsBuffer geometryBuffer;
         GraphicsBuffer materialBuffer;
         GraphicsBuffer materialBindingBuffer;
+        GraphicsBuffer emissiveAliasBuffer;
         int instanceCapacity;
         int geometryCapacity;
         int materialCapacity;
         int materialBindingCapacity;
+        int emissiveAliasCapacity;
         int lastBuildFrame = -1;
         int lastMaterialWarningFrame = -10000;
 
@@ -92,11 +101,16 @@ namespace RealtimeGI
                 ref materialBuffer, ref materialCapacity, builder.materials.Count,
                 GISceneAbi.MaterialStride, "GI Materials");
             EnsureBuffer(ref materialBindingBuffer, ref materialBindingCapacity, builder.materialBindings.Count, GISceneAbi.MaterialBindingStride, "GI Material Bindings");
+            BuildEmissiveAliasTable(builder.instances, builder.materials, builder.materialBindings);
+            EnsureBuffer(ref emissiveAliasBuffer, ref emissiveAliasCapacity, emissiveAliases.Count,
+                GISceneAbi.EmissiveAliasStride, "GI Emissive Instance Alias Table");
 
             if (builder.instances.Count > 0) instanceBuffer.SetData(builder.instances, 0, 0, builder.instances.Count);
             if (builder.geometries.Count > 0) geometryBuffer.SetData(builder.geometries, 0, 0, builder.geometries.Count);
             UploadChangedMaterials(builder.materials, materialBufferReallocated);
             if (builder.materialBindings.Count > 0) materialBindingBuffer.SetData(builder.materialBindings, 0, 0, builder.materialBindings.Count);
+            if (emissiveAliases.Count > 0)
+                emissiveAliasBuffer.SetData(emissiveAliases, 0, 0, emissiveAliases.Count);
 
             geometrySources.Clear();
             geometrySources.AddRange(builder.geometrySources);
@@ -117,6 +131,7 @@ namespace RealtimeGI
             geometryCount = builder.geometries.Count;
             materialCount = builder.materials.Count;
             materialBindingCount = builder.materialBindings.Count;
+            emissiveAliasCount = emissiveAliases.Count;
             materialSlotOverflowCount = materialSlots.OverflowCount;
             if (materialSlotOverflowCount > 0 && Time.frameCount - lastMaterialWarningFrame >= 120)
             {
@@ -142,10 +157,12 @@ namespace RealtimeGI
                 geometryBuffer,
                 materialBuffer,
                 materialBindingBuffer,
+                emissiveAliasBuffer,
                 instanceCount,
                 geometryCount,
                 materialCount,
                 materialBindingCount,
+                emissiveAliasCount,
                 sceneRevision);
             return view.IsValid;
         }
@@ -216,6 +233,109 @@ namespace RealtimeGI
             a.emissive.Equals(b.emissive) && a.surface.Equals(b.surface) &&
             a.baseMapST.Equals(b.baseMapST) && a.emissionMapST.Equals(b.emissionMapST);
 
+        void BuildEmissiveAliasTable(
+            List<GIGpuInstanceData> instances,
+            List<GIGpuMaterialData> materials,
+            List<GIGpuMaterialBindingData> bindings)
+        {
+            emissiveAliases.Clear();
+            emissiveWeights.Clear();
+            float totalWeight = 0f;
+            for (int instanceIndex = 0; instanceIndex < instances.Count; instanceIndex++)
+            {
+                GIGpuInstanceData instance = instances[instanceIndex];
+                if ((instance.flags & (uint)GIInstanceFlags.Emissive) == 0u)
+                    continue;
+                float emission = 0f;
+                int first = (int)instance.firstMaterialBinding;
+                int end = Mathf.Min(bindings.Count, first + (int)instance.materialBindingCount);
+                for (int bindingIndex = first; bindingIndex < end; bindingIndex++)
+                {
+                    int materialIndex = (int)bindings[bindingIndex].materialIndex;
+                    if (materialIndex < 0 || materialIndex >= materials.Count)
+                        continue;
+                    Vector4 e = materials[materialIndex].emissive;
+                    emission = Mathf.Max(emission, Mathf.Max(0f,
+                        e.x * 0.2126f + e.y * 0.7152f + e.z * 0.0722f));
+                }
+                if (emission <= 1e-5f)
+                    continue;
+                float radius = Mathf.Max(0.05f, instance.worldBoundingSphere.w);
+                float weight = Mathf.Max(1e-4f, emission * radius * radius);
+                emissiveAliases.Add(new GIGpuEmissiveAliasData
+                {
+                    worldBoundingSphere = instance.worldBoundingSphere,
+                    probability = 0f,
+                    aliasProbability = 1f,
+                    aliasIndex = (uint)emissiveAliases.Count,
+                    objectId = instance.objectId
+                });
+                emissiveWeights.Add(weight);
+                totalWeight += weight;
+            }
+
+            // The screen gather evaluates the complete mixture PDF. Keep that bounded and
+            // retain the sources with the largest projected-power proxy.
+            while (emissiveAliases.Count > MaxEmissiveAliasCount)
+            {
+                int weakest = 0;
+                for (int i = 1; i < emissiveWeights.Count; i++)
+                    if (emissiveWeights[i] < emissiveWeights[weakest]) weakest = i;
+                totalWeight -= emissiveWeights[weakest];
+                emissiveWeights.RemoveAt(weakest);
+                emissiveAliases.RemoveAt(weakest);
+            }
+
+            int count = emissiveAliases.Count;
+            if (count == 0 || totalWeight <= 0f)
+                return;
+            aliasScaledWeights.Clear();
+            aliasSmall.Clear();
+            aliasLarge.Clear();
+            for (int i = 0; i < count; i++)
+            {
+                float probability = emissiveWeights[i] / totalWeight;
+                GIGpuEmissiveAliasData entry = emissiveAliases[i];
+                entry.probability = probability;
+                emissiveAliases[i] = entry;
+                float scaled = probability * count;
+                aliasScaledWeights.Add(scaled);
+                (scaled < 1f ? aliasSmall : aliasLarge).Add(i);
+            }
+            while (aliasSmall.Count > 0 && aliasLarge.Count > 0)
+            {
+                int smallLast = aliasSmall.Count - 1;
+                int largeLast = aliasLarge.Count - 1;
+                int small = aliasSmall[smallLast];
+                int large = aliasLarge[largeLast];
+                aliasSmall.RemoveAt(smallLast);
+                aliasLarge.RemoveAt(largeLast);
+                GIGpuEmissiveAliasData entry = emissiveAliases[small];
+                entry.aliasProbability = aliasScaledWeights[small];
+                entry.aliasIndex = (uint)large;
+                emissiveAliases[small] = entry;
+                aliasScaledWeights[large] = aliasScaledWeights[large] +
+                    aliasScaledWeights[small] - 1f;
+                (aliasScaledWeights[large] < 1f ? aliasSmall : aliasLarge).Add(large);
+            }
+            for (int i = 0; i < aliasSmall.Count; i++)
+            {
+                int index = aliasSmall[i];
+                GIGpuEmissiveAliasData entry = emissiveAliases[index];
+                entry.aliasProbability = 1f;
+                entry.aliasIndex = (uint)index;
+                emissiveAliases[index] = entry;
+            }
+            for (int i = 0; i < aliasLarge.Count; i++)
+            {
+                int index = aliasLarge[i];
+                GIGpuEmissiveAliasData entry = emissiveAliases[index];
+                entry.aliasProbability = 1f;
+                entry.aliasIndex = (uint)index;
+                emissiveAliases[index] = entry;
+            }
+        }
+
         static bool EnsureBuffer(
             ref GraphicsBuffer buffer,
             ref int capacity,
@@ -252,10 +372,12 @@ namespace RealtimeGI
             geometryBuffer?.Release();
             materialBuffer?.Release();
             materialBindingBuffer?.Release();
+            emissiveAliasBuffer?.Release();
             instanceBuffer = null;
             geometryBuffer = null;
             materialBuffer = null;
             materialBindingBuffer = null;
+            emissiveAliasBuffer = null;
             geometrySources.Clear();
             materialSources.Clear();
             materialBridges.Clear();
@@ -263,7 +385,9 @@ namespace RealtimeGI
             cpuGeometries.Clear();
             cpuMaterials.Clear();
             cpuMaterialBindings.Clear();
+            emissiveAliases.Clear();
             instanceCapacity = geometryCapacity = materialCapacity = materialBindingCapacity = 0;
+            emissiveAliasCapacity = 0;
             materialSlots?.Clear();
             materialSlots = null;
         }

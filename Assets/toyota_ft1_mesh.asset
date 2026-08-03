@@ -36124,6 +36124,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Nanite::Nanite.NaniteMesh
   sourceMesh: {fileID: 4150187935214784790, guid: cf5a632ff3708aa46a0952d32d1baa33, type: 3}
+  sourceMaterials:
+  - {fileID: -2059414335738768768, guid: cf5a632ff3708aa46a0952d32d1baa33, type: 3}
   sourceTriangleCount: 312269
   boundingSphere: {x: 0, y: 0.72600454, z: -0.003437519, w: 2.8205516}
   subMeshCount: 1

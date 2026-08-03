@@ -718,3 +718,74 @@ Evidence: `Logs/far-field-uv-bounded-{bake,audit,build}.log`,
 `Validation/far-field-uv-bounded-{close,mid035,mid050,mid070}-*` 4K A/B captures in the isolated
 verification project. The pre-replacement main-project Bake is recoverable from
 `Logs/far-field-uv-prebounded-backup-20260731`.
+
+## 23. Proxy material/editor delivery closure (2026-08-03)
+
+`NaniteRuntimeProxy` now exposes only the production dependencies in its custom Inspector:
+`Nanite Mesh`, one conflict-free `Rendering Mode` enum (Nanite by default), and `Materials`.
+Per-Proxy culling implementation fields, the automatic fallback override, and all debug/render
+statistics remain serialized for compatibility but are intentionally hidden from ordinary asset
+authors. The 432 legacy SampleScene records are all Force-Nanite records. Hidden
+`FormerlySerializedAs` fields migrate any unopened legacy Nanite/Raster/Auto configuration into the
+enum on first deserialization; conflicting legacy forces map to Auto instead of choosing silently.
+
+URP/Lit is the built-in formal resolve family. A genuinely different opaque shader must register an
+`INaniteMaterialResolveFamily` whose resolve Material has a `GBufferMerge` pass and consumes the
+common VBuffer globals. `Supports` owns exact admission and `Bind` owns textures/draw-bound state.
+Shaders with a different scalar/property layout also implement
+`INaniteMaterialResolveDataProvider.Populate` and include every draw-bound compatibility input in
+`GetCompatibilityHash`. Lit-like project shaders can use `NaniteLitAliasResolveFamily.Register`
+instead of authoring a full adapter. Registration is explicit and lifetime-scoped:
+
+```csharp
+IDisposable naniteFamily = NaniteLitAliasResolveFamily.Register(
+    customShader,
+    baseMapProperty: "_AlbedoTex",
+    baseColorProperty: "_Tint",
+    normalMapProperty: "_NormalTex");
+```
+
+Unsupported programs stay on their native Renderer in Auto/Raster admission. Forced Nanite fails
+closed and never applies URP/Lit shading to an unknown program. The Inspector reports the exact
+unsupported material slot. Transparent/custom multipass effects are not implicitly compatible and
+must stay Raster until a matching resolve family exists.
+
+Different SubMesh materials, textures and scalar parameters are supported. Scalar/color/ST edits
+share the same GPU material table and now upload only compact `GpuMaterialData`; they do not rebuild
+geometry. Shader, keyword, resolve-family or texture-binding changes rebuild compatibility bins but
+reuse immutable Page residency. Material identity is 16-bit (`65,535` scene materials). Parameter
+variants sharing shader state and textures remain one compatibility bin. Different texture sets or
+shader state add bins and therefore bindings/indirect resolve work; adaptive material-tile classify
+limits each bin to touched screen tiles once enough bins justify its fixed compute cost. Texture
+arrays/atlases or a project bindless resolve family are the scaling path for very large heterogeneous
+texture sets; arbitrary texture diversity is supported but not free.
+
+Editor material changes are detected at 10 Hz through Unity dirty counts and texture/material asset
+imports also invalidate bindings. Runtime code that mutates a Material calls
+`proxy.MarkMaterialsDirty()`. Numeric changes then become a small buffer upload; texture/shader state
+changes rebuild bins. The audit proves scalar refresh changes the material-data signature without
+changing geometry generation, while a texture replacement rebuilds bins.
+
+Edit mode retains the source MeshRenderer as `enabled=true, forceRenderingOff=true`: Unity can pick
+it without submitting it to rendering or carrying it into Player cost. Because Unity's ordinary
+selected-renderer overlay ignores a force-disabled Renderer, the custom Inspector now submits the
+Renderer explicitly through Unity 6 `Handles.DrawOutline` on SceneView repaint. A cached, click-only
+CPU triangle raycast handles cases where native Scene picking misses; repeated clicks at the same
+point cycle overlapping/parent-child Nanite Proxy hits. Fallback picking never consumes MouseDown:
+it records the press, lets Unity's translate/rotate/scale tools own the complete interaction, and
+selects on MouseUp only when pointer travel stayed within four pixels. This avoids both the former
+Gizmo interception and the overly broad `nearestControl` gate that also blocked ordinary SceneView
+clicks. Renderer state is restored on disable/destroy.
+
+`NaniteMesh.sourceMesh` already serializes the source FBX GUID plus local Mesh file ID. Bake now also
+captures the matching imported Renderer material slots as `sourceMaterials`. Existing loaded assets
+are repaired once in the Editor. Runtime/Editor binding order is explicit Proxy material overrides,
+then the instance MeshRenderer materials, then baked FBX defaults. This preserves heterogeneous
+per-instance materials while guaranteeing an empty MeshRenderer receives the FBX defaults. The
+MeshRenderer therefore exposes Unity's standard material panel and shares the exact Material objects
+used by Nanite resolve. `Raster Fallback Mesh` remains an internal override for compatibility but is
+no longer exposed; fallback resolves automatically from `NaniteMesh.sourceMesh`.
+
+Evidence: `Logs/proxy-material-refresh-audit.log`,
+`Logs/proxy-editor-interaction-audit.log`, `Logs/proxy-source-binding-build.log`, and
+`Logs/proxy-inspector-selection-smoke.log`.

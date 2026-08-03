@@ -1,9 +1,17 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace Nanite
 {
+    public enum NaniteRenderingMode
+    {
+        Nanite = 0,
+        Raster = 1,
+        Auto = 2
+    }
+
     public enum NaniteDebugColorMode
     {
         Single = 0,
@@ -19,7 +27,7 @@ namespace Nanite
     /// 这里只做可见性计算与统计，渲染管线可在此基础上接入 Compute/Draw。
     /// </summary>
     [ExecuteAlways]
-    public class NaniteRuntimeProxy : MonoBehaviour
+    public class NaniteRuntimeProxy : MonoBehaviour, ISerializationCallbackReceiver
     {
         [Header("Runtime Load")]
         public bool autoLoadFromResources = false;
@@ -42,12 +50,75 @@ namespace Nanite
         public bool useBvh = true;
 
         [Header("Pipeline Admission")]
-        [Tooltip("始终进入虚拟几何管线；用于低面模型对比或强制 Nanite。")]
-        public bool forceNaniteRendering = false;
-        [Tooltip("始终交给普通 MeshRenderer/SRP 路径。两个 Force 同时开启属于冲突配置，运行时按自动准入处理。")]
-        public bool forceRasterRendering = false;
+        [Tooltip("Nanite 为默认生产路径；Raster 强制普通 MeshRenderer；Auto 允许成本模型自动选择。")]
+        public NaniteRenderingMode renderingMode = NaniteRenderingMode.Nanite;
         [Tooltip("低复杂度回退使用的原始 Mesh。留空时优先使用 NaniteMesh.sourceMesh，其次捕获当前 MeshFilter。")]
         public Mesh rasterFallbackMesh;
+
+        // Serialized migration only. Field initializers make newly added components
+        // follow the new Nanite default, while FormerlySerializedAs preserves old
+        // Force Nanite/Raster values from scenes and prefabs that have not been saved
+        // since the single-enum Inspector was introduced.
+        [SerializeField, HideInInspector, FormerlySerializedAs("forceNaniteRendering")]
+        bool legacyForceNaniteRendering = true;
+        [SerializeField, HideInInspector, FormerlySerializedAs("forceRasterRendering")]
+        bool legacyForceRasterRendering;
+        [SerializeField, HideInInspector]
+        int renderingModeSerializationVersion;
+
+        // Source compatibility only. These are properties instead of serialized
+        // fields so new Inspectors expose one conflict-free rendering mode.
+        [Obsolete("Use renderingMode instead.")]
+        public bool forceNaniteRendering
+        {
+            get => renderingMode == NaniteRenderingMode.Nanite;
+            set
+            {
+                if (value)
+                    renderingMode = NaniteRenderingMode.Nanite;
+                else if (renderingMode == NaniteRenderingMode.Nanite)
+                    renderingMode = NaniteRenderingMode.Auto;
+            }
+        }
+
+        [Obsolete("Use renderingMode instead.")]
+        public bool forceRasterRendering
+        {
+            get => renderingMode == NaniteRenderingMode.Raster;
+            set
+            {
+                if (value)
+                    renderingMode = NaniteRenderingMode.Raster;
+                else if (renderingMode == NaniteRenderingMode.Raster)
+                    renderingMode = NaniteRenderingMode.Auto;
+            }
+        }
+
+        public void OnBeforeSerialize()
+        {
+            // Keep the hidden legacy payload aligned with edits made through the new
+            // enum or through code. This also prevents a first serialization from
+            // overwriting a programmatically selected mode on a newly added Proxy.
+            legacyForceNaniteRendering = renderingMode == NaniteRenderingMode.Nanite;
+            legacyForceRasterRendering = renderingMode == NaniteRenderingMode.Raster;
+            renderingModeSerializationVersion = 1;
+        }
+
+        public void OnAfterDeserialize()
+        {
+            if (renderingModeSerializationVersion == 0)
+                MigrateLegacyRenderingMode();
+        }
+
+        void MigrateLegacyRenderingMode()
+        {
+            renderingMode = legacyForceRasterRendering && !legacyForceNaniteRendering
+                ? NaniteRenderingMode.Raster
+                : (legacyForceNaniteRendering && !legacyForceRasterRendering
+                    ? NaniteRenderingMode.Nanite
+                    : NaniteRenderingMode.Auto);
+            renderingModeSerializationVersion = 1;
+        }
 
         [Header("Resolve Materials")]
         [Tooltip("可选：覆盖 VBuffer→GBuffer Resolve 使用的材质。留空则从 Renderer.sharedMaterials 读取；仍无则使用 URP Lit 回退。")]
@@ -116,6 +187,10 @@ namespace Nanite
         int selectionPacketCapacity;
         int selectionPageRangeCapacity;
         int externalSelectionFrame = -100000;
+        bool editorSelectionRendererActive;
+        bool editorRendererStateCaptured;
+        bool editorRendererWasEnabled;
+        bool editorRendererForcedOff;
 
         class PageGpuData
         {
@@ -158,8 +233,8 @@ namespace Nanite
         public int VisiblePageRangeCount => runtimeSelection.pageRanges.Count;
         public bool NaniteRenderingActive => !rasterFallbackActive;
         public bool RasterFallbackActive => rasterFallbackActive;
-        public bool ForceNaniteRequested => forceNaniteRendering && !forceRasterRendering;
-        public bool ForceRasterRequested => forceRasterRendering && !forceNaniteRendering;
+        public bool ForceNaniteRequested => renderingMode == NaniteRenderingMode.Nanite;
+        public bool ForceRasterRequested => renderingMode == NaniteRenderingMode.Raster;
 
         public int RasterFallbackTriangleCount
         {
@@ -214,6 +289,8 @@ namespace Nanite
                     return false;
                 if (renderVisibleMesh)
                     return false;
+                if (editorSelectionRendererActive && !Application.isPlaying)
+                    return false;
                 MeshRenderer renderer = GetComponent<MeshRenderer>();
                 return renderer != null && renderer.enabled;
             }
@@ -224,6 +301,8 @@ namespace Nanite
             TryAutoLoadNaniteMesh();
             CaptureRasterFallbackMesh();
             EnsureDebugRenderer();
+            SynchronizeSourceRendererBindings();
+            PrepareEditorSelectionRenderer();
         }
 
         void OnEnable()
@@ -231,6 +310,8 @@ namespace Nanite
             TryAutoLoadNaniteMesh();
             CaptureRasterFallbackMesh();
             EnsureDebugRenderer();
+            SynchronizeSourceRendererBindings();
+            PrepareEditorSelectionRenderer();
             NaniteRuntimeRegistry.Register(this);
         }
 
@@ -487,6 +568,8 @@ namespace Nanite
         {
             TryAutoLoadNaniteMesh();
             CaptureRasterFallbackMesh();
+            SynchronizeSourceRendererBindings();
+            PrepareEditorSelectionRenderer();
             if (!useGpuCulling || gpuCullingShader == null)
                 DisposeGpuBackend();
             NaniteRuntimeRegistry.NotifyRenderDataChanged(this);
@@ -514,11 +597,13 @@ namespace Nanite
                 ClearDebugMesh();
                 debugMeshFilter.sharedMesh = source;
                 debugMeshRenderer.enabled = true;
+                debugMeshRenderer.forceRenderingOff = false;
                 debugMeshRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On;
             }
             else if (debugMeshRenderer != null && !renderVisibleMesh)
             {
-                debugMeshRenderer.enabled = false;
+                if (!PrepareEditorSelectionRenderer())
+                    debugMeshRenderer.enabled = false;
             }
 
             NaniteRuntimeRegistry.NotifyRenderDataChanged(this);
@@ -531,8 +616,16 @@ namespace Nanite
             NaniteRuntimeRegistry.NotifyRenderDataChanged(this);
         }
 
+        /// <summary>
+        /// Call after changing a material from script. Numeric parameters update only
+        /// the compact GPU material buffer; shader/texture/keyword changes also rebuild
+        /// compatibility bins. Editor material changes are detected automatically.
+        /// </summary>
+        public void MarkMaterialsDirty() => MarkRenderDataDirty();
+
         void OnDisable()
         {
+            RestoreEditorSelectionRenderer();
             ClearDebugMesh();
             DisposeGpuBackend();
             ReleasePageGpuBuffers();
@@ -543,6 +636,7 @@ namespace Nanite
 
         void OnDestroy()
         {
+            RestoreEditorSelectionRenderer();
             DisposeGpuBackend();
             ReleasePageGpuBuffers();
             ReleaseMergedGpuBuffers();
@@ -891,6 +985,93 @@ namespace Nanite
             if (naniteMesh != null && naniteMesh.sourceMesh != null)
                 return naniteMesh.sourceMesh;
             return capturedRasterFallbackMesh;
+        }
+
+        /// <summary>
+        /// Keeps MeshFilter/MeshRenderer bound to the same FBX Mesh and Material
+        /// assets as the baked Nanite asset. Shared Material references preserve the
+        /// standard Inspector material panel while Nanite owns actual rendering.
+        /// </summary>
+        public bool SynchronizeSourceRendererBindings()
+        {
+            CaptureRasterFallbackMesh();
+            Mesh source = ResolveRasterFallbackMesh();
+            bool changed = false;
+            if (source != null && debugMeshFilter != null && debugMeshFilter.sharedMesh != source)
+            {
+                debugMeshFilter.sharedMesh = source;
+                changed = true;
+            }
+
+            Material[] materials = resolveMaterials != null && resolveMaterials.Length > 0
+                ? resolveMaterials
+                : null;
+            Material[] rendererMaterials = debugMeshRenderer != null
+                ? debugMeshRenderer.sharedMaterials
+                : null;
+            if ((materials == null || materials.Length == 0) &&
+                (rendererMaterials == null || rendererMaterials.Length == 0))
+                materials = naniteMesh != null ? naniteMesh.sourceMaterials : null;
+            if (debugMeshRenderer != null && materials != null && materials.Length > 0 &&
+                !SameMaterials(debugMeshRenderer.sharedMaterials, materials))
+            {
+                debugMeshRenderer.sharedMaterials = materials;
+                changed = true;
+            }
+            return changed;
+        }
+
+        static bool SameMaterials(Material[] left, Material[] right)
+        {
+            if (ReferenceEquals(left, right))
+                return true;
+            if (left == null || right == null || left.Length != right.Length)
+                return false;
+            for (int index = 0; index < left.Length; index++)
+            {
+                if (left[index] != right[index])
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Keeps a non-rendering source Renderer in edit mode so Unity's normal Scene
+        /// picking and selected-object outline can target GPU-driven geometry. It is
+        /// never enabled in Player or Play mode and adds no shipping renderer cost.
+        /// </summary>
+        public bool PrepareEditorSelectionRenderer()
+        {
+            if (Application.isPlaying || !isActiveAndEnabled || rasterFallbackActive || renderVisibleMesh)
+                return false;
+
+            SynchronizeSourceRendererBindings();
+            Mesh source = ResolveRasterFallbackMesh();
+            if (source == null || debugMeshFilter == null || debugMeshRenderer == null)
+                return false;
+
+            if (!editorRendererStateCaptured)
+            {
+                editorRendererStateCaptured = true;
+                editorRendererWasEnabled = debugMeshRenderer.enabled;
+                editorRendererForcedOff = debugMeshRenderer.forceRenderingOff;
+            }
+
+            debugMeshFilter.sharedMesh = source;
+            debugMeshRenderer.enabled = true;
+            debugMeshRenderer.forceRenderingOff = true;
+            editorSelectionRendererActive = true;
+            return true;
+        }
+
+        void RestoreEditorSelectionRenderer()
+        {
+            if (!editorRendererStateCaptured || debugMeshRenderer == null)
+                return;
+            debugMeshRenderer.enabled = editorRendererWasEnabled;
+            debugMeshRenderer.forceRenderingOff = editorRendererForcedOff;
+            editorSelectionRendererActive = false;
+            editorRendererStateCaptured = false;
         }
 
         Vector4 TransformSphere(in Vector4 localSphere, float maxScale)

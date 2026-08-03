@@ -9,6 +9,8 @@ namespace Nanite
     {
         [Tooltip("原始 Unity Mesh。用于低复杂度对象自动回退到 SRP Batcher / GPU Instancing。")]
         public Mesh sourceMesh;
+        [Tooltip("Materials captured from the source FBX renderer in SubMesh order.")]
+        public Material[] sourceMaterials = Array.Empty<Material>();
         [Min(0)] public int sourceTriangleCount;
         public Vector4 boundingSphere;
         public int subMeshCount;

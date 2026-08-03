@@ -17,17 +17,20 @@ MonoBehaviour:
     enableInSceneView: 1
     enableDiffuse: 1
     diffuseResolutionScale: 0.25
-    diffuseRaysPerProbe: 2
-    diffuseHistoryWeight: 0.98
+    diffuseRaysPerProbe: 1
+    disocclusionRays: 3
+    disocclusionExtraRayBudget: 8192
+    diffuseHistoryWeight: 0.88
     diffuseIntensity: 1
     maxTraceDistance: 150
     screenTraceDistance: 12
     diffuseSpatialSamples: 4
     diffuseSpatialRadius: 4
+    diffuseFireflyClamp: 12
     enableSceneColorHistory: 0
     enableSpecular: 1
-    specularResolutionScale: 0.5
-    specularHistoryWeight: 0.9
+    specularResolutionScale: 0.375
+    specularHistoryWeight: 0.88
     specularIntensity: 1
     minSpecularRoughness: 0
     maxSpecularRoughness: 0.8
@@ -36,7 +39,7 @@ MonoBehaviour:
     diffuseDebugStage: 0
     enableTraceCounters: 0
     traceCounterReadbackInterval: 10
-    pipelineVersion: 9
+    pipelineVersion: 18
     screenLightingShader: {fileID: 7200000, guid: 8ecfe36bca684db9be134731e21828c9, type: 3}
     compositeShader: {fileID: 4800000, guid: 97a6c21fe47943a0a46becfd0f7a4230, type: 3}
 --- !u!114 &-1619528804519490273
