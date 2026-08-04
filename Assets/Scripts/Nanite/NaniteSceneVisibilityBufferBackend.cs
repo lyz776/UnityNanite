@@ -467,6 +467,19 @@ namespace Nanite
             UsePackedPageRaster ? ResidentVertexCapacity : geometryVertexCount;
         public ComputeBuffer PageResidencyBitsetBuffer => pagePool.ResidencyBitsetBuffer;
         public ComputeBuffer PageRequestBitsetBuffer => pagePool.RequestBitsetBuffer;
+        public bool TryGetResidentPageReadOnlyView(out NaniteResidentPageReadOnlyView view) =>
+            pagePool.TryGetResidentPageReadOnlyView(out view);
+
+        public bool TryGetResidentMeshIndex(NaniteMesh mesh, out int meshIndex) =>
+            pagePool.TryGetMeshIndex(mesh, out meshIndex);
+
+        public bool TryGetResidentMeshPageRange(
+            NaniteMesh mesh, out int firstPageId, out int pageCount, out int meshIndex) =>
+            pagePool.TryGetMeshPageRange(mesh, out firstPageId, out pageCount, out meshIndex);
+
+        public bool TryGetResidentPageId(
+            NaniteMesh mesh, int localPageIndex, out int pageId) =>
+            pagePool.TryGetPageId(mesh, localPageIndex, out pageId);
         public ComputeBuffer TrianglePageRefBuffer => trianglePageRefBuffer;
         public void UpdatePageStreaming(int frameIndex, int readbackIntervalFrames, int maxUploadsPerPoll)
         {

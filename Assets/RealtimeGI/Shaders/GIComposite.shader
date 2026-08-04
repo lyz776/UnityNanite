@@ -28,6 +28,7 @@ Shader "Hidden/RealtimeGI/Composite"
             TEXTURE2D_X(_GISpecularLightingTexture);
             TEXTURE2D_X(_GIGBuffer0);
             TEXTURE2D_X(_GIGBuffer1);
+            half _GISpecularIntensity;
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/GBufferCommon.hlsl"
 
@@ -46,7 +47,11 @@ Shader "Hidden/RealtimeGI/Composite"
                 // The final gather estimates irradiance. Apply the Lambert BRDF exactly once
                 // here; the cache itself stores outgoing radiance.
                 half3 indirectDiffuse = irradiance * brdfDiffuse * (1.0h / PI) * gBuffer1.a;
-                return half4(max(0.0h, indirectDiffuse + indirectSpecular * gBuffer1.a), 0.0h);
+                half receivesSpecular = (materialFlags & kMaterialFlagSpecularHighlightsOff) == 0u
+                    ? 1.0h : 0.0h;
+                half3 injectedSpecular = indirectSpecular * gBuffer1.a *
+                    max(_GISpecularIntensity, 0.0h) * receivesSpecular;
+                return half4(max(0.0h, indirectDiffuse + injectedSpecular), 0.0h);
             }
             ENDHLSL
         }

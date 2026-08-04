@@ -228,10 +228,13 @@ namespace RealtimeGI
         }
 
         static bool MaterialEquals(GIGpuMaterialData a, GIGpuMaterialData b) =>
-            a.revision == b.revision && a.materialId == b.materialId && a.flags == b.flags &&
-            a.textureIndex == b.textureIndex && a.baseColor.Equals(b.baseColor) &&
+            a.revision == b.revision && a.geometryRevision == b.geometryRevision &&
+            a.materialId == b.materialId && a.flags == b.flags &&
+            a.channels == b.channels && a.baseColor.Equals(b.baseColor) &&
             a.emissive.Equals(b.emissive) && a.surface.Equals(b.surface) &&
-            a.baseMapST.Equals(b.baseMapST) && a.emissionMapST.Equals(b.emissionMapST);
+            a.baseMapST.Equals(b.baseMapST) && a.emissionMapST.Equals(b.emissionMapST) &&
+            a.normalMapST.Equals(b.normalMapST) && a.maskMapST.Equals(b.maskMapST) &&
+            a.maskRemap0.Equals(b.maskRemap0) && a.maskRemap1.Equals(b.maskRemap1);
 
         void BuildEmissiveAliasTable(
             List<GIGpuInstanceData> instances,

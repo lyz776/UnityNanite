@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using Nanite;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
 
 namespace RealtimeGI
 {
@@ -19,7 +21,7 @@ namespace RealtimeGI
         // Increment whenever the persistent radiance representation or update addressing changes.
         // Including this in the lighting signature guarantees that stale cache contents are
         // requeued instead of surviving a shader-only implementation update.
-        const int RadianceAlgorithmVersion = 16;
+        const int RadianceAlgorithmVersion = 17;
         public static GIClipmapSystem Active { get; private set; }
         [Header("Sources")]
         public RealtimeGIScene scene;
@@ -31,7 +33,13 @@ namespace RealtimeGI
         [Min(512)] public int staticBrickCapacity = 8192;
         [Min(128)] public int dynamicBrickCapacity = 2048;
         [Range(64, 16384)] public int maxCellsPerTriangle = 4096;
+        [Tooltip("Hard cap for GPU-generated cooperative 1024-triangle voxel work items per layer. Dispatch is unfolded over XY, so capacities above the D3D dispatch-X limit remain valid.")]
+        [Range(1024, 1048576)] public int maxVoxelWorkItems = 65535;
         [Range(1, 7)] public int distancePropagationPasses = 7;
+        [Tooltip("Maximum static geometry Bricks rebuilt in one frame. Remaining GPU-dirty Bricks persist and are consumed fine-to-coarse on later frames.")]
+        [Min(1)] public int staticGeometryBricksPerFrame = 8;
+        [Tooltip("Maximum dynamic geometry Bricks rebuilt in one frame.")]
+        [Min(1)] public int dynamicGeometryBricksPerFrame = 12;
         [Min(1)] public int staticRadianceBricksPerFrame = 64;
         [Min(1)] public int dynamicRadianceBricksPerFrame = 128;
         public bool enableRadianceShadows = true;
@@ -53,6 +61,9 @@ namespace RealtimeGI
         [Min(0.1f)] public float radianceClamp = 32f;
         [Range(32, 512)] public int materialTextureResolution = 128;
         public bool automaticUpdate = true;
+        [Header("Scheduling")]
+        [Tooltip("Record the Clipmap build as a RenderGraph compute pass on the async queue. RenderGraph inserts the fence before screen GI reads the cache.")]
+        public bool enableAsyncCompute = true;
 
         [Header("Read-only statistics")]
         [SerializeField] int generation;
@@ -65,6 +76,8 @@ namespace RealtimeGI
         [SerializeField] int invalidGeometryCount;
         [SerializeField] int invalidatedStaticBrickCount;
         [SerializeField] int invalidatedDynamicBrickCount;
+        [SerializeField] uint staticVoxelWorkOverflow;
+        [SerializeField] uint dynamicVoxelWorkOverflow;
         [SerializeField] int pendingStaticRadianceBricks;
         [SerializeField] int pendingDynamicRadianceBricks;
         [SerializeField] int updatedRadianceBricks;
@@ -75,20 +88,6 @@ namespace RealtimeGI
         readonly Vector3Int[] levelOrigins = new Vector3Int[GIClipmapConstants.LevelCount];
         readonly Vector3Int[] previousLevelOrigins = new Vector3Int[GIClipmapConstants.LevelCount];
         readonly GIGpuClipmapLevelData[] levelData = new GIGpuClipmapLevelData[GIClipmapConstants.LevelCount];
-        readonly HashSet<GIClipmapBrickKey> staticRequired = new HashSet<GIClipmapBrickKey>();
-        readonly HashSet<GIClipmapBrickKey> dynamicRequired = new HashSet<GIClipmapBrickKey>();
-        readonly HashSet<uint> activeGeometryIndices = new HashSet<uint>();
-        readonly HashSet<GIClipmapBrickKey> invalidatedStaticBricks = new HashSet<GIClipmapBrickKey>();
-        readonly Dictionary<uint, StaticInstanceState> previousStaticInstances =
-            new Dictionary<uint, StaticInstanceState>(256);
-        readonly HashSet<uint> observedStaticInstances = new HashSet<uint>();
-        readonly List<uint> removedStaticInstances = new List<uint>(64);
-        readonly HashSet<GIClipmapBrickKey> invalidatedDynamicBricks =
-            new HashSet<GIClipmapBrickKey>();
-        readonly Dictionary<uint, StaticInstanceState> previousDynamicInstances =
-            new Dictionary<uint, StaticInstanceState>(256);
-        readonly HashSet<uint> observedDynamicInstances = new HashSet<uint>();
-        readonly List<uint> removedDynamicInstances = new List<uint>(64);
         readonly List<GILocalLight> localLightScratch = new List<GILocalLight>(64);
         readonly List<GIGpuLocalLightData> gpuLocalLights = new List<GIGpuLocalLightData>(64);
 
@@ -100,10 +99,30 @@ namespace RealtimeGI
         GraphicsBuffer localLightBuffer;
         GraphicsBuffer radianceScratchBuffer;
         GraphicsBuffer validityScratchBuffer;
+        GraphicsBuffer naniteFallbackPageTable;
+        GraphicsBuffer naniteFallbackResidentPageTable;
+        GraphicsBuffer naniteFallbackResidencyBits;
+        GraphicsBuffer naniteFallbackVertices;
+        GraphicsBuffer naniteFallbackIndices;
+        GraphicsBuffer naniteFallbackTriangleSubMeshes;
         int clearKernel = -1;
-        int voxelizeKernel = -1;
+        int clearRadianceKernel = -1;
+        int resetPageAllocatorKernel = -1;
+        int initializePhysicalPageAllocatorKernel = -1;
+        int markRequiredPagesKernel = -1;
+        int reprojectResidentPagesKernel = -1;
+        int allocateRequiredPagesKernel = -1;
+        int buildDirtyWorkQueuesKernel = -1;
+        int buildRadianceWorkQueueKernel = -1;
+        int advanceRadianceCursorKernel = -1;
+        int markDirtyBricksKernel = -1;
+        int resetVoxelWorkQueueKernel = -1;
+        int buildVoxelWorkQueueKernel = -1;
+        int clampVoxelDispatchArgsKernel = -1;
+        int voxelizeWorkQueueKernel = -1;
         int initializeDistanceKernel = -1;
         int propagateDistanceKernel = -1;
+        int finalizeDirtyBricksKernel = -1;
         int updateRadianceKernel = -1;
         int buildBrickLightListsKernel = -1;
         int commitRadianceKernel = -1;
@@ -119,6 +138,114 @@ namespace RealtimeGI
         int radianceScratchCapacity;
         int validityScratchCapacity;
         bool gpuForensicsIssued;
+        GISceneGpuView preparedSceneView;
+        NaniteResidentPageReadOnlyView preparedNaniteView;
+        bool preparedNaniteViewValid;
+        Vector3 preparedLightDirection;
+        Color preparedLightColor;
+        Color preparedSkyColor;
+        int preparedFrame = -1;
+        int preparedSequence;
+        int recordedFrame = -1;
+        bool preparedValid;
+        uint voxelWorkGeneration = 1u;
+
+        sealed class ClipmapRenderGraphPassData
+        {
+            public GIClipmapSystem owner;
+            public int frame;
+            public TextureHandle baseColorTextures;
+            public TextureHandle emissionTextures;
+            public TextureHandle normalTextures;
+            public TextureHandle maskTextures;
+        }
+
+        interface IGIComputeCommands
+        {
+            void BeginSample(string name);
+            void EndSample(string name);
+            void SetComputeIntParam(ComputeShader shader, int id, int value);
+            void SetComputeFloatParam(ComputeShader shader, int id, float value);
+            void SetComputeVectorParam(ComputeShader shader, int id, Vector4 value);
+            void SetComputeBufferParam(ComputeShader shader, int kernel, int id, GraphicsBuffer buffer);
+            void SetComputeTextureParam(ComputeShader shader, int kernel, int id, Texture texture);
+            void DispatchCompute(ComputeShader shader, int kernel, int x, int y, int z);
+            void DispatchCompute(ComputeShader shader, int kernel, GraphicsBuffer indirectArgs, uint argsOffset);
+        }
+
+        sealed class LegacyComputeCommands : IGIComputeCommands
+        {
+            readonly CommandBuffer cmd;
+            public LegacyComputeCommands(CommandBuffer cmd) => this.cmd = cmd;
+            public void BeginSample(string name) => cmd.BeginSample(name);
+            public void EndSample(string name) => cmd.EndSample(name);
+            public void SetComputeIntParam(ComputeShader shader, int id, int value) =>
+                cmd.SetComputeIntParam(shader, id, value);
+            public void SetComputeFloatParam(ComputeShader shader, int id, float value) =>
+                cmd.SetComputeFloatParam(shader, id, value);
+            public void SetComputeVectorParam(ComputeShader shader, int id, Vector4 value) =>
+                cmd.SetComputeVectorParam(shader, id, value);
+            public void SetComputeBufferParam(
+                ComputeShader shader, int kernel, int id, GraphicsBuffer buffer) =>
+                cmd.SetComputeBufferParam(shader, kernel, id, buffer);
+            public void SetComputeTextureParam(
+                ComputeShader shader, int kernel, int id, Texture texture) =>
+                cmd.SetComputeTextureParam(shader, kernel, id, texture);
+            public void DispatchCompute(ComputeShader shader, int kernel, int x, int y, int z) =>
+                cmd.DispatchCompute(shader, kernel, x, y, z);
+            public void DispatchCompute(ComputeShader shader, int kernel, GraphicsBuffer indirectArgs, uint argsOffset) =>
+                cmd.DispatchCompute(shader, kernel, indirectArgs, argsOffset);
+        }
+
+        sealed class RenderGraphComputeCommands : IGIComputeCommands
+        {
+            readonly ComputeCommandBuffer cmd;
+            readonly GIMaterialTextureCache textures;
+            readonly TextureHandle baseColor;
+            readonly TextureHandle emission;
+            readonly TextureHandle normal;
+            readonly TextureHandle mask;
+
+            public RenderGraphComputeCommands(
+                ComputeCommandBuffer cmd,
+                GIMaterialTextureCache textures,
+                TextureHandle baseColor,
+                TextureHandle emission,
+                TextureHandle normal,
+                TextureHandle mask)
+            {
+                this.cmd = cmd;
+                this.textures = textures;
+                this.baseColor = baseColor;
+                this.emission = emission;
+                this.normal = normal;
+                this.mask = mask;
+            }
+
+            public void BeginSample(string name) => cmd.BeginSample(name);
+            public void EndSample(string name) => cmd.EndSample(name);
+            public void SetComputeIntParam(ComputeShader shader, int id, int value) =>
+                cmd.SetComputeIntParam(shader, id, value);
+            public void SetComputeFloatParam(ComputeShader shader, int id, float value) =>
+                cmd.SetComputeFloatParam(shader, id, value);
+            public void SetComputeVectorParam(ComputeShader shader, int id, Vector4 value) =>
+                cmd.SetComputeVectorParam(shader, id, value);
+            public void SetComputeBufferParam(
+                ComputeShader shader, int kernel, int id, GraphicsBuffer buffer) =>
+                cmd.SetComputeBufferParam(shader, kernel, id, buffer);
+            public void SetComputeTextureParam(
+                ComputeShader shader, int kernel, int id, Texture texture)
+            {
+                TextureHandle handle = ReferenceEquals(texture, textures.BaseColorArray) ? baseColor :
+                    ReferenceEquals(texture, textures.EmissionArray) ? emission :
+                    ReferenceEquals(texture, textures.NormalArray) ? normal : mask;
+                cmd.SetComputeTextureParam(shader, kernel, id, handle);
+            }
+            public void DispatchCompute(ComputeShader shader, int kernel, int x, int y, int z) =>
+                cmd.DispatchCompute(shader, kernel, x, y, z);
+            public void DispatchCompute(ComputeShader shader, int kernel, GraphicsBuffer indirectArgs, uint argsOffset) =>
+                cmd.DispatchCompute(shader, kernel, indirectArgs, argsOffset);
+        }
 
         static readonly int DirtyBricksId = Shader.PropertyToID("_GIDirtyBricks");
         static readonly int DirtyBrickCountId = Shader.PropertyToID("_GIDirtyBrickCount");
@@ -126,10 +253,13 @@ namespace RealtimeGI
         static readonly int SurfaceId = Shader.PropertyToID("_GISurface");
         static readonly int SurfaceUvId = Shader.PropertyToID("_GISurfaceUV");
         static readonly int SurfaceIdentityId = Shader.PropertyToID("_GISurfaceIdentity");
+        static readonly int SurfaceStableIdId = Shader.PropertyToID("_GISurfaceStableId");
         static readonly int SurfaceKeyId = Shader.PropertyToID("_GISurfaceKey");
         static readonly int DistanceId = Shader.PropertyToID("_GIDistance");
         static readonly int InstancesId = Shader.PropertyToID("_GIInstances");
+        static readonly int GeometriesId = Shader.PropertyToID("_GIGeometries");
         static readonly int MaterialBindingsId = Shader.PropertyToID("_GIMaterialBindings");
+        static readonly int ClipmapMaterialsId = Shader.PropertyToID("_GIMaterials");
         static readonly int GeometryRangesId = Shader.PropertyToID("_GIGeometryRanges");
         static readonly int VerticesId = Shader.PropertyToID("_GIVertices");
         static readonly int UvsId = Shader.PropertyToID("_GIUVs");
@@ -137,8 +267,6 @@ namespace RealtimeGI
         static readonly int TriangleSubMeshesId = Shader.PropertyToID("_GITriangleSubMeshes");
         static readonly int LevelsId = Shader.PropertyToID("_GIClipmapLevels");
         static readonly int PageTableId = Shader.PropertyToID("_GIPageTable");
-        static readonly int InstanceIndexId = Shader.PropertyToID("_GIInstanceIndex");
-        static readonly int TriangleBaseId = Shader.PropertyToID("_GITriangleBase");
         static readonly int MaxCellsId = Shader.PropertyToID("_GIMaxCellsPerTriangle");
         static readonly int VoxelizePhaseId = Shader.PropertyToID("_GIVoxelizePhase");
         static readonly int RadianceId = Shader.PropertyToID("_GIRadiance");
@@ -184,6 +312,8 @@ namespace RealtimeGI
         static readonly int TargetValidityScratchId = Shader.PropertyToID("_GITargetValidityScratch");
         static readonly int BaseColorTexturesId = Shader.PropertyToID("_GIBaseColorTextures");
         static readonly int EmissionTexturesId = Shader.PropertyToID("_GIEmissionTextures");
+        static readonly int NormalTexturesId = Shader.PropertyToID("_GINormalTextures");
+        static readonly int MaskTexturesId = Shader.PropertyToID("_GIMaskTextures");
         static readonly int TextureSliceCountId = Shader.PropertyToID("_GITextureSliceCount");
         static readonly int SecondaryBounceRaysId = Shader.PropertyToID("_GISecondaryBounceRays");
         static readonly int SecondaryBounceIntensityId = Shader.PropertyToID("_GISecondaryBounceIntensity");
@@ -193,6 +323,45 @@ namespace RealtimeGI
         static readonly int RadianceClampId = Shader.PropertyToID("_GIRadianceClamp");
         static readonly int RadianceFrameIndexId = Shader.PropertyToID("_GIRadianceFrameIndex");
         static readonly int TargetLayerId = Shader.PropertyToID("_GITargetLayer");
+        static readonly int DirtyGenerationId = Shader.PropertyToID("_GIDirtyGeneration");
+        static readonly int VoxelWorkQueueId = Shader.PropertyToID("_GIVoxelWorkQueue");
+        static readonly int VoxelDispatchArgsId = Shader.PropertyToID("_GIVoxelDispatchArgs");
+        static readonly int VoxelWorkQueueReadId =
+            Shader.PropertyToID("_GIVoxelWorkQueueRead");
+        static readonly int VoxelDispatchArgsReadId =
+            Shader.PropertyToID("_GIVoxelDispatchArgsRead");
+        static readonly int InstanceCountId = Shader.PropertyToID("_GIInstanceCount");
+        static readonly int TargetDynamicId = Shader.PropertyToID("_GITargetDynamic");
+        static readonly int VoxelWorkCapacityId = Shader.PropertyToID("_GIVoxelWorkCapacity");
+        static readonly int WorkGenerationId = Shader.PropertyToID("_GIWorkGeneration");
+        static readonly int RequiredPageMaskId = Shader.PropertyToID("_GIRequiredPageMask");
+        static readonly int RequiredPageHashId = Shader.PropertyToID("_GIRequiredPageHash");
+        static readonly int PhysicalPageHashId = Shader.PropertyToID("_GIPhysicalPageHash");
+        static readonly int PhysicalRadianceGenerationId =
+            Shader.PropertyToID("_GIPhysicalRadianceGeneration");
+        static readonly int FreePageListId = Shader.PropertyToID("_GIFreePageList");
+        static readonly int AllocatorStateId = Shader.PropertyToID("_GIAllocatorState");
+        static readonly int PageDispatchArgsId = Shader.PropertyToID("_GIPageDispatchArgs");
+        static readonly int PhysicalPageCapacityId = Shader.PropertyToID("_GIPhysicalPageCapacity");
+        static readonly int InitializeAllocatorId = Shader.PropertyToID("_GIInitializeAllocator");
+        static readonly int AllocationLevelId = Shader.PropertyToID("_GIAllocationLevel");
+        static readonly int RadianceBrickBudgetId = Shader.PropertyToID("_GIRadianceBrickBudget");
+        static readonly int DirtyBrickBudgetId = Shader.PropertyToID("_GIDirtyBrickBudget");
+        static readonly int NanitePageTableId = Shader.PropertyToID("_GINanitePageTable");
+        static readonly int NaniteResidentPageTableId =
+            Shader.PropertyToID("_GINaniteResidentPageTable");
+        static readonly int NaniteResidencyBitsId = Shader.PropertyToID("_GINaniteResidencyBits");
+        static readonly int NaniteResidentVerticesId =
+            Shader.PropertyToID("_GINaniteResidentVertices");
+        static readonly int NaniteResidentIndicesId =
+            Shader.PropertyToID("_GINaniteResidentIndices");
+        static readonly int NaniteResidentTriangleSubMeshesId =
+            Shader.PropertyToID("_GINaniteResidentTriangleSubMeshes");
+        static readonly int NanitePageCountId = Shader.PropertyToID("_GINanitePageCount");
+        static readonly int NanitePoolGenerationId =
+            Shader.PropertyToID("_GINanitePoolGeneration");
+        static readonly int NaniteGeometryReadyFlagId =
+            Shader.PropertyToID("_GINaniteGeometryReadyFlag");
 
         public int Generation => generation;
         public int LightingRevision => lightingRevision;
@@ -212,49 +381,43 @@ namespace RealtimeGI
             scene = GetComponent<RealtimeGIScene>();
         }
 
-        void LateUpdate()
-        {
-            if (automaticUpdate)
-                UpdateClipmaps();
-        }
-
-        public void UpdateClipmaps()
+        public bool PrepareClipmaps()
         {
             if (!isActiveAndEnabled || !SystemInfo.supportsComputeShaders ||
                 SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null)
-                return;
+                return false;
             if (Application.isPlaying && lastUpdateFrame == Time.frameCount)
-                return;
+                return preparedValid;
             lastUpdateFrame = Time.frameCount;
+            preparedValid = false;
 
             if (!EnsureInitialized())
-                return;
+                return false;
+            // RenderGraph work from the previous frame is complete before this update.
+            // Issue the one-shot readback here so async-compute builds are audited too;
+            // the legacy immediate path also calls it after its command buffer executes.
+            RequestGpuForensicsOnce();
             scene.BuildNow();
             if (!scene.TryGetGpuView(out GISceneGpuView sceneView))
-                return;
+                return false;
             materialTextureCache.Update(scene, materialTextureResolution);
 
             Vector3 focusPosition = ResolveFocusPosition();
             BuildLocalLightList(focusPosition);
             bool originsChanged = UpdateLevelOrigins(focusPosition);
-            BuildRequiredBrickSets();
-            bool geometryRebuilt = geometryCache.RebuildIfNeeded(scene, activeGeometryIndices);
+            // The GPU derives required pages and per-page invalidation hashes directly from
+            // the scene buffers.  The compact fallback stream still contains every ordinary
+            // Mesh; Nanite ranges are redirected to the live resident-page export below.
+            bool geometryRebuilt = geometryCache.RebuildIfNeeded(scene);
+            NaniteRendererFeature naniteFeature = NaniteRendererFeature.ActiveInstance;
+            preparedNaniteViewValid = naniteFeature != null &&
+                naniteFeature.TryGetResidentPageReadOnlyView(out preparedNaniteView) &&
+                preparedNaniteView.IsValid;
             streamedVertexCount = geometryCache.VertexCount;
             streamedTriangleCount = geometryCache.TriangleCount;
             invalidGeometryCount = geometryCache.InvalidGeometryCount;
-            BuildStaticInvalidationSet();
-            BuildDynamicInvalidationSet();
-
-            staticLayer.UpdateRequired(staticRequired, levelOrigins, false);
-            staticLayer.MarkDirty(invalidatedStaticBricks);
-            // `UpdateRequired(..., true)` dirties every allocated dynamic brick.  The clear
-            // pass then resets its validity every frame, while only a bounded subset can be
-            // re-lit below.  Dynamic cache cells therefore never become readable when the
-            // number of bricks exceeds the per-frame radiance budget.  Newly required bricks
-            // are already dirtied by UpdateRequired; motion needs explicit dirty regions,
-            // rather than invalidating the complete dynamic pool every frame.
-            dynamicLayer.UpdateRequired(dynamicRequired, levelOrigins, false);
-            dynamicLayer.MarkDirty(invalidatedDynamicBricks);
+            invalidatedStaticBrickCount = 0;
+            invalidatedDynamicBrickCount = 0;
 
             Light sun = RenderSettings.sun;
             Vector3 lightDirection = sun != null
@@ -274,70 +437,180 @@ namespace RealtimeGI
             if (nextLightingSignature != lightingSignature)
             {
                 lightingSignature = nextLightingSignature;
-                bool firstLightingUpdate = lightingRevision == 0;
                 unchecked { lightingRevision++; }
-                staticLayer.EnqueueAllRadiance(levelOrigins, true, firstLightingUpdate);
-                dynamicLayer.EnqueueAllRadiance(levelOrigins, true, firstLightingUpdate);
-                remainingStaticBounceSweeps = Mathf.Max(0, staticBounceSweeps - 1);
             }
-            else if (staticLayer.DirtyBrickCount > 0)
-                remainingStaticBounceSweeps = Mathf.Max(
-                    remainingStaticBounceSweeps, Mathf.Max(0, staticBounceSweeps - 1));
 
-            // A sweep consumes the previous sweep's cache. Requeue only after its backlog is
-            // completely drained so the iteration is deterministic under a per-frame budget.
-            if (staticLayer.PendingRadianceCount == 0 && remainingStaticBounceSweeps > 0)
+            preparedSceneView = sceneView;
+            preparedLightDirection = lightDirection;
+            preparedLightColor = lightColorValue;
+            preparedSkyColor = skyColorValue;
+            unchecked { preparedFrame = ++preparedSequence; }
+            preparedValid = true;
+            // Runtime counts live in the allocator state buffer.  They are intentionally not
+            // read back into the frame loop; optional diagnostics may sample them later.
+            staticBrickCount = 0;
+            dynamicBrickCount = 0;
+            droppedStaticBricks = 0;
+            droppedDynamicBricks = 0;
+            pendingStaticRadianceBricks = 0;
+            pendingDynamicRadianceBricks = 0;
+            updatedRadianceBricks = 0;
+            generation++;
+            if (originsChanged || geometryRebuilt)
+                estimatedPoolMiB = EstimatePoolMiB();
+            WarnOnDegradation();
+            return true;
+        }
+
+        /// <summary>Legacy/debug entry point. Runtime rendering uses RecordRenderGraph.</summary>
+        public void UpdateClipmaps()
+        {
+            if (!PrepareClipmaps() || recordedFrame == preparedFrame)
+                return;
+            CommandBuffer cmd = CommandBufferPool.Get("RealtimeGI/Clipmap Update (Immediate Fallback)");
+            RecordPreparedCommands(new LegacyComputeCommands(cmd));
+            Graphics.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+            recordedFrame = preparedFrame;
+            RequestGpuForensicsOnce();
+        }
+
+        public bool RecordRenderGraph(RenderGraph renderGraph)
+        {
+            if (renderGraph == null || !preparedValid || recordedFrame == preparedFrame)
+                return false;
+
+            using (var builder = renderGraph.AddComputePass<ClipmapRenderGraphPassData>(
+                       "RealtimeGI/Clipmap Build", out ClipmapRenderGraphPassData passData))
             {
-                staticLayer.EnqueueAllRadiance(levelOrigins, false);
-                remainingStaticBounceSweeps--;
-            }
-            staticLayer.PrepareRadianceUpdates(staticRadianceBricksPerFrame);
-            dynamicLayer.PrepareRadianceUpdates(dynamicRadianceBricksPerFrame);
+                passData.owner = this;
+                passData.frame = preparedFrame;
+                passData.baseColorTextures = renderGraph.ImportTexture(materialTextureCache.BaseColorHandle);
+                passData.emissionTextures = renderGraph.ImportTexture(materialTextureCache.EmissionHandle);
+                passData.normalTextures = renderGraph.ImportTexture(materialTextureCache.NormalHandle);
+                passData.maskTextures = renderGraph.ImportTexture(materialTextureCache.MaskHandle);
+                builder.AllowPassCulling(false);
+                // Graphics.Blit refreshes imported material arrays outside RenderGraph. Keep
+                // their upload frame on graphics; stable arrays can use the async queue safely.
+                builder.EnableAsyncCompute(enableAsyncCompute && SystemInfo.supportsAsyncCompute &&
+                                           !materialTextureCache.UpdatedThisFrame);
 
-            CommandBuffer cmd = CommandBufferPool.Get("RealtimeGI/Clipmap Update");
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedSceneView.instances), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedSceneView.geometries), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedSceneView.materials), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedSceneView.materialBindings), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(geometryCache.RangeBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(geometryCache.VertexBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(geometryCache.UvBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(geometryCache.IndexBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(geometryCache.TriangleSubMeshBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedNaniteViewValid
+                    ? preparedNaniteView.pageTable : naniteFallbackPageTable), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedNaniteViewValid
+                    ? preparedNaniteView.residentPageTable : naniteFallbackResidentPageTable), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedNaniteViewValid
+                    ? preparedNaniteView.residencyBits : naniteFallbackResidencyBits), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedNaniteViewValid
+                    ? preparedNaniteView.residentVertices : naniteFallbackVertices), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedNaniteViewValid
+                    ? preparedNaniteView.residentIndices : naniteFallbackIndices), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(preparedNaniteViewValid
+                    ? preparedNaniteView.residentTriangleSubMeshes
+                    : naniteFallbackTriangleSubMeshes), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(levelDataBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(localLightBuffer), AccessFlags.Read);
+                builder.UseBuffer(renderGraph.ImportBuffer(radianceScratchBuffer), AccessFlags.ReadWrite);
+                builder.UseBuffer(renderGraph.ImportBuffer(validityScratchBuffer), AccessFlags.ReadWrite);
+                DeclareLayerResources(renderGraph, builder, staticLayer);
+                DeclareLayerResources(renderGraph, builder, dynamicLayer);
+                builder.UseTexture(passData.baseColorTextures, AccessFlags.Read);
+                builder.UseTexture(passData.emissionTextures, AccessFlags.Read);
+                builder.UseTexture(passData.normalTextures, AccessFlags.Read);
+                builder.UseTexture(passData.maskTextures, AccessFlags.Read);
+                builder.SetRenderFunc(static (ClipmapRenderGraphPassData data, ComputeGraphContext context) =>
+                {
+                    if (!data.owner.preparedValid || data.owner.preparedFrame != data.frame)
+                        return;
+                    data.owner.RecordPreparedCommands(new RenderGraphComputeCommands(
+                        context.cmd,
+                        data.owner.materialTextureCache,
+                        data.baseColorTextures,
+                        data.emissionTextures,
+                        data.normalTextures,
+                        data.maskTextures));
+                });
+            }
+            recordedFrame = preparedFrame;
+            return true;
+        }
+
+        static void DeclareLayerResources(
+            RenderGraph renderGraph,
+            IComputeRenderGraphBuilder builder,
+            GIClipmapLayer layer)
+        {
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.DirtyBrickBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.RadianceDirtyBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.BrickDataBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.PageTableBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.OccupancyBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.SurfaceBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.SurfaceUvBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.SurfaceIdentityBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.SurfaceStableIdBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.SurfaceKeyBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.DistanceBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.RadianceBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.ValidityBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.LightCountBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.LightIndexBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.DirtyGenerationBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.VoxelWorkQueueBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.VoxelDispatchArgsBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.RequiredPageMaskBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.RequiredPageHashBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.PhysicalPageHashBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.PhysicalRadianceGenerationBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.FreePageListBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.AllocatorStateBuffer), AccessFlags.ReadWrite);
+            builder.UseBuffer(renderGraph.ImportBuffer(layer.PageDispatchArgsBuffer), AccessFlags.ReadWrite);
+        }
+
+        void RecordPreparedCommands(IGIComputeCommands cmd)
+        {
             cmd.BeginSample("RealtimeGI/Clipmap Total");
+            uint workGeneration = ++voxelWorkGeneration;
+            if (workGeneration == 0u)
+                workGeneration = voxelWorkGeneration = 1u;
+            cmd.BeginSample("RealtimeGI/GPU Page Allocation");
+            AllocateClipmapPagesGpu(cmd, preparedSceneView, staticLayer, false,
+                staticGeometryBricksPerFrame, staticRadianceBricksPerFrame, workGeneration);
+            AllocateClipmapPagesGpu(cmd, preparedSceneView, dynamicLayer, true,
+                dynamicGeometryBricksPerFrame, dynamicRadianceBricksPerFrame, workGeneration);
+            cmd.EndSample("RealtimeGI/GPU Page Allocation");
             cmd.BeginSample("RealtimeGI/Clipmap Clear");
             ClearDirtyBricks(cmd, staticLayer);
             ClearDirtyBricks(cmd, dynamicLayer);
             cmd.EndSample("RealtimeGI/Clipmap Clear");
-
-            if (staticLayer.DirtyBrickCount > 0)
-            {
-                cmd.BeginSample("RealtimeGI/Voxelize Static");
-                VoxelizeLayer(cmd, sceneView, staticLayer, false);
-                cmd.EndSample("RealtimeGI/Voxelize Static");
-            }
-            if (dynamicLayer.DirtyBrickCount > 0)
-            {
-                cmd.BeginSample("RealtimeGI/Voxelize Dynamic");
-                VoxelizeLayer(cmd, sceneView, dynamicLayer, true);
-                cmd.EndSample("RealtimeGI/Voxelize Dynamic");
-            }
+            cmd.BeginSample("RealtimeGI/Voxelize Static");
+            VoxelizeLayer(cmd, preparedSceneView, staticLayer, false);
+            cmd.EndSample("RealtimeGI/Voxelize Static");
+            cmd.BeginSample("RealtimeGI/Voxelize Dynamic");
+            VoxelizeLayer(cmd, preparedSceneView, dynamicLayer, true);
+            cmd.EndSample("RealtimeGI/Voxelize Dynamic");
             cmd.BeginSample("RealtimeGI/Distance Propagation");
             BuildDistance(cmd, staticLayer);
             BuildDistance(cmd, dynamicLayer);
+            FinalizeDirtyBricks(cmd, staticLayer);
+            FinalizeDirtyBricks(cmd, dynamicLayer);
             cmd.EndSample("RealtimeGI/Distance Propagation");
             cmd.BeginSample("RealtimeGI/Radiance Update");
-            UpdateRadiance(cmd, sceneView, staticLayer, lightDirection, lightColorValue, skyColorValue);
-            UpdateRadiance(cmd, sceneView, dynamicLayer, lightDirection, lightColorValue, skyColorValue);
+            UpdateRadiance(cmd, preparedSceneView, staticLayer,
+                preparedLightDirection, preparedLightColor, preparedSkyColor);
+            UpdateRadiance(cmd, preparedSceneView, dynamicLayer,
+                preparedLightDirection, preparedLightColor, preparedSkyColor);
             cmd.EndSample("RealtimeGI/Radiance Update");
             cmd.EndSample("RealtimeGI/Clipmap Total");
-            Graphics.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-            RequestGpuForensicsOnce();
-
-            staticBrickCount = staticLayer.AllocatedCount;
-            dynamicBrickCount = dynamicLayer.AllocatedCount;
-            droppedStaticBricks = staticLayer.DroppedBrickCount;
-            droppedDynamicBricks = dynamicLayer.DroppedBrickCount;
-            pendingStaticRadianceBricks = staticLayer.PendingRadianceCount;
-            pendingDynamicRadianceBricks = dynamicLayer.PendingRadianceCount;
-            updatedRadianceBricks = staticLayer.RadianceDirtyCount + dynamicLayer.RadianceDirtyCount;
-            generation++;
-            if (originsChanged || geometryRebuilt || invalidatedStaticBricks.Count > 0 ||
-                invalidatedDynamicBricks.Count > 0)
-                estimatedPoolMiB = EstimatePoolMiB();
-            WarnOnDegradation();
         }
 
         // This is deliberately a one-shot, raw-buffer audit. It avoids every screen-space
@@ -349,8 +622,31 @@ namespace RealtimeGI
                 return;
             gpuForensicsIssued = true;
             LogRadianceSourceForensics();
+            RequestVoxelQueueForensics("Static", staticLayer, true);
+            RequestVoxelQueueForensics("Dynamic", dynamicLayer, false);
             RequestLayerForensics("Static", staticLayer);
             RequestLayerForensics("Dynamic", dynamicLayer);
+        }
+
+        void RequestVoxelQueueForensics(string layerName, GIClipmapLayer layer, bool isStatic)
+        {
+            if (layer?.VoxelDispatchArgsBuffer == null)
+                return;
+            AsyncGPUReadback.Request(layer.VoxelDispatchArgsBuffer, request =>
+            {
+                if (this == null || request.hasError)
+                    return;
+                var args = request.GetData<uint>();
+                uint overflow = args.Length > 3 ? args[3] : 0u;
+                if (isStatic)
+                    staticVoxelWorkOverflow = overflow;
+                else
+                    dynamicVoxelWorkOverflow = overflow;
+                if (overflow > 0u)
+                    Debug.LogError($"[RealtimeGI][VoxelQueue] {layerName} dropped {overflow} " +
+                                   $"1024-triangle work items; raise Max Voxel Work Items or " +
+                                   "reduce simultaneous dirty geometry.");
+            });
         }
 
         void LogRadianceSourceForensics()
@@ -382,9 +678,9 @@ namespace RealtimeGI
 
         static void RequestLayerForensics(string layerName, GIClipmapLayer layer)
         {
-            if (layer == null || layer.AllocatedCount == 0)
+            if (layer == null)
             {
-                Debug.Log($"[RealtimeGI][Forensics] {layerName}: no allocated bricks.");
+                Debug.Log($"[RealtimeGI][Forensics] {layerName}: layer unavailable.");
                 return;
             }
 
@@ -485,9 +781,24 @@ namespace RealtimeGI
             {
                 GIClipmapConstants.Validate();
                 clearKernel = clipmapBuildShader.FindKernel("ClearBricks");
-                voxelizeKernel = clipmapBuildShader.FindKernel("VoxelizeInstance");
+                clearRadianceKernel = clipmapBuildShader.FindKernel("ClearBrickRadiance");
+                resetPageAllocatorKernel = clipmapBuildShader.FindKernel("ResetPageAllocatorFrame");
+                initializePhysicalPageAllocatorKernel =
+                    clipmapBuildShader.FindKernel("InitializePhysicalPageAllocator");
+                markRequiredPagesKernel = clipmapBuildShader.FindKernel("MarkRequiredPages");
+                reprojectResidentPagesKernel = clipmapBuildShader.FindKernel("ReprojectResidentPages");
+                allocateRequiredPagesKernel = clipmapBuildShader.FindKernel("AllocateRequiredPages");
+                buildDirtyWorkQueuesKernel = clipmapBuildShader.FindKernel("BuildDirtyWorkQueues");
+                buildRadianceWorkQueueKernel = clipmapBuildShader.FindKernel("BuildRadianceWorkQueue");
+                advanceRadianceCursorKernel = clipmapBuildShader.FindKernel("AdvanceRadianceCursor");
+                markDirtyBricksKernel = clipmapBuildShader.FindKernel("MarkDirtyBricks");
+                resetVoxelWorkQueueKernel = clipmapBuildShader.FindKernel("ResetVoxelWorkQueue");
+                buildVoxelWorkQueueKernel = clipmapBuildShader.FindKernel("BuildVoxelWorkQueue");
+                clampVoxelDispatchArgsKernel = clipmapBuildShader.FindKernel("ClampVoxelDispatchArgs");
+                voxelizeWorkQueueKernel = clipmapBuildShader.FindKernel("VoxelizeWorkQueue");
                 initializeDistanceKernel = clipmapBuildShader.FindKernel("InitializeDistance");
                 propagateDistanceKernel = clipmapBuildShader.FindKernel("PropagateDistance");
+                finalizeDirtyBricksKernel = clipmapBuildShader.FindKernel("FinalizeDirtyBricks");
                 updateRadianceKernel = radianceCacheShader.FindKernel("UpdateSurfaceRadiance");
                 buildBrickLightListsKernel = radianceCacheShader.FindKernel("BuildBrickLightLists");
                 commitRadianceKernel = radianceCacheShader.FindKernel("CommitSurfaceRadiance");
@@ -495,6 +806,8 @@ namespace RealtimeGI
                 materialTextureCache = new GIMaterialTextureCache();
                 staticLayer = new GIClipmapLayer(staticBrickCapacity, "GI Static");
                 dynamicLayer = new GIClipmapLayer(dynamicBrickCapacity, "GI Dynamic");
+                staticLayer.EnsureVoxelWorkQueue(maxVoxelWorkItems, "GI Static");
+                dynamicLayer.EnsureVoxelWorkQueue(maxVoxelWorkItems, "GI Dynamic");
                 allocatedStaticCapacity = staticBrickCapacity;
                 allocatedDynamicCapacity = dynamicBrickCapacity;
                 levelDataBuffer = new GraphicsBuffer(
@@ -517,6 +830,29 @@ namespace RealtimeGI
         {
             staticLayer?.EnsureLightLists(maxLocalLightsPerBrick, "GI Static");
             dynamicLayer?.EnsureLightLists(maxLocalLightsPerBrick, "GI Dynamic");
+            staticLayer?.EnsureVoxelWorkQueue(maxVoxelWorkItems, "GI Static");
+            dynamicLayer?.EnsureVoxelWorkQueue(maxVoxelWorkItems, "GI Dynamic");
+            if (naniteFallbackPageTable == null)
+            {
+                naniteFallbackPageTable = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, 1, NaniteGpuPagePool.PageTableEntryBytes)
+                    { name = "GI Null Nanite Page Table" };
+                naniteFallbackResidentPageTable = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, 1, NaniteGpuPagePool.ResidentPageEntryBytes)
+                    { name = "GI Null Nanite Resident Table" };
+                naniteFallbackResidencyBits = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, 1, 4)
+                    { name = "GI Null Nanite Residency" };
+                naniteFallbackVertices = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, 1, NaniteGpuPagePool.ResidentVertexBytes)
+                    { name = "GI Null Nanite Vertices" };
+                naniteFallbackIndices = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, 1, 4)
+                    { name = "GI Null Nanite Indices" };
+                naniteFallbackTriangleSubMeshes = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, 1, 4)
+                    { name = "GI Null Nanite Triangle SubMeshes" };
+            }
             int scratchBricks = Mathf.Max(staticBrickCapacity, dynamicBrickCapacity);
             int requiredScratch = scratchBricks * GIClipmapConstants.RadianceWordsPerBrick;
             if (radianceScratchBuffer == null || radianceScratchCapacity < requiredScratch)
@@ -630,271 +966,283 @@ namespace RealtimeGI
             return changed;
         }
 
-        void BuildRequiredBrickSets()
+        void AllocateClipmapPagesGpu(
+            IGIComputeCommands cmd,
+            GISceneGpuView view,
+            GIClipmapLayer layer,
+            bool dynamic,
+            int dirtyBudget,
+            int radianceBudget,
+            uint workGeneration)
         {
-            staticRequired.Clear();
-            dynamicRequired.Clear();
-            activeGeometryIndices.Clear();
-            IReadOnlyList<GIGpuInstanceData> instances = scene.CpuInstances;
-            for (int i = 0; i < instances.Count; i++)
+            int[] kernels =
             {
-                GIGpuInstanceData instance = instances[i];
-                GIInstanceFlags flags = (GIInstanceFlags)instance.flags;
-                if ((flags & (GIInstanceFlags.Occluder | GIInstanceFlags.Contributor)) == 0)
-                    continue;
-                HashSet<GIClipmapBrickKey> target = (flags & GIInstanceFlags.Dynamic) != 0
-                    ? dynamicRequired
-                    : staticRequired;
-                if (AddSphereBricks(instance.worldBoundingSphere, target))
-                    activeGeometryIndices.Add(instance.geometryIndex);
+                resetPageAllocatorKernel,
+                initializePhysicalPageAllocatorKernel,
+                markRequiredPagesKernel,
+                reprojectResidentPagesKernel,
+                allocateRequiredPagesKernel,
+                buildDirtyWorkQueuesKernel,
+                buildRadianceWorkQueueKernel,
+                advanceRadianceCursorKernel
+            };
+            foreach (int kernel in kernels)
+            {
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, InstancesId, view.instances);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, GeometriesId, view.geometries);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, MaterialBindingsId,
+                    view.materialBindings);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, ClipmapMaterialsId,
+                    view.materials);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, GeometryRangesId,
+                    geometryCache.RangeBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, LevelsId, levelDataBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, PageTableId,
+                    layer.PageTableBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, BrickDataId,
+                    layer.BrickDataBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, RequiredPageMaskId,
+                    layer.RequiredPageMaskBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, RequiredPageHashId,
+                    layer.RequiredPageHashBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, PhysicalPageHashId,
+                    layer.PhysicalPageHashBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel,
+                    PhysicalRadianceGenerationId,
+                    layer.PhysicalRadianceGenerationBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, FreePageListId,
+                    layer.FreePageListBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, AllocatorStateId,
+                    layer.AllocatorStateBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, PageDispatchArgsId,
+                    layer.PageDispatchArgsBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, DirtyBricksId,
+                    layer.DirtyBrickBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, RadianceDirtyBricksId,
+                    layer.RadianceDirtyBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, DirtyGenerationId,
+                    layer.DirtyGenerationBuffer);
             }
-        }
 
-        bool AddSphereBricks(Vector4 sphere, HashSet<GIClipmapBrickKey> target)
-        {
-            bool overlapsAnyLevel = false;
-            Vector3 center = new Vector3(sphere.x, sphere.y, sphere.z);
-            float radius = Mathf.Max(0.01f, sphere.w);
+            cmd.SetComputeIntParam(clipmapBuildShader, InstanceCountId, view.instanceCount);
+            cmd.SetComputeIntParam(clipmapBuildShader, MaterialCountId, view.materialCount);
+            cmd.SetComputeIntParam(clipmapBuildShader, TargetDynamicId, dynamic ? 1 : 0);
+            cmd.SetComputeIntParam(clipmapBuildShader, PhysicalPageCapacityId, layer.Capacity);
+            cmd.SetComputeIntParam(clipmapBuildShader, InitializeAllocatorId,
+                layer.GpuAllocatorInitialized ? 0 : 1);
+            cmd.SetComputeIntParam(clipmapBuildShader, WorkGenerationId,
+                unchecked((int)workGeneration));
+            cmd.SetComputeIntParam(clipmapBuildShader, RadianceBrickBudgetId,
+                Mathf.Clamp(radianceBudget, 1, layer.Capacity));
+            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickBudgetId,
+                Mathf.Clamp(dirtyBudget, 1, layer.Capacity));
+
+            int resetCount = Mathf.Max(GIClipmapConstants.PageTableEntries, layer.Capacity);
+            cmd.DispatchCompute(clipmapBuildShader, resetPageAllocatorKernel,
+                Mathf.CeilToInt(resetCount / 64f), 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, initializePhysicalPageAllocatorKernel,
+                Mathf.CeilToInt(layer.Capacity / 64f), 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, markRequiredPagesKernel,
+                Mathf.Max(1, Mathf.CeilToInt(view.instanceCount / 64f)), 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, reprojectResidentPagesKernel,
+                Mathf.CeilToInt(layer.Capacity / 64f), 1, 1);
+            // Level ordering is a deterministic priority rule under pool pressure: finer
+            // pages always get a chance to allocate before their coarse fallbacks.
             for (int level = 0; level < GIClipmapConstants.LevelCount; level++)
             {
-                float brickWorldSize = GIClipmapConstants.CellSizes[level] * GIClipmapConstants.BrickSize;
-                Vector3Int min = FloorToBrick(center - Vector3.one * radius, brickWorldSize);
-                Vector3Int max = FloorToBrick(center + Vector3.one * radius, brickWorldSize);
-                Vector3Int clipMin = levelOrigins[level];
-                Vector3Int clipMax = clipMin + Vector3Int.one * (GIClipmapConstants.BricksPerAxis - 1);
-                min = Vector3Int.Max(min, clipMin);
-                max = Vector3Int.Min(max, clipMax);
-                if (min.x > max.x || min.y > max.y || min.z > max.z)
-                    continue;
-                overlapsAnyLevel = true;
-                for (int z = min.z; z <= max.z; z++)
-                for (int y = min.y; y <= max.y; y++)
-                for (int x = min.x; x <= max.x; x++)
-                    target.Add(new GIClipmapBrickKey(level, new Vector3Int(x, y, z)));
+                cmd.SetComputeIntParam(clipmapBuildShader, AllocationLevelId, level);
+                cmd.DispatchCompute(clipmapBuildShader, allocateRequiredPagesKernel,
+                    Mathf.CeilToInt(GIClipmapConstants.BricksPerLevel / 64f), 1, 1);
             }
-            return overlapsAnyLevel;
+            // The bounded persistent queue is filled fine-to-coarse. This keeps newly visible
+            // near geometry useful while preventing a camera scroll from rebuilding every
+            // newly exposed page in one catastrophic frame.
+            for (int level = 0; level < GIClipmapConstants.LevelCount; level++)
+            {
+                cmd.SetComputeIntParam(clipmapBuildShader, AllocationLevelId, level);
+                cmd.DispatchCompute(clipmapBuildShader, buildDirtyWorkQueuesKernel,
+                    Mathf.CeilToInt(layer.Capacity / 64f), 1, 1);
+            }
+            cmd.DispatchCompute(clipmapBuildShader, buildRadianceWorkQueueKernel,
+                Mathf.CeilToInt(layer.Capacity / 64f), 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, advanceRadianceCursorKernel, 1, 1, 1);
+            layer.MarkGpuAllocatorRecorded();
         }
 
-        static Vector3Int FloorToBrick(Vector3 position, float brickWorldSize) => new Vector3Int(
-            Mathf.FloorToInt(position.x / brickWorldSize),
-            Mathf.FloorToInt(position.y / brickWorldSize),
-            Mathf.FloorToInt(position.z / brickWorldSize));
-
-        void BuildStaticInvalidationSet()
+        void ClearDirtyBricks(IGIComputeCommands cmd, GIClipmapLayer layer)
         {
-            invalidatedStaticBricks.Clear();
-            observedStaticInstances.Clear();
-            IReadOnlyList<GIGpuInstanceData> instances = scene.CpuInstances;
-            IReadOnlyList<GIGpuGeometryData> geometries = scene.CpuGeometries;
-            IReadOnlyList<GIGpuMaterialBindingData> bindings = scene.CpuMaterialBindings;
-            for (int i = 0; i < instances.Count; i++)
-            {
-                GIGpuInstanceData instance = instances[i];
-                GIInstanceFlags flags = (GIInstanceFlags)instance.flags;
-                if ((flags & GIInstanceFlags.Dynamic) != 0 ||
-                    (flags & (GIInstanceFlags.Occluder | GIInstanceFlags.Contributor)) == 0)
-                    continue;
-                StaticInstanceState next = BuildStaticState(instance, geometries, bindings);
-                observedStaticInstances.Add(instance.objectId);
-                if (!previousStaticInstances.TryGetValue(instance.objectId, out StaticInstanceState previous))
-                    AddSphereBricks(instance.worldBoundingSphere, invalidatedStaticBricks);
-                else if (previous.signature != next.signature || previous.sphere != next.sphere)
-                {
-                    AddSphereBricks(previous.sphere, invalidatedStaticBricks);
-                    AddSphereBricks(next.sphere, invalidatedStaticBricks);
-                }
-                previousStaticInstances[instance.objectId] = next;
-            }
-
-            removedStaticInstances.Clear();
-            foreach (KeyValuePair<uint, StaticInstanceState> pair in previousStaticInstances)
-            {
-                if (observedStaticInstances.Contains(pair.Key))
-                    continue;
-                AddSphereBricks(pair.Value.sphere, invalidatedStaticBricks);
-                removedStaticInstances.Add(pair.Key);
-            }
-            for (int i = 0; i < removedStaticInstances.Count; i++)
-                previousStaticInstances.Remove(removedStaticInstances[i]);
-            invalidatedStaticBrickCount = invalidatedStaticBricks.Count;
-        }
-
-        void BuildDynamicInvalidationSet()
-        {
-            invalidatedDynamicBricks.Clear();
-            observedDynamicInstances.Clear();
-            IReadOnlyList<GIGpuInstanceData> instances = scene.CpuInstances;
-            IReadOnlyList<GIGpuGeometryData> geometries = scene.CpuGeometries;
-            IReadOnlyList<GIGpuMaterialBindingData> bindings = scene.CpuMaterialBindings;
-            for (int i = 0; i < instances.Count; i++)
-            {
-                GIGpuInstanceData instance = instances[i];
-                GIInstanceFlags flags = (GIInstanceFlags)instance.flags;
-                if ((flags & GIInstanceFlags.Dynamic) == 0 ||
-                    (flags & (GIInstanceFlags.Occluder | GIInstanceFlags.Contributor)) == 0)
-                    continue;
-
-                StaticInstanceState next = BuildStaticState(instance, geometries, bindings);
-                observedDynamicInstances.Add(instance.objectId);
-                if (!previousDynamicInstances.TryGetValue(
-                        instance.objectId, out StaticInstanceState previous))
-                {
-                    AddSphereBricks(instance.worldBoundingSphere, invalidatedDynamicBricks);
-                }
-                else if (previous.signature != next.signature || previous.sphere != next.sphere)
-                {
-                    // Clearing both footprints removes the trail left in a still-required
-                    // shared brick, then voxelization repopulates every current dynamic
-                    // contributor touching either footprint.
-                    AddSphereBricks(previous.sphere, invalidatedDynamicBricks);
-                    AddSphereBricks(next.sphere, invalidatedDynamicBricks);
-                }
-                previousDynamicInstances[instance.objectId] = next;
-            }
-
-            removedDynamicInstances.Clear();
-            foreach (KeyValuePair<uint, StaticInstanceState> pair in previousDynamicInstances)
-            {
-                if (observedDynamicInstances.Contains(pair.Key))
-                    continue;
-                AddSphereBricks(pair.Value.sphere, invalidatedDynamicBricks);
-                removedDynamicInstances.Add(pair.Key);
-            }
-            for (int i = 0; i < removedDynamicInstances.Count; i++)
-                previousDynamicInstances.Remove(removedDynamicInstances[i]);
-            invalidatedDynamicBrickCount = invalidatedDynamicBricks.Count;
-        }
-
-        static StaticInstanceState BuildStaticState(
-            GIGpuInstanceData instance,
-            IReadOnlyList<GIGpuGeometryData> geometries,
-            IReadOnlyList<GIGpuMaterialBindingData> bindings)
-        {
-            unchecked
-            {
-                int hash = 17;
-                if (instance.geometryIndex < geometries.Count)
-                {
-                    GIGpuGeometryData geometry = geometries[(int)instance.geometryIndex];
-                    hash = hash * 31 + (int)geometry.sourceObjectId;
-                    hash = hash * 31 + (int)geometry.sourceRevision;
-                    hash = hash * 31 + (int)geometry.kind;
-                }
-                hash = hash * 31 + (int)instance.revision;
-                hash = hash * 31 + instance.localToWorld.GetHashCode();
-                const GIInstanceFlags geometryFlags = GIInstanceFlags.Occluder |
-                                                      GIInstanceFlags.Contributor |
-                                                      GIInstanceFlags.TwoSided |
-                                                      GIInstanceFlags.AlphaTested;
-                hash = hash * 31 + (int)((GIInstanceFlags)instance.flags & geometryFlags);
-                int first = (int)instance.firstMaterialBinding;
-                int count = (int)instance.materialBindingCount;
-                for (int binding = 0; binding < count && first + binding < bindings.Count; binding++)
-                    hash = hash * 31 + (int)bindings[first + binding].materialIndex;
-                return new StaticInstanceState(hash, instance.worldBoundingSphere);
-            }
-        }
-
-        void ClearDirtyBricks(CommandBuffer cmd, GIClipmapLayer layer)
-        {
-            if (layer.DirtyBrickCount <= 0)
-                return;
-            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.DirtyBrickCount);
+            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.Capacity);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, DirtyBricksId, layer.DirtyBrickBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, OccupancyId, layer.OccupancyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceId, layer.SurfaceBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceUvId, layer.SurfaceUvBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceIdentityId, layer.SurfaceIdentityBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceStableIdId, layer.SurfaceStableIdBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, SurfaceKeyId, layer.SurfaceKeyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, DistanceId, layer.DistanceBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, RadianceId, layer.RadianceBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, clearKernel, ValidityId, layer.ValidityBuffer);
-            cmd.DispatchCompute(clipmapBuildShader, clearKernel, layer.DirtyBrickCount, 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, clearKernel,
+                layer.PageDispatchArgsBuffer, 0u);
+            // Stable IDs pushed the monolithic clear beyond D3D11's eight-UAV limit.
+            // Lighting payload is independent, so clear it in a second bounded dispatch.
+            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.Capacity);
+            cmd.SetComputeBufferParam(clipmapBuildShader, clearRadianceKernel,
+                DirtyBricksId, layer.DirtyBrickBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, clearRadianceKernel,
+                RadianceId, layer.RadianceBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, clearRadianceKernel,
+                ValidityId, layer.ValidityBuffer);
+            cmd.DispatchCompute(clipmapBuildShader, clearRadianceKernel,
+                layer.PageDispatchArgsBuffer, 0u);
         }
 
-        void VoxelizeLayer(CommandBuffer cmd, GISceneGpuView view, GIClipmapLayer layer, bool dynamic)
+        void VoxelizeLayer(IGIComputeCommands cmd, GISceneGpuView view, GIClipmapLayer layer, bool dynamic)
         {
-            if (geometryCache.TriangleCount <= 0)
-                return;
+            uint workGeneration = voxelWorkGeneration;
             cmd.SetComputeIntParam(clipmapBuildShader, MaxCellsId, maxCellsPerTriangle);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, InstancesId, view.instances);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, MaterialBindingsId, view.materialBindings);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, GeometryRangesId, geometryCache.RangeBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, VerticesId, geometryCache.VertexBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, UvsId, geometryCache.UvBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, IndicesId, geometryCache.IndexBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, TriangleSubMeshesId, geometryCache.TriangleSubMeshBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, LevelsId, levelDataBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, PageTableId, layer.PageTableBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, OccupancyId, layer.OccupancyBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceId, layer.SurfaceBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceUvId, layer.SurfaceUvBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceIdentityId, layer.SurfaceIdentityBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, SurfaceKeyId, layer.SurfaceKeyBuffer);
-            cmd.SetComputeBufferParam(clipmapBuildShader, voxelizeKernel, DistanceId, layer.DistanceBuffer);
-
-            IReadOnlyList<GIGpuInstanceData> instances = scene.CpuInstances;
-            IReadOnlyList<GIGpuGeometryStreamData> ranges = geometryCache.Ranges;
-            // Phase 0 atomically selects the closest deterministic triangle key for every cell.
-            // Phase 1 repeats the conservative coverage and commits only the selected candidate,
-            // keeping material, UV and instance identity from the same triangle.
+            int[] kernels = { markDirtyBricksKernel, resetVoxelWorkQueueKernel,
+                buildVoxelWorkQueueKernel, clampVoxelDispatchArgsKernel, voxelizeWorkQueueKernel };
+            foreach (int kernel in kernels)
+            {
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, InstancesId, view.instances);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, GeometriesId, view.geometries);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, MaterialBindingsId, view.materialBindings);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, ClipmapMaterialsId, view.materials);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, GeometryRangesId, geometryCache.RangeBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, VerticesId, geometryCache.VertexBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, UvsId, geometryCache.UvBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, IndicesId, geometryCache.IndexBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, TriangleSubMeshesId, geometryCache.TriangleSubMeshBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, LevelsId, levelDataBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, PageTableId, layer.PageTableBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, BrickDataId, layer.BrickDataBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, DirtyBricksId, layer.DirtyBrickBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, DirtyGenerationId, layer.DirtyGenerationBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, PageDispatchArgsId,
+                    layer.PageDispatchArgsBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, VoxelWorkQueueId, layer.VoxelWorkQueueBuffer);
+                cmd.SetComputeBufferParam(clipmapBuildShader, kernel, VoxelDispatchArgsId, layer.VoxelDispatchArgsBuffer);
+                BindNaniteResidentGeometry(cmd, clipmapBuildShader, kernel);
+            }
+            cmd.SetComputeIntParam(clipmapBuildShader, MaterialCountId, view.materialCount);
+            cmd.SetComputeIntParam(clipmapBuildShader, TextureSliceCountId,
+                materialTextureCache != null ? materialTextureCache.SliceCount : 0);
+            cmd.SetComputeTextureParam(clipmapBuildShader, voxelizeWorkQueueKernel,
+                BaseColorTexturesId, materialTextureCache.BaseColorArray);
+            cmd.SetComputeTextureParam(clipmapBuildShader, voxelizeWorkQueueKernel,
+                NormalTexturesId, materialTextureCache.NormalArray);
+            cmd.SetComputeTextureParam(clipmapBuildShader, voxelizeWorkQueueKernel,
+                MaskTexturesId, materialTextureCache.MaskArray);
+            int voxelKernel = voxelizeWorkQueueKernel;
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, OccupancyId, layer.OccupancyBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, SurfaceId, layer.SurfaceBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, SurfaceUvId, layer.SurfaceUvBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, SurfaceIdentityId, layer.SurfaceIdentityBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, SurfaceStableIdId, layer.SurfaceStableIdBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, SurfaceKeyId, layer.SurfaceKeyBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel, DistanceId, layer.DistanceBuffer);
+            // Read-only aliases keep queue/indirect metadata out of the D3D11 UAV count.
+            // The producer dispatches complete before this consumer starts.
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel,
+                VoxelWorkQueueReadId, layer.VoxelWorkQueueBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, voxelKernel,
+                VoxelDispatchArgsReadId, layer.VoxelDispatchArgsBuffer);
+            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.Capacity);
+            cmd.SetComputeIntParam(clipmapBuildShader, InstanceCountId, view.instanceCount);
+            cmd.SetComputeIntParam(clipmapBuildShader, TargetDynamicId, dynamic ? 1 : 0);
+            cmd.SetComputeIntParam(clipmapBuildShader, VoxelWorkCapacityId, layer.VoxelWorkCapacity);
+            cmd.SetComputeIntParam(clipmapBuildShader, WorkGenerationId, unchecked((int)workGeneration));
+            cmd.DispatchCompute(clipmapBuildShader, markDirtyBricksKernel,
+                layer.PageDispatchArgsBuffer, 0u);
+            cmd.DispatchCompute(clipmapBuildShader, resetVoxelWorkQueueKernel, 1, 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, buildVoxelWorkQueueKernel,
+                Mathf.CeilToInt(view.instanceCount / 64f), 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, clampVoxelDispatchArgsKernel, 1, 1, 1);
+            // Phase 0 selects a deterministic winner. Phase 1 commits its complete material,
+            // stable IDs and exact triangle index. Both consume one GPU-generated work queue.
             for (int phase = 0; phase < 2; phase++)
             {
                 cmd.SetComputeIntParam(clipmapBuildShader, VoxelizePhaseId, phase);
-                for (int instanceIndex = 0; instanceIndex < instances.Count; instanceIndex++)
-                {
-                    GIGpuInstanceData instance = instances[instanceIndex];
-                    bool isDynamic = ((GIInstanceFlags)instance.flags & GIInstanceFlags.Dynamic) != 0;
-                    if (isDynamic != dynamic || instance.geometryIndex >= ranges.Count)
-                        continue;
-                    if (!SphereTouchesDirtyBrick(instance.worldBoundingSphere, layer))
-                        continue;
-                    uint triangleCount = ranges[(int)instance.geometryIndex].triangleCount;
-                    if (triangleCount == 0)
-                        continue;
-                    cmd.SetComputeIntParam(clipmapBuildShader, InstanceIndexId, instanceIndex);
-                    const uint maxTrianglesPerDispatch = 65535u * 64u;
-                    uint triangleBase = 0;
-                    while (triangleBase < triangleCount)
-                    {
-                        uint batchCount = Math.Min(maxTrianglesPerDispatch, triangleCount - triangleBase);
-                        cmd.SetComputeIntParam(clipmapBuildShader, TriangleBaseId, (int)triangleBase);
-                        cmd.DispatchCompute(clipmapBuildShader, voxelizeKernel, Mathf.CeilToInt(batchCount / 64f), 1, 1);
-                        triangleBase += batchCount;
-                    }
-                }
+                cmd.DispatchCompute(clipmapBuildShader, voxelKernel, layer.VoxelDispatchArgsBuffer, 0u);
             }
         }
 
-        void BuildDistance(CommandBuffer cmd, GIClipmapLayer layer)
+        void BindNaniteResidentGeometry(
+            IGIComputeCommands cmd, ComputeShader shader, int kernel)
         {
-            if (layer.DirtyBrickCount <= 0)
-                return;
-            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.DirtyBrickCount);
+            GraphicsBuffer pageTable = preparedNaniteViewValid
+                ? preparedNaniteView.pageTable : naniteFallbackPageTable;
+            GraphicsBuffer residentTable = preparedNaniteViewValid
+                ? preparedNaniteView.residentPageTable : naniteFallbackResidentPageTable;
+            GraphicsBuffer residency = preparedNaniteViewValid
+                ? preparedNaniteView.residencyBits : naniteFallbackResidencyBits;
+            GraphicsBuffer vertices = preparedNaniteViewValid
+                ? preparedNaniteView.residentVertices : naniteFallbackVertices;
+            GraphicsBuffer indices = preparedNaniteViewValid
+                ? preparedNaniteView.residentIndices : naniteFallbackIndices;
+            GraphicsBuffer subMeshes = preparedNaniteViewValid
+                ? preparedNaniteView.residentTriangleSubMeshes
+                : naniteFallbackTriangleSubMeshes;
+            cmd.SetComputeBufferParam(shader, kernel, NanitePageTableId, pageTable);
+            cmd.SetComputeBufferParam(shader, kernel, NaniteResidentPageTableId, residentTable);
+            cmd.SetComputeBufferParam(shader, kernel, NaniteResidencyBitsId, residency);
+            cmd.SetComputeBufferParam(shader, kernel, NaniteResidentVerticesId, vertices);
+            cmd.SetComputeBufferParam(shader, kernel, NaniteResidentIndicesId, indices);
+            cmd.SetComputeBufferParam(shader, kernel,
+                NaniteResidentTriangleSubMeshesId, subMeshes);
+            cmd.SetComputeIntParam(shader, NanitePageCountId,
+                preparedNaniteViewValid ? preparedNaniteView.pageCount : 0);
+            cmd.SetComputeIntParam(shader, NanitePoolGenerationId,
+                preparedNaniteViewValid ? unchecked((int)preparedNaniteView.poolGeneration) : 0);
+            cmd.SetComputeIntParam(shader, NaniteGeometryReadyFlagId,
+                preparedNaniteViewValid ? unchecked((int)preparedNaniteView.geometryReadyFlag) : 0);
+        }
+
+        void BuildDistance(IGIComputeCommands cmd, GIClipmapLayer layer)
+        {
+            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.Capacity);
             cmd.SetComputeBufferParam(clipmapBuildShader, initializeDistanceKernel, DirtyBricksId, layer.DirtyBrickBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, initializeDistanceKernel, OccupancyId, layer.OccupancyBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, initializeDistanceKernel, DistanceId, layer.DistanceBuffer);
-            cmd.DispatchCompute(clipmapBuildShader, initializeDistanceKernel, layer.DirtyBrickCount, 1, 1);
+            cmd.DispatchCompute(clipmapBuildShader, initializeDistanceKernel,
+                layer.PageDispatchArgsBuffer, 0u);
 
             cmd.SetComputeIntParam(clipmapBuildShader, PropagationStepId, 1);
             cmd.SetComputeBufferParam(clipmapBuildShader, propagateDistanceKernel, DirtyBricksId, layer.DirtyBrickBuffer);
             cmd.SetComputeBufferParam(clipmapBuildShader, propagateDistanceKernel, DistanceId, layer.DistanceBuffer);
             int passCount = Mathf.Clamp(distancePropagationPasses, 1, 7);
             for (int pass = 0; pass < passCount; pass++)
-                cmd.DispatchCompute(clipmapBuildShader, propagateDistanceKernel, layer.DirtyBrickCount, 1, 1);
+                cmd.DispatchCompute(clipmapBuildShader, propagateDistanceKernel,
+                    layer.PageDispatchArgsBuffer, 0u);
+        }
+
+        void FinalizeDirtyBricks(IGIComputeCommands cmd, GIClipmapLayer layer)
+        {
+            cmd.SetComputeIntParam(clipmapBuildShader, DirtyBrickCountId, layer.Capacity);
+            cmd.SetComputeBufferParam(clipmapBuildShader, finalizeDirtyBricksKernel,
+                DirtyBricksId, layer.DirtyBrickBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, finalizeDirtyBricksKernel,
+                DirtyGenerationId, layer.DirtyGenerationBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, finalizeDirtyBricksKernel,
+                VoxelDispatchArgsReadId, layer.VoxelDispatchArgsBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, finalizeDirtyBricksKernel,
+                PageTableId, layer.PageTableBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, finalizeDirtyBricksKernel,
+                BrickDataId, layer.BrickDataBuffer);
+            cmd.SetComputeBufferParam(clipmapBuildShader, finalizeDirtyBricksKernel,
+                LevelsId, levelDataBuffer);
+            cmd.DispatchCompute(clipmapBuildShader, finalizeDirtyBricksKernel,
+                layer.PageDispatchArgsBuffer, 0u);
         }
 
         void UpdateRadiance(
-            CommandBuffer cmd,
+            IGIComputeCommands cmd,
             GISceneGpuView view,
             GIClipmapLayer layer,
             Vector3 lightDirection,
             Color lightColor,
             Color skyColor)
         {
-            if (layer.RadianceDirtyCount <= 0)
-                return;
-            cmd.SetComputeIntParam(radianceCacheShader, RadianceDirtyBrickCountId, layer.RadianceDirtyCount);
+            cmd.SetComputeIntParam(radianceCacheShader, RadianceDirtyBrickCountId, layer.Capacity);
             cmd.SetComputeIntParam(radianceCacheShader, MaterialCountId, view.materialCount);
             cmd.SetComputeIntParam(radianceCacheShader, TextureSliceCountId,
                 materialTextureCache != null ? materialTextureCache.SliceCount : 0);
@@ -969,6 +1317,8 @@ namespace RealtimeGI
                 BaseColorTexturesId, materialTextureCache.BaseColorArray);
             cmd.SetComputeTextureParam(radianceCacheShader, updateRadianceKernel,
                 EmissionTexturesId, materialTextureCache.EmissionArray);
+            cmd.SetComputeTextureParam(radianceCacheShader, updateRadianceKernel,
+                MaskTexturesId, materialTextureCache.MaskArray);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 LevelsId, levelDataBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
@@ -1000,12 +1350,12 @@ namespace RealtimeGI
             cmd.SetComputeBufferParam(radianceCacheShader, updateRadianceKernel,
                 DynamicValidityId, dynamicLayer.ValidityBuffer);
             cmd.DispatchCompute(radianceCacheShader, buildBrickLightListsKernel,
-                layer.RadianceDirtyCount, 1, 1);
+                layer.PageDispatchArgsBuffer, 12u);
             cmd.DispatchCompute(radianceCacheShader, updateRadianceKernel,
-                layer.RadianceDirtyCount, 1, 1);
+                layer.PageDispatchArgsBuffer, 12u);
 
             cmd.SetComputeIntParam(radianceCacheShader, RadianceDirtyBrickCountId,
-                layer.RadianceDirtyCount);
+                layer.Capacity);
             cmd.SetComputeBufferParam(radianceCacheShader, commitRadianceKernel,
                 RadianceDirtyBricksId, layer.RadianceDirtyBuffer);
             cmd.SetComputeBufferParam(radianceCacheShader, commitRadianceKernel,
@@ -1017,7 +1367,7 @@ namespace RealtimeGI
             cmd.SetComputeBufferParam(radianceCacheShader, commitRadianceKernel,
                 TargetValidityId, layer.ValidityBuffer);
             cmd.DispatchCompute(radianceCacheShader, commitRadianceKernel,
-                layer.RadianceDirtyCount, 1, 1);
+                layer.PageDispatchArgsBuffer, 12u);
         }
 
         int ComputeLightingSignature(Vector3 lightDirection, Color lightColor, Color skyColor)
@@ -1067,26 +1417,6 @@ namespace RealtimeGI
 
         static int QuantizeLighting(float value, float scale) => Mathf.RoundToInt(value * scale);
 
-        bool SphereTouchesDirtyBrick(Vector4 sphere, GIClipmapLayer layer)
-        {
-            Vector3 center = new Vector3(sphere.x, sphere.y, sphere.z);
-            float radius = Mathf.Max(0.01f, sphere.w);
-            for (int level = 0; level < GIClipmapConstants.LevelCount; level++)
-            {
-                float brickWorldSize = GIClipmapConstants.CellSizes[level] * GIClipmapConstants.BrickSize;
-                Vector3Int min = FloorToBrick(center - Vector3.one * radius, brickWorldSize);
-                Vector3Int max = FloorToBrick(center + Vector3.one * radius, brickWorldSize);
-                for (int z = min.z; z <= max.z; z++)
-                for (int y = min.y; y <= max.y; y++)
-                for (int x = min.x; x <= max.x; x++)
-                {
-                    if (layer.IsDirty(new GIClipmapBrickKey(level, new Vector3Int(x, y, z))))
-                        return true;
-                }
-            }
-            return false;
-        }
-
         float EstimatePoolMiB()
         {
             long bytesPerBrick =
@@ -1094,6 +1424,7 @@ namespace RealtimeGI
                 GIClipmapConstants.SurfaceWordsPerBrick * 4L +
                 GIClipmapConstants.SurfaceUvWordsPerBrick * 4L +
                 GIClipmapConstants.SurfaceIdentityWordsPerBrick * 4L +
+                GIClipmapConstants.SurfaceStableIdEntriesPerBrick * 8L +
                 GIClipmapConstants.SurfaceKeyWordsPerBrick * 4L +
                 GIClipmapConstants.DistanceWordsPerBrick * 4L +
                 GIClipmapConstants.RadianceWordsPerBrick * 4L +
@@ -1101,13 +1432,19 @@ namespace RealtimeGI
                 GIClipmapConstants.BrickDataStride;
             long bytes = bytesPerBrick * (staticBrickCapacity + dynamicBrickCapacity) +
                          GIClipmapConstants.PageTableEntries * 4L * 2L +
+                         // Required mask/hash are per logical page and physical hash,
+                         // radiance-generation and free-list are per physical page.
+                         GIClipmapConstants.PageTableEntries * 8L * 2L +
+                         (staticBrickCapacity + dynamicBrickCapacity) * 12L +
                          GIClipmapConstants.LevelCount * GIClipmapConstants.LevelStride +
                          Math.Max(staticBrickCapacity, dynamicBrickCapacity) *
                          (GIClipmapConstants.RadianceWordsPerBrick +
                           GIClipmapConstants.ValidityWordsPerBrick) * 4L +
                          Math.Max(1, maxUploadedLocalLights) * GILightAbi.LocalLightStride +
                          (staticBrickCapacity + dynamicBrickCapacity) *
-                         (4L + Math.Max(8, maxLocalLightsPerBrick) * 4L);
+                         (8L + Math.Max(8, maxLocalLightsPerBrick) * 4L) +
+                         Math.Max(1024, Math.Min(1048576, maxVoxelWorkItems)) * 16L * 2L + 40L +
+                         (geometryCache?.ResidentBytes ?? 0L);
             return bytes / (1024f * 1024f);
         }
 
@@ -1133,7 +1470,20 @@ namespace RealtimeGI
         public bool TryGetGpuView(out GIClipmapGpuView view)
         {
             view = new GIClipmapGpuView(
-                levelDataBuffer, staticLayer, dynamicLayer, localLightBuffer,
+                levelDataBuffer, staticLayer, dynamicLayer, localLightBuffer, geometryCache,
+                preparedNaniteViewValid ? preparedNaniteView.pageTable : naniteFallbackPageTable,
+                preparedNaniteViewValid ? preparedNaniteView.residentPageTable : naniteFallbackResidentPageTable,
+                preparedNaniteViewValid ? preparedNaniteView.residencyBits : naniteFallbackResidencyBits,
+                preparedNaniteViewValid ? preparedNaniteView.residentVertices : naniteFallbackVertices,
+                preparedNaniteViewValid ? preparedNaniteView.residentIndices : naniteFallbackIndices,
+                preparedNaniteViewValid ? preparedNaniteView.residentTriangleSubMeshes : naniteFallbackTriangleSubMeshes,
+                preparedNaniteViewValid ? preparedNaniteView.pageCount : 0,
+                preparedNaniteViewValid ? preparedNaniteView.poolGeneration : 0u,
+                preparedNaniteViewValid ? preparedNaniteView.geometryReadyFlag : 0u,
+                materialTextureCache?.BaseColorHandle,
+                materialTextureCache?.EmissionHandle,
+                materialTextureCache?.MaskHandle,
+                materialTextureCache?.SliceCount ?? 0,
                 activeLocalLightCount, generation, lightingRevision,
                 Mathf.Max(0f, skyIrradianceScale), Mathf.Max(0f, mainLightBounceScale));
             return initialized && view.IsValid;
@@ -1155,6 +1505,10 @@ namespace RealtimeGI
 
         void ReleaseResources()
         {
+            preparedValid = false;
+            preparedSceneView = default;
+            preparedFrame = -1;
+            recordedFrame = -1;
             geometryCache?.Dispose();
             materialTextureCache?.Dispose();
             staticLayer?.Dispose();
@@ -1163,6 +1517,12 @@ namespace RealtimeGI
             localLightBuffer?.Release();
             radianceScratchBuffer?.Release();
             validityScratchBuffer?.Release();
+            naniteFallbackPageTable?.Release();
+            naniteFallbackResidentPageTable?.Release();
+            naniteFallbackResidencyBits?.Release();
+            naniteFallbackVertices?.Release();
+            naniteFallbackIndices?.Release();
+            naniteFallbackTriangleSubMeshes?.Release();
             geometryCache = null;
             materialTextureCache = null;
             staticLayer = null;
@@ -1171,17 +1531,17 @@ namespace RealtimeGI
             localLightBuffer = null;
             radianceScratchBuffer = null;
             validityScratchBuffer = null;
+            naniteFallbackPageTable = null;
+            naniteFallbackResidentPageTable = null;
+            naniteFallbackResidencyBits = null;
+            naniteFallbackVertices = null;
+            naniteFallbackIndices = null;
+            naniteFallbackTriangleSubMeshes = null;
+            preparedNaniteView = default;
+            preparedNaniteViewValid = false;
             initialized = false;
             originsInitialized = false;
             lastUpdateFrame = -1;
-            previousStaticInstances.Clear();
-            observedStaticInstances.Clear();
-            removedStaticInstances.Clear();
-            invalidatedStaticBricks.Clear();
-            previousDynamicInstances.Clear();
-            observedDynamicInstances.Clear();
-            removedDynamicInstances.Clear();
-            invalidatedDynamicBricks.Clear();
             lightingSignature = 0;
             lightingRevision = 0;
             allocatedStaticCapacity = 0;
@@ -1193,16 +1553,5 @@ namespace RealtimeGI
             remainingStaticBounceSweeps = 0;
         }
 
-        readonly struct StaticInstanceState
-        {
-            public readonly int signature;
-            public readonly Vector4 sphere;
-
-            public StaticInstanceState(int signature, Vector4 sphere)
-            {
-                this.signature = signature;
-                this.sphere = sphere;
-            }
-        }
     }
 }

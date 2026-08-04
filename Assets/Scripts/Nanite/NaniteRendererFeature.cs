@@ -25,6 +25,7 @@ namespace Nanite
     /// </summary>
     public class NaniteRendererFeature : ScriptableRendererFeature
     {
+        public static NaniteRendererFeature ActiveInstance { get; private set; }
         static readonly ProfilerMarker kFirstCullMarker = new ProfilerMarker("Nanite.CPU.FirstCull");
         static readonly ProfilerMarker kScenePrepareMarker = new ProfilerMarker("Nanite.CPU.ScenePrepare");
         static readonly ProfilerMarker kResolveSubmitMarker = new ProfilerMarker("Nanite.CPU.ResolveSubmit");
@@ -134,7 +135,7 @@ namespace Nanite
             [Tooltip("Cluster：每块 cluster 异色；Triangle：每个三角形异色；Page：每个 streaming page 异色。")]
             public DebugVisualizationMode debugVisualizationMode = DebugVisualizationMode.Cluster;
             [Tooltip("Debug 可视化绘制时机（建议 AfterRenderingOpaques）。")]
-            public RenderPassEvent debugVisualizationEvent = RenderPassEvent.AfterRenderingOpaques;
+            public RenderPassEvent debugVisualizationEvent = RenderPassEvent.AfterRendering;
             [Header("Formal VisibilityBuffer")]
             [Tooltip("正式 GPU-driven Visibility Buffer 链路；仅在原生渲染对照或诊断时关闭。")]
             public bool enableFormalVisibilityBuffer = true;
@@ -529,6 +530,45 @@ namespace Nanite
         int compactVBufferProbeGeneration;
         NaniteGpuBatchedCullingBackend batchedCulling;
         NaniteSceneVisibilityBufferBackend sceneVisibilityBackend;
+
+        /// <summary>Frame-scoped read-only export of the published live resident-page front table.</summary>
+        public bool TryGetResidentPageReadOnlyView(out NaniteResidentPageReadOnlyView view)
+        {
+            if (sceneVisibilityBackend != null)
+                return sceneVisibilityBackend.TryGetResidentPageReadOnlyView(out view);
+            view = default;
+            return false;
+        }
+
+        public bool TryGetResidentMeshIndex(NaniteMesh mesh, out int meshIndex)
+        {
+            if (sceneVisibilityBackend != null)
+                return sceneVisibilityBackend.TryGetResidentMeshIndex(mesh, out meshIndex);
+            meshIndex = -1;
+            return false;
+        }
+
+        public bool TryGetResidentMeshPageRange(
+            NaniteMesh mesh, out int firstPageId, out int pageCount, out int meshIndex)
+        {
+            if (sceneVisibilityBackend != null)
+                return sceneVisibilityBackend.TryGetResidentMeshPageRange(
+                    mesh, out firstPageId, out pageCount, out meshIndex);
+            firstPageId = -1;
+            pageCount = 0;
+            meshIndex = -1;
+            return false;
+        }
+
+        public bool TryGetResidentPageId(
+            NaniteMesh mesh, int localPageIndex, out int pageId)
+        {
+            if (sceneVisibilityBackend != null)
+                return sceneVisibilityBackend.TryGetResidentPageId(
+                    mesh, localPageIndex, out pageId);
+            pageId = -1;
+            return false;
+        }
         MaterialPropertyBlock vbufferMpb;
         int perfSampleCount;
         double perfFirstCullCpuMsAccum;
@@ -808,6 +848,7 @@ namespace Nanite
         bool featureDriverRegistered;
         public override void Create()
         {
+            ActiveInstance = this;
             if (!featureDriverRegistered)
             {
                 NaniteRuntimeRegistry.RegisterFeatureDriver();
@@ -1426,7 +1467,13 @@ namespace Nanite
             passBuildHzb.renderPassEvent = (RenderPassEvent)eHzb;
             passSecondCull.renderPassEvent = settings.secondCullEvent;
             passVBufferPreview.renderPassEvent = settings.vbufferPreviewEvent;
-            passDebugVisualization.renderPassEvent = settings.debugVisualizationEvent;
+            // Debug is a presentation overlay. Scheduling it before temporal/post
+            // processing lets Game-view history blend the lit frame back over the
+            // diagnostic colors while the camera moves.
+            int eDebug = Mathf.Max(
+                (int)settings.debugVisualizationEvent,
+                (int)RenderPassEvent.AfterRenderingPostProcessing);
+            passDebugVisualization.renderPassEvent = (RenderPassEvent)eDebug;
             int eFormal = (int)settings.formalVBufferEvent + settings.formalVBufferQueueOffset;
             eFormal = Mathf.Clamp(
                 eFormal,
@@ -2387,6 +2434,8 @@ namespace Nanite
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
+            if (ReferenceEquals(ActiveInstance, this))
+                ActiveInstance = null;
             if (featureDriverRegistered)
             {
                 NaniteRuntimeRegistry.UnregisterFeatureDriver();
@@ -3453,6 +3502,7 @@ namespace Nanite
         {
             internal Material material;
             internal Camera camera;
+            internal TextureHandle depth;
         }
 
         class VBufferCompositeRgPassData
@@ -3949,14 +3999,25 @@ namespace Nanite
                 {
                     passData.material = material;
                     passData.camera = cameraData.camera;
+                    passData.depth = resourceData.cameraDepthTexture.IsValid()
+                        ? resourceData.cameraDepthTexture
+                        : resourceData.activeDepthTexture;
                     builder.AllowPassCulling(false);
                     builder.AllowGlobalStateModification(true);
-                    builder.SetRenderAttachment(resourceData.activeColorTexture, 0, AccessFlags.Write);
-                    if (resourceData.activeDepthTexture.IsValid())
-                        builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.ReadWrite);
+                    // Debug is a sparse overlay. Preserve the already resolved camera
+                    // color and compare against a sampled depth copy in the shader.
+                    // Re-rasterizing against the live depth attachment with exact
+                    // fixed-function LEqual is unstable under Game-camera jitter:
+                    // tiny replay differences reject whole triangle fragments and the
+                    // lit image appears to progressively eat the debug colors.
+                    builder.SetRenderAttachment(resourceData.activeColorTexture, 0, AccessFlags.ReadWrite);
+                    if (passData.depth.IsValid())
+                        builder.UseTexture(passData.depth, AccessFlags.Read);
 
                     builder.SetRenderFunc((VBufferPreviewRgPassData data, RasterGraphContext context) =>
                     {
+                        if (data.depth.IsValid())
+                            context.cmd.SetGlobalTexture(ShaderIds.CameraDepthTexture, data.depth);
                         ExecuteDebugVisualization(context.cmd, data.material, data.camera);
                     });
                 }

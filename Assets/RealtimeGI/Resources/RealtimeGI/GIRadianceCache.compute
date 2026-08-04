@@ -45,6 +45,7 @@ StructuredBuffer<uint> _GIDynamicRadiance;
 StructuredBuffer<uint> _GIDynamicValidity;
 Texture2DArray<float4> _GIBaseColorTextures;
 Texture2DArray<float4> _GIEmissionTextures;
+Texture2DArray<float4> _GIMaskTextures;
 SamplerState sampler_LinearRepeat;
 
 uint _GIRadianceDirtyBrickCount;
@@ -158,6 +159,15 @@ float3 GIReadDirectionalCell(uint physicalBrick, uint localCell, uint hitLayer,
     uint validity = hitLayer == 0u ? _GIStaticValidity[cellAddress] : _GIDynamicValidity[cellAddress];
     float confidence = (validity & 0xffu) / 255.0;
     if (confidence <= 0.0)
+        return 0.0;
+    uint surfaceAddress = physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
+    uint packedSurface = hitLayer == 0u ? _GIStaticSurface[surfaceAddress]
+                                        : _GIDynamicSurface[surfaceAddress];
+    float3 surfaceNormal = GIUnpackSurfaceNormal(packedSurface);
+    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
+    bool twoSided = materialIndex < _GIMaterialCount &&
+        (_GIMaterials[materialIndex].flags & GI_MATERIAL_DOUBLE_SIDED) != 0u;
+    if (!twoSided && dot(surfaceNormal, normalize(outgoingDirection)) <= 0.0)
         return 0.0;
     float3 direction = normalize(outgoingDirection);
     float3 weights = abs(direction);
@@ -359,14 +369,31 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
         uint packedUv = _GITargetSurfaceUV[physicalBrick * GI_SURFACE_UV_WORDS_PER_BRICK + localCell];
         float2 uv = float2(f16tof32(packedUv & 0xffffu), f16tof32(packedUv >> 16u));
         float mipLevel = min((float)_GITargetBrickData[physicalBrick].level, 6.0);
-        if (materialIndex < _GITextureSliceCount && (material.flags & 8u) != 0u)
+        if (materialIndex < _GITextureSliceCount &&
+            (material.flags & GI_MATERIAL_HAS_BASE_MAP) != 0u)
             baseColor *= _GIBaseColorTextures.SampleLevel(
                 sampler_LinearRepeat, float3(uv * material.baseMapST.xy + material.baseMapST.zw,
                                              materialIndex), mipLevel).rgb;
-        if (materialIndex < _GITextureSliceCount && (material.flags & 16u) != 0u)
+        if (materialIndex < _GITextureSliceCount &&
+            (material.flags & GI_MATERIAL_HAS_EMISSION_MAP) != 0u)
             emissive *= _GIEmissionTextures.SampleLevel(
                 sampler_LinearRepeat, float3(uv * material.emissionMapST.xy + material.emissionMapST.zw,
                                              materialIndex), mipLevel).rgb;
+        if (materialIndex < _GITextureSliceCount &&
+            (material.flags & GI_MATERIAL_HAS_MASK_MAP) != 0u)
+        {
+            float4 mask = _GIMaskTextures.SampleLevel(
+                sampler_LinearRepeat, float3(uv * material.maskMapST.xy + material.maskMapST.zw,
+                                             materialIndex), mipLevel);
+            uint metallicChannel = GIMaterialMetallicChannel(material);
+            uint roughnessChannel = GIMaterialRoughnessChannel(material);
+            if (metallicChannel != GI_MASK_CHANNEL_CONSTANT)
+                metallic = saturate(GISelectMaterialChannel(mask, metallicChannel, metallic) *
+                                    material.maskRemap0.x + material.maskRemap0.y);
+            if (roughnessChannel != GI_MASK_CHANNEL_CONSTANT)
+                roughness = saturate(GISelectMaterialChannel(mask, roughnessChannel, roughness) *
+                                     material.maskRemap0.z + material.maskRemap0.w);
+        }
     }
 
     GIGpuClipmapBrickData brick = _GITargetBrickData[physicalBrick];
@@ -377,7 +404,7 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
     // Only materials explicitly marked double-sided may illuminate from the back.
     // Applying abs(N.L) to every voxel turns occluded backfaces into emitters and is a
     // major source of light leaking in densely instanced geometry.
-    bool twoSided = (materialFlags & 1u) != 0u;
+    bool twoSided = (materialFlags & GI_MATERIAL_DOUBLE_SIDED) != 0u;
     float mainDot = dot(normal, -_GIMainLightDirection);
     float mainNoL = twoSided ? abs(mainDot) : saturate(mainDot);
     float mainVisibility = 1.0;
@@ -502,8 +529,12 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
     [unroll]
     for (uint outputLobe = 0u; outputLobe < GI_RADIANCE_LOBE_COUNT; outputLobe++)
     {
-        float hemisphere = dot(normal, GILobeAxis(outputLobe)) > -0.05 ? 1.0 : 0.0;
-        float3 nextRadiance = diffuseRadiance * hemisphere;
+        // Diffuse outgoing radiance is constant over the visible hemisphere. Encoding a
+        // hard hemisphere into six axis lobes underestimates diagonal normals because a
+        // valid outgoing direction can blend against a zeroed negative-axis lobe. Store
+        // the radiance in every lobe and enforce the hemisphere against the exact cached
+        // surface normal when reading it.
+        float3 nextRadiance = diffuseRadiance;
         uint previousPacked = _GITargetLayer == 0u
             ? _GIStaticRadiance[targetRadianceBase + outputLobe]
             : _GIDynamicRadiance[targetRadianceBase + outputLobe];

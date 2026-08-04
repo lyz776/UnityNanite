@@ -24,6 +24,7 @@ namespace Nanite
         const int EvictionGraceFrames = 30;
         public const int SlotBytes = 256 * 1024;
         public const int PageDecodeEntryBytes = 64;
+        public const int PageTableEntryBytes = 32;
         public const int ResidentPageEntryBytes = 32;
         // Draw-time layout: position.xyz + uv.xy + normal.xyz + tangent.xyzw.
         // NPG1 quantization/oct decode happens once on residency, never per pixel.
@@ -243,10 +244,16 @@ namespace Nanite
         GraphicsBuffer packedPoolBuffer;
         GraphicsBuffer residentVertexBuffer;
         GraphicsBuffer residentIndexBuffer;
+        GraphicsBuffer residentTriangleSubMeshBuffer;
         readonly ComputeBuffer[] pageTableBuffers = new ComputeBuffer[2];
         readonly ComputeBuffer[] pageDecodeBuffers = new ComputeBuffer[2];
         readonly ComputeBuffer[] residentPageTableBuffers = new ComputeBuffer[2];
         readonly ComputeBuffer[] residencyBitsetBuffers = new ComputeBuffer[2];
+        // RenderGraph can only import GraphicsBuffer.  These tables mirror the published
+        // front metadata, not geometry; resident vertex/index storage remains shared directly.
+        readonly GraphicsBuffer[] exportedPageTableBuffers = new GraphicsBuffer[2];
+        readonly GraphicsBuffer[] exportedResidentPageTableBuffers = new GraphicsBuffer[2];
+        readonly GraphicsBuffer[] exportedResidencyBitsetBuffers = new GraphicsBuffer[2];
         readonly ComputeBuffer[] requestBitsetBuffers = new ComputeBuffer[2];
         ComputeBuffer transcodeTaskBuffer;
         GpuPageTableEntry[] pageTableCpu = Array.Empty<GpuPageTableEntry>();
@@ -275,6 +282,8 @@ namespace Nanite
         uint[] requestBitsCpu = Array.Empty<uint>();
         int signature;
         uint generation;
+        ulong publishedTableEpoch;
+        int publishedTableFrame = -1;
         bool requestReadbackPending;
         int activeTableBufferIndex;
         int activeRequestBufferIndex;
@@ -372,6 +381,67 @@ namespace Nanite
             requestBitsetBuffers[1] != null &&
             PageCount > 0 &&
             SlotCount > 0;
+
+        /// <summary>
+        /// Returns the stable front table only. The view is read-only and valid for consumers
+        /// recorded into the current RenderGraph frame; page reuse remains protected by the
+        /// pool's existing retirement fences and per-page generation checks.
+        /// </summary>
+        public bool TryGetResidentPageReadOnlyView(out NaniteResidentPageReadOnlyView view)
+        {
+            view = new NaniteResidentPageReadOnlyView(
+                residentVertexBuffer,
+                residentIndexBuffer,
+                residentTriangleSubMeshBuffer,
+                exportedPageTableBuffers[activeTableBufferIndex],
+                exportedResidentPageTableBuffers[activeTableBufferIndex],
+                exportedResidencyBitsetBuffers[activeTableBufferIndex],
+                PageCount,
+                ResidentPageCount,
+                generation,
+                publishedTableEpoch,
+                publishedTableFrame);
+            return IsReady && view.IsValid;
+        }
+
+        public bool TryGetMeshIndex(NaniteMesh mesh, out int meshIndex)
+        {
+            meshIndex = -1;
+            if (mesh == null)
+                return false;
+            for (int pageId = 0; pageId < pages.Count; pageId++)
+            {
+                CpuPageRecord record = pages[pageId];
+                if (record.mesh != mesh)
+                    continue;
+                meshIndex = record.meshIndex;
+                return true;
+            }
+            return false;
+        }
+
+        public bool TryGetMeshPageRange(
+            NaniteMesh mesh, out int firstPageId, out int pageCount, out int meshIndex)
+        {
+            firstPageId = -1;
+            pageCount = 0;
+            meshIndex = -1;
+            if (mesh == null)
+                return false;
+            for (int pageId = 0; pageId < pages.Count; pageId++)
+            {
+                CpuPageRecord record = pages[pageId];
+                if (record.mesh != mesh)
+                    continue;
+                if (firstPageId < 0)
+                {
+                    firstPageId = pageId;
+                    meshIndex = record.meshIndex;
+                }
+                pageCount++;
+            }
+            return firstPageId >= 0 && pageCount > 0;
+        }
 
         /// <param name="maxPoolMiB">Hard upper budget. Actual allocation is capped to the
         /// number of registered pages, so small scenes do not reserve the entire budget.</param>
@@ -580,6 +650,7 @@ namespace Nanite
             packedPoolBuffer?.Dispose();
             residentVertexBuffer?.Dispose();
             residentIndexBuffer?.Dispose();
+            residentTriangleSubMeshBuffer?.Dispose();
             transcodeTaskBuffer?.Release();
             for (int i = 0; i < pageTableBuffers.Length; i++)
             {
@@ -587,10 +658,16 @@ namespace Nanite
                 pageDecodeBuffers[i]?.Release();
                 residentPageTableBuffers[i]?.Release();
                 residencyBitsetBuffers[i]?.Release();
+                exportedPageTableBuffers[i]?.Release();
+                exportedResidentPageTableBuffers[i]?.Release();
+                exportedResidencyBitsetBuffers[i]?.Release();
                 pageTableBuffers[i] = null;
                 pageDecodeBuffers[i] = null;
                 residentPageTableBuffers[i] = null;
                 residencyBitsetBuffers[i] = null;
+                exportedPageTableBuffers[i] = null;
+                exportedResidentPageTableBuffers[i] = null;
+                exportedResidencyBitsetBuffers[i] = null;
             }
             for (int i = 0; i < requestBitsetBuffers.Length; i++)
             {
@@ -600,6 +677,7 @@ namespace Nanite
             packedPoolBuffer = null;
             residentVertexBuffer = null;
             residentIndexBuffer = null;
+            residentTriangleSubMeshBuffer = null;
             transcodeTaskBuffer = null;
             pages.Clear();
             pageIdByKey.Clear();
@@ -621,6 +699,8 @@ namespace Nanite
             requestBitsCpu = Array.Empty<uint>();
             signature = 0;
             generation = 0;
+            publishedTableEpoch = 0;
+            publishedTableFrame = -1;
             requestReadbackPending = false;
             activeTableBufferIndex = 0;
             activeRequestBufferIndex = 0;
@@ -732,8 +812,16 @@ namespace Nanite
 
             // Capacity is immutable until scene membership changes, but is not over-reserved
             // for a small scene.
+            int pageTableEntryBytes = Marshal.SizeOf<GpuPageTableEntry>();
             int decodeEntryBytes = Marshal.SizeOf<GpuPageDecodeEntry>();
             int residentEntryBytes = Marshal.SizeOf<GpuResidentPageEntry>();
+            if (pageTableEntryBytes != PageTableEntryBytes)
+            {
+                Debug.LogError(
+                    $"[Nanite][PagePool] Page table ABI is {pageTableEntryBytes} bytes; " +
+                    $"expected {PageTableEntryBytes}.");
+                return false;
+            }
             if (decodeEntryBytes != PageDecodeEntryBytes)
             {
                 Debug.LogError(
@@ -803,6 +891,10 @@ namespace Nanite
                 GraphicsBuffer.Target.Structured,
                 Mathf.Max(1, (int)totalResidentIndices),
                 sizeof(uint));
+            residentTriangleSubMeshBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                Mathf.Max(1, (int)totalResidentIndices / 3),
+                sizeof(uint)) { name = "Nanite Resident Triangle SubMeshes" };
             ResidentGeometryBytes =
                 totalResidentVertices * ResidentVertexBytes + totalResidentIndices * sizeof(uint);
             int bitWordCount = Mathf.Max(1, (pages.Count + 31) / 32);
@@ -810,7 +902,7 @@ namespace Nanite
             {
                 pageTableBuffers[i] = new ComputeBuffer(
                     pages.Count,
-                    Marshal.SizeOf<GpuPageTableEntry>(),
+                    pageTableEntryBytes,
                     ComputeBufferType.Structured);
                 pageDecodeBuffers[i] = new ComputeBuffer(
                     pages.Count,
@@ -821,6 +913,21 @@ namespace Nanite
                     residentEntryBytes,
                     ComputeBufferType.Structured);
                 residencyBitsetBuffers[i] = new ComputeBuffer(bitWordCount, sizeof(uint));
+                exportedPageTableBuffers[i] = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, pages.Count, pageTableEntryBytes)
+                {
+                    name = $"Nanite Published Page Table {i}"
+                };
+                exportedResidentPageTableBuffers[i] = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, pages.Count, residentEntryBytes)
+                {
+                    name = $"Nanite Published Resident Page Table {i}"
+                };
+                exportedResidencyBitsetBuffers[i] = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured, bitWordCount, sizeof(uint))
+                {
+                    name = $"Nanite Published Residency Bits {i}"
+                };
             }
             transcodeTaskBuffer = new ComputeBuffer(
                 Mathf.Max(1, pages.Count),
@@ -1026,6 +1133,7 @@ namespace Nanite
             record.pinned = pin || record.pinned;
             record.lastTouchedFrame = record.pinned ? int.MaxValue : Time.frameCount;
             pages[pageId] = record;
+            UploadResidentTriangleSubMeshes(record);
 
             GpuPageTableEntry entry = pageTableCpu[pageId];
             entry.slotIndex = (uint)slotIndex;
@@ -1053,6 +1161,32 @@ namespace Nanite
             if (record.pinned)
                 PinnedPageCount++;
             return true;
+        }
+
+        void UploadResidentTriangleSubMeshes(CpuPageRecord record)
+        {
+            if (residentTriangleSubMeshBuffer == null || record.page == null ||
+                record.residentIndexBase < 0 || record.indexCount < 3)
+                return;
+            int triangleCount = record.indexCount / 3;
+            var subMeshes = new uint[triangleCount];
+            NaniteCluster[] clusters = record.page.clusterArray;
+            if (clusters != null)
+            {
+                for (int clusterIndex = 0; clusterIndex < clusters.Length; clusterIndex++)
+                {
+                    NaniteCluster cluster = clusters[clusterIndex];
+                    int first = Mathf.Clamp(cluster.indiceIndex / 3, 0, triangleCount);
+                    int last = Mathf.Clamp(
+                        (cluster.indiceIndex + cluster.indiceCount + 2) / 3,
+                        first, triangleCount);
+                    uint subMesh = (uint)Mathf.Max(0, cluster.subMeshId);
+                    for (int triangle = first; triangle < last; triangle++)
+                        subMeshes[triangle] = subMesh;
+                }
+            }
+            residentTriangleSubMeshBuffer.SetData(
+                subMeshes, 0, record.residentIndexBase / 3, triangleCount);
         }
 
         bool TryGetPackedPageBlob(
@@ -1679,6 +1813,9 @@ namespace Nanite
                 pageDecodeBuffers[i].SetData(pageDecodeCpu);
                 residentPageTableBuffers[i].SetData(residentPageTableCpu);
                 residencyBitsetBuffers[i].SetData(residencyBitsCpu);
+                exportedPageTableBuffers[i].SetData(pageTableCpu);
+                exportedResidentPageTableBuffers[i].SetData(residentPageTableCpu);
+                exportedResidencyBitsetBuffers[i].SetData(residencyBitsCpu);
             }
             requestBitsetBuffers[0].SetData(requestBitsCpu);
             requestBitsetBuffers[1].SetData(requestBitsCpu);
@@ -1687,6 +1824,8 @@ namespace Nanite
                 dirtyPageIdsByTable[i].Clear();
                 dirtyResidencyWordsByTable[i].Clear();
             }
+            publishedTableEpoch++;
+            publishedTableFrame = Time.frameCount;
         }
 
         void PublishTables()
@@ -1701,9 +1840,15 @@ namespace Nanite
             UploadDirtyRanges(pageDecodeBuffers[nextIndex], pageDecodeCpu, dirtyPages);
             UploadDirtyRanges(residentPageTableBuffers[nextIndex], residentPageTableCpu, dirtyPages);
             UploadDirtyRanges(residencyBitsetBuffers[nextIndex], residencyBitsCpu, dirtyWords);
+            UploadDirtyRanges(exportedPageTableBuffers[nextIndex], pageTableCpu, dirtyPages);
+            UploadDirtyRanges(
+                exportedResidentPageTableBuffers[nextIndex], residentPageTableCpu, dirtyPages);
+            UploadDirtyRanges(exportedResidencyBitsetBuffers[nextIndex], residencyBitsCpu, dirtyWords);
             dirtyPages.Clear();
             dirtyWords.Clear();
             activeTableBufferIndex = nextIndex;
+            publishedTableEpoch++;
+            publishedTableFrame = Time.frameCount;
         }
 
         void MarkPageDirty(int pageId)
@@ -1738,6 +1883,36 @@ namespace Nanite
                 return;
             dirtyRangeScratch.Sort();
 
+            int runStart = dirtyRangeScratch[0];
+            int runEnd = runStart + 1;
+            for (int i = 1; i <= dirtyRangeScratch.Count; i++)
+            {
+                if (i < dirtyRangeScratch.Count && dirtyRangeScratch[i] == runEnd)
+                {
+                    runEnd++;
+                    continue;
+                }
+                destination.SetData(source, runStart, runStart, runEnd - runStart);
+                if (i < dirtyRangeScratch.Count)
+                {
+                    runStart = dirtyRangeScratch[i];
+                    runEnd = runStart + 1;
+                }
+            }
+        }
+
+        void UploadDirtyRanges<T>(GraphicsBuffer destination, T[] source, HashSet<int> dirty)
+            where T : struct
+        {
+            if (destination == null || source == null || dirty == null || dirty.Count == 0)
+                return;
+            dirtyRangeScratch.Clear();
+            foreach (int index in dirty)
+                if ((uint)index < (uint)source.Length)
+                    dirtyRangeScratch.Add(index);
+            if (dirtyRangeScratch.Count == 0)
+                return;
+            dirtyRangeScratch.Sort();
             int runStart = dirtyRangeScratch[0];
             int runEnd = runStart + 1;
             for (int i = 1; i <= dirtyRangeScratch.Count; i++)

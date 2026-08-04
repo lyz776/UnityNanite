@@ -77,6 +77,7 @@ namespace RealtimeGI
             measuredSubtotalMs = clipmapTotalMs + diffuseTraceMs + specularTraceMs +
                                  specularFilterMs + upsampleMs;
 
+
             GIClipmapSystem clipmaps = GIClipmapSystem.Active;
             if (clipmaps == null)
                 return;

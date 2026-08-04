@@ -1936,3 +1936,46 @@ classification avoids executing every bin over the whole screen, but its compute
 only above the configured bin threshold. The hard scene material-ID limit is 65,535. Large projects
 should consolidate texture diversity with arrays/atlases or a bindless project resolve family rather
 than assuming unbounded unique textures have zero cost.
+
+## Delivery/performance position after the debug closure (2026-08-04)
+
+The current Windows DX12 path is a stable approximately 85-90% deliverable for the validated content,
+not the final performance shape of UE Nanite. The comparison “40,000 objects should be easy” is valid
+only when those objects have strong mesh/material reuse, modest visible pixel coverage, limited shadow
+work and cheap shading. It is not equivalent to 4K loss-preserving geometry, heterogeneous material
+instances/custom shader families, and four independent shadow cascades. In this project, instance
+submission is already GPU-resident and zero-readback; the expensive terms are visible triangles/pixels,
+material resolve bins, and repeated shadow cuts rather than the CPU count of GameObjects.
+
+The current `NaniteMaterialTileClassify.compute` is a UE5.0-style material-tile optimization: every
+tile accumulates family/Bloom masks and each compatibility bin owns a tile list plus an indirect draw.
+It avoids a full-screen pass per material but can still shade unrelated pixels within a touched tile,
+retains raster PSO/binding transitions, and allocates bin ranges by `bin * tileCount`. The GDC 2024
+UE5.4 design described in [GDC2024 UE5 Nanite GPU-driven materials](https://zhuanlan.zhihu.com/p/692851186)
+goes further: Count -> Reserve -> Scatter builds one compact screen-sized pixel-coordinate allocation,
+then compute shades only pixels belonging to each visible shading bin and writes GBuffer UAVs. Morton
+ordering and DCC-friendly complete block writes are part of that gain; merely changing tile size is not.
+
+There is therefore meaningful headroom, but only three large changes justify their engineering risk:
+
+1. Pixel Shade Binning plus compute GBuffer resolve, with visible-bin-only indirect dispatch and
+   compacted GPU command submission. This attacks heterogeneous material overdraw and empty
+   dispatch/PSO overhead; it is a renderer-architecture project, not a threshold tweak.
+2. Shadow queue reuse/caching and coarser caster admission so four cascades do not repeat a near-full
+   traversal/raster cut. Existing measurements identify shadows as the dominant remaining validated
+   cost, so this has higher priority than software raster on current NVIDIA hardware.
+3. Re-admit per-instance HZB only after the close-field holes are fixed and an A/B gate proves net GPU
+   benefit. The current HZB experiment is correctly off; turning it on for a better number would violate
+   the image contract.
+
+More compact VBuffer/attribute fetches and bindless texture tables can provide secondary wins. HW/SW
+hybrid raster is not a present priority: the compatibility software path is slower on the measured Ada
+GPU and remains cost-gated. Further LOD-error relaxation, half-resolution IDs, unconditional tile
+classify, or additional CPU-side batching are likely negative optimizations because they either damage
+the accepted image or add fixed work to a path already driven by indirect GPU queues.
+
+Decision gate: capture pass-level GPU timings for Formal Raster, Tile Classify/Resolve, four shadow
+cull/draw stages and post effects at 400, 4,000 and 40,000 strongly-instanced objects. Start Shade
+Binning only when material resolve/PSO overhead is a leading term; otherwise do shadow reuse first.
+This preserves the stable default while keeping a credible route beyond the present 4K/approximately
+100 FPS user measurement.

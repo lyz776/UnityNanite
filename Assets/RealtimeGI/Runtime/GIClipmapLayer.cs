@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -9,29 +8,13 @@ namespace RealtimeGI
     public sealed class GIClipmapLayer : IDisposable
     {
         readonly int capacity;
-        readonly Dictionary<GIClipmapBrickKey, int> allocations;
-        readonly Stack<int> freePhysicalIds;
-        readonly List<GIClipmapBrickKey> removalScratch = new List<GIClipmapBrickKey>(256);
-        readonly List<GIClipmapBrickKey> priorityScratch = new List<GIClipmapBrickKey>(1024);
-        readonly HashSet<GIClipmapBrickKey> selectedScratch = new HashSet<GIClipmapBrickKey>();
-        readonly List<int> dirtyPhysicalIds = new List<int>(256);
-        readonly HashSet<int> dirtyPhysicalSet = new HashSet<int>();
-        readonly HashSet<GIClipmapBrickKey> dirtyWorldBricks = new HashSet<GIClipmapBrickKey>();
-        readonly int[] pageTableCpu = new int[GIClipmapConstants.PageTableEntries];
-        readonly GIGpuClipmapBrickData[] brickDataCpu;
-        // Geometry/material changes must not wait behind a whole-world bounce sweep.  Keep
-        // urgent direct-light work separate from the background Jacobi iterations.
-        readonly Queue<GIClipmapBrickKey> urgentRadianceQueue = new Queue<GIClipmapBrickKey>(256);
-        readonly Queue<GIClipmapBrickKey> backgroundRadianceQueue = new Queue<GIClipmapBrickKey>(256);
-        readonly HashSet<GIClipmapBrickKey> urgentRadianceQueued = new HashSet<GIClipmapBrickKey>();
-        readonly HashSet<GIClipmapBrickKey> backgroundRadianceQueued = new HashSet<GIClipmapBrickKey>();
-        readonly List<int> radiancePhysicalIds = new List<int>(256);
 
         GraphicsBuffer pageTableBuffer;
         GraphicsBuffer occupancyBuffer;
         GraphicsBuffer surfaceBuffer;
         GraphicsBuffer surfaceUvBuffer;
         GraphicsBuffer surfaceIdentityBuffer;
+        GraphicsBuffer surfaceStableIdBuffer;
         GraphicsBuffer surfaceKeyBuffer;
         GraphicsBuffer distanceBuffer;
         GraphicsBuffer dirtyBrickBuffer;
@@ -41,8 +24,17 @@ namespace RealtimeGI
         GraphicsBuffer radianceDirtyBuffer;
         GraphicsBuffer lightCountBuffer;
         GraphicsBuffer lightIndexBuffer;
-        int dirtyCapacity;
-        int radianceDirtyCapacity;
+        GraphicsBuffer dirtyGenerationBuffer;
+        GraphicsBuffer voxelWorkQueueBuffer;
+        GraphicsBuffer voxelDispatchArgsBuffer;
+        GraphicsBuffer requiredPageMaskBuffer;
+        GraphicsBuffer requiredPageHashBuffer;
+        GraphicsBuffer physicalPageHashBuffer;
+        GraphicsBuffer physicalRadianceGenerationBuffer;
+        GraphicsBuffer freePageListBuffer;
+        GraphicsBuffer allocatorStateBuffer;
+        GraphicsBuffer pageDispatchArgsBuffer;
+        int voxelWorkCapacity;
         int lightsPerBrick;
 
         public GraphicsBuffer PageTableBuffer => pageTableBuffer;
@@ -50,6 +42,7 @@ namespace RealtimeGI
         public GraphicsBuffer SurfaceBuffer => surfaceBuffer;
         public GraphicsBuffer SurfaceUvBuffer => surfaceUvBuffer;
         public GraphicsBuffer SurfaceIdentityBuffer => surfaceIdentityBuffer;
+        public GraphicsBuffer SurfaceStableIdBuffer => surfaceStableIdBuffer;
         public GraphicsBuffer SurfaceKeyBuffer => surfaceKeyBuffer;
         public GraphicsBuffer DistanceBuffer => distanceBuffer;
         public GraphicsBuffer DirtyBrickBuffer => dirtyBrickBuffer;
@@ -59,24 +52,24 @@ namespace RealtimeGI
         public GraphicsBuffer RadianceDirtyBuffer => radianceDirtyBuffer;
         public GraphicsBuffer LightCountBuffer => lightCountBuffer;
         public GraphicsBuffer LightIndexBuffer => lightIndexBuffer;
+        public GraphicsBuffer DirtyGenerationBuffer => dirtyGenerationBuffer;
+        public GraphicsBuffer VoxelWorkQueueBuffer => voxelWorkQueueBuffer;
+        public GraphicsBuffer VoxelDispatchArgsBuffer => voxelDispatchArgsBuffer;
+        public GraphicsBuffer RequiredPageMaskBuffer => requiredPageMaskBuffer;
+        public GraphicsBuffer RequiredPageHashBuffer => requiredPageHashBuffer;
+        public GraphicsBuffer PhysicalPageHashBuffer => physicalPageHashBuffer;
+        public GraphicsBuffer PhysicalRadianceGenerationBuffer => physicalRadianceGenerationBuffer;
+        public GraphicsBuffer FreePageListBuffer => freePageListBuffer;
+        public GraphicsBuffer AllocatorStateBuffer => allocatorStateBuffer;
+        public GraphicsBuffer PageDispatchArgsBuffer => pageDispatchArgsBuffer;
+        public int VoxelWorkCapacity => voxelWorkCapacity;
         public int LightsPerBrick => lightsPerBrick;
-        public int DirtyBrickCount => dirtyPhysicalIds.Count;
-        public int RadianceDirtyCount => radiancePhysicalIds.Count;
-        public int PendingRadianceCount => urgentRadianceQueued.Count + backgroundRadianceQueued.Count;
-        public int AllocatedCount => allocations.Count;
         public int Capacity => capacity;
-        public int DroppedBrickCount { get; private set; }
+        public bool GpuAllocatorInitialized { get; private set; }
 
         public GIClipmapLayer(int capacity, string debugName)
         {
             this.capacity = Mathf.Max(1, capacity);
-            allocations = new Dictionary<GIClipmapBrickKey, int>(this.capacity);
-            freePhysicalIds = new Stack<int>(this.capacity);
-            for (int i = this.capacity - 1; i >= 0; i--)
-                freePhysicalIds.Push(i);
-            Array.Fill(pageTableCpu, -1);
-            brickDataCpu = new GIGpuClipmapBrickData[this.capacity];
-
             pageTableBuffer = NewBuffer(GIClipmapConstants.PageTableEntries, 4, debugName + " Page Table");
             occupancyBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.OccupancyWordsPerBrick, 4, debugName + " Occupancy");
@@ -86,6 +79,9 @@ namespace RealtimeGI
                 this.capacity * GIClipmapConstants.SurfaceUvWordsPerBrick, 4, debugName + " Surface UV0");
             surfaceIdentityBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.SurfaceIdentityWordsPerBrick, 4, debugName + " Surface Identity");
+            surfaceStableIdBuffer = NewBuffer(
+                this.capacity * GIClipmapConstants.SurfaceStableIdEntriesPerBrick, 8,
+                debugName + " Stable Object Surface ID");
             surfaceKeyBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.SurfaceKeyWordsPerBrick, 4, debugName + " Surface Candidate Key");
             distanceBuffer = NewBuffer(
@@ -95,252 +91,56 @@ namespace RealtimeGI
             validityBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.ValidityWordsPerBrick, 4, debugName + " Radiance Validity");
             brickDataBuffer = NewBuffer(this.capacity, GIClipmapConstants.BrickDataStride, debugName + " Brick Data");
-            dirtyBrickBuffer = NewBuffer(1, 4, debugName + " Dirty Bricks");
-            radianceDirtyBuffer = NewBuffer(1, 4, debugName + " Radiance Dirty Bricks");
-            dirtyCapacity = 1;
-            radianceDirtyCapacity = 1;
-            pageTableBuffer.SetData(pageTableCpu);
+            // GPU allocation produces both queues.  Allocate their hard capacity once so
+            // no CPU count/readback is needed to resize them in the frame loop.
+            dirtyBrickBuffer = NewBuffer(this.capacity, 4, debugName + " Dirty Bricks");
+            radianceDirtyBuffer = NewBuffer(this.capacity, 4, debugName + " Radiance Dirty Bricks");
+            dirtyGenerationBuffer = NewBuffer(this.capacity, 4, debugName + " Dirty Generation");
+            requiredPageMaskBuffer = NewBuffer(
+                GIClipmapConstants.PageTableEntries, 4, debugName + " Required Page Mask");
+            requiredPageHashBuffer = NewBuffer(
+                GIClipmapConstants.PageTableEntries, 4, debugName + " Required Page Hash");
+            physicalPageHashBuffer = NewBuffer(
+                this.capacity, 4, debugName + " Physical Page Hash");
+            physicalRadianceGenerationBuffer = NewBuffer(
+                this.capacity, 4, debugName + " Physical Radiance Generation");
+            freePageListBuffer = NewBuffer(this.capacity, 4, debugName + " Free Page List");
+            allocatorStateBuffer = NewBuffer(
+                GIClipmapConstants.AllocatorStateWords, 4, debugName + " Allocator State");
+            pageDispatchArgsBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured,
+                GIClipmapConstants.PageDispatchArgumentWords, 4)
+            {
+                name = debugName + " Page Dispatch Args"
+            };
+            // ResetPageAllocatorFrame initializes page ownership, free-list, hashes and
+            // indirect arguments before any consumer dispatch. No CPU allocation payload is
+            // uploaded here.
         }
 
-        public void UpdateRequired(
-            HashSet<GIClipmapBrickKey> required,
-            Vector3Int[] levelOrigins,
-            bool invalidateExisting)
+        public void MarkGpuAllocatorRecorded() => GpuAllocatorInitialized = true;
+
+        /// <summary>
+        /// Bounded GPU queue. One uint4 entry represents one cooperative 1024-triangle
+        /// instance/Page batch. Indirect xyz occupy the first three argument words, the
+        /// fourth is the overflow counter and the fifth stores the accepted linear count.
+        /// </summary>
+        public void EnsureVoxelWorkQueue(int requestedCapacity, string debugName)
         {
-            dirtyPhysicalIds.Clear();
-            dirtyPhysicalSet.Clear();
-            dirtyWorldBricks.Clear();
-            SelectRequiredByPriority(required, levelOrigins);
-            DroppedBrickCount = Mathf.Max(0, required.Count - selectedScratch.Count);
-            removalScratch.Clear();
-            foreach (KeyValuePair<GIClipmapBrickKey, int> pair in allocations)
-            {
-                if (!selectedScratch.Contains(pair.Key))
-                    removalScratch.Add(pair.Key);
-            }
-            for (int i = 0; i < removalScratch.Count; i++)
-            {
-                GIClipmapBrickKey key = removalScratch[i];
-                int physicalId = allocations[key];
-                allocations.Remove(key);
-                freePhysicalIds.Push(physicalId);
-            }
-
-            foreach (GIClipmapBrickKey key in selectedScratch)
-            {
-                if (allocations.TryGetValue(key, out int existing))
-                {
-                    if (invalidateExisting)
-                        AddDirty(key, existing);
-                    continue;
-                }
-                if (freePhysicalIds.Count == 0)
-                {
-                    DroppedBrickCount++;
-                    continue;
-                }
-                int physicalId = freePhysicalIds.Pop();
-                allocations.Add(key, physicalId);
-                brickDataCpu[physicalId] = new GIGpuClipmapBrickData
-                {
-                    worldBrick = key.worldBrick,
-                    level = (uint)key.level
-                };
-                AddDirty(key, physicalId);
-            }
-
-            Array.Fill(pageTableCpu, -1);
-            foreach (KeyValuePair<GIClipmapBrickKey, int> pair in allocations)
-            {
-                GIClipmapBrickKey key = pair.Key;
-                Vector3Int local = key.worldBrick - levelOrigins[key.level];
-                if ((uint)local.x >= (uint)GIClipmapConstants.BricksPerAxis ||
-                    (uint)local.y >= (uint)GIClipmapConstants.BricksPerAxis ||
-                    (uint)local.z >= (uint)GIClipmapConstants.BricksPerAxis)
-                    continue;
-                int address = key.level * GIClipmapConstants.BricksPerLevel +
-                              local.x + local.y * GIClipmapConstants.BricksPerAxis +
-                              local.z * GIClipmapConstants.BricksPerAxis * GIClipmapConstants.BricksPerAxis;
-                pageTableCpu[address] = pair.Value;
-            }
-            pageTableBuffer.SetData(pageTableCpu);
-            brickDataBuffer.SetData(brickDataCpu);
-            UploadDirtyList();
-        }
-
-        void SelectRequiredByPriority(
-            HashSet<GIClipmapBrickKey> required,
-            Vector3Int[] levelOrigins)
-        {
-            selectedScratch.Clear();
-            if (required.Count <= capacity)
-            {
-                selectedScratch.UnionWith(required);
+            int next = Mathf.Clamp(requestedCapacity, 1024, 1048576);
+            if (voxelWorkQueueBuffer != null && voxelDispatchArgsBuffer != null &&
+                voxelWorkCapacity == next)
                 return;
-            }
-
-            priorityScratch.Clear();
-            priorityScratch.AddRange(required);
-            priorityScratch.Sort((a, b) =>
+            voxelWorkQueueBuffer?.Release();
+            voxelDispatchArgsBuffer?.Release();
+            voxelWorkCapacity = next;
+            voxelWorkQueueBuffer = NewBuffer(next, 16, debugName + " Voxel Work Queue");
+            voxelDispatchArgsBuffer = new GraphicsBuffer(
+                GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured, 5, 4)
             {
-                int levelOrder = a.level.CompareTo(b.level);
-                if (levelOrder != 0)
-                    return levelOrder;
-                Vector3Int center = levelOrigins[a.level] +
-                                    Vector3Int.one * (GIClipmapConstants.BricksPerAxis / 2);
-                int aDistance = SquareDistance(a.worldBrick, center);
-                int bDistance = SquareDistance(b.worldBrick, center);
-                return aDistance.CompareTo(bDistance);
-            });
-            int count = Mathf.Min(capacity, priorityScratch.Count);
-            for (int i = 0; i < count; i++)
-                selectedScratch.Add(priorityScratch[i]);
-        }
-
-        static int SquareDistance(Vector3Int a, Vector3Int b)
-        {
-            int x = a.x - b.x;
-            int y = a.y - b.y;
-            int z = a.z - b.z;
-            return x * x + y * y + z * z;
-        }
-
-        public void MarkAllDirty()
-        {
-            dirtyPhysicalIds.Clear();
-            dirtyPhysicalSet.Clear();
-            dirtyWorldBricks.Clear();
-            foreach (KeyValuePair<GIClipmapBrickKey, int> pair in allocations)
-                AddDirty(pair.Key, pair.Value);
-            UploadDirtyList();
-        }
-
-        public void MarkDirty(IEnumerable<GIClipmapBrickKey> worldBricks)
-        {
-            if (worldBricks == null)
-                return;
-            foreach (GIClipmapBrickKey key in worldBricks)
-            {
-                if (allocations.TryGetValue(key, out int physicalId))
-                    AddDirty(key, physicalId);
-            }
-            UploadDirtyList();
-        }
-
-        public bool IsDirty(GIClipmapBrickKey key) => dirtyWorldBricks.Contains(key);
-
-        void AddDirty(GIClipmapBrickKey key, int physicalId)
-        {
-            dirtyWorldBricks.Add(key);
-            if (dirtyPhysicalSet.Add(physicalId))
-                dirtyPhysicalIds.Add(physicalId);
-            EnqueueRadiance(key, true);
-        }
-
-        public void EnqueueAllRadiance(
-            Vector3Int[] levelOrigins,
-            bool urgent,
-            bool resetOrder = false)
-        {
-            priorityScratch.Clear();
-            priorityScratch.AddRange(allocations.Keys);
-            priorityScratch.Sort((a, b) =>
-            {
-                int levelOrder = a.level.CompareTo(b.level);
-                if (levelOrder != 0)
-                    return levelOrder;
-                Vector3Int center = levelOrigins[a.level] +
-                                    Vector3Int.one * (GIClipmapConstants.BricksPerAxis / 2);
-                return SquareDistance(a.worldBrick, center).CompareTo(
-                    SquareDistance(b.worldBrick, center));
-            });
-
-            // Rebuild once at startup so level 0/camera-near bricks become usable first.
-            // Later TOD/light revisions merge with the in-flight queue: restarting at brick
-            // zero every revision would permanently starve the rest of a large clipmap.
-            if (urgent && resetOrder)
-            {
-                urgentRadianceQueue.Clear();
-                backgroundRadianceQueue.Clear();
-                urgentRadianceQueued.Clear();
-                backgroundRadianceQueued.Clear();
-            }
-            for (int i = 0; i < priorityScratch.Count; i++)
-                EnqueueRadiance(priorityScratch[i], urgent);
-        }
-
-        void EnqueueRadiance(GIClipmapBrickKey key, bool urgent)
-        {
-            if (urgent)
-            {
-                // Promotion leaves a harmless stale entry in the background FIFO. Its set
-                // membership is removed so PrepareRadianceUpdates will skip it later.
-                backgroundRadianceQueued.Remove(key);
-                if (urgentRadianceQueued.Add(key))
-                    urgentRadianceQueue.Enqueue(key);
-            }
-            else if (!urgentRadianceQueued.Contains(key) && backgroundRadianceQueued.Add(key))
-            {
-                backgroundRadianceQueue.Enqueue(key);
-            }
-        }
-
-        public void PrepareRadianceUpdates(int budget)
-        {
-            radiancePhysicalIds.Clear();
-            int remaining = Mathf.Max(0, budget);
-            int physicalId;
-            while (remaining > 0 && TryDequeueRadiance(urgentRadianceQueue,
-                                                       urgentRadianceQueued, out physicalId))
-            {
-                radiancePhysicalIds.Add(physicalId);
-                remaining--;
-            }
-            while (remaining > 0 && TryDequeueRadiance(backgroundRadianceQueue,
-                                                       backgroundRadianceQueued, out physicalId))
-            {
-                radiancePhysicalIds.Add(physicalId);
-                remaining--;
-            }
-            int required = Mathf.NextPowerOfTwo(Mathf.Max(1, radiancePhysicalIds.Count));
-            if (radianceDirtyBuffer == null || radianceDirtyCapacity < required)
-            {
-                radianceDirtyBuffer?.Release();
-                radianceDirtyCapacity = required;
-                radianceDirtyBuffer = NewBuffer(required, 4, "GI Radiance Dirty Bricks");
-            }
-            if (radiancePhysicalIds.Count > 0)
-                radianceDirtyBuffer.SetData(radiancePhysicalIds, 0, 0, radiancePhysicalIds.Count);
-        }
-
-        bool TryDequeueRadiance(
-            Queue<GIClipmapBrickKey> queue,
-            HashSet<GIClipmapBrickKey> queued,
-            out int physicalId)
-        {
-            while (queue.Count > 0)
-            {
-                GIClipmapBrickKey key = queue.Dequeue();
-                if (!queued.Remove(key))
-                    continue;
-                if (allocations.TryGetValue(key, out physicalId))
-                    return true;
-            }
-            physicalId = -1;
-            return false;
-        }
-
-        void UploadDirtyList()
-        {
-            int required = Mathf.NextPowerOfTwo(Mathf.Max(1, dirtyPhysicalIds.Count));
-            if (dirtyBrickBuffer == null || dirtyCapacity < required)
-            {
-                dirtyBrickBuffer?.Release();
-                dirtyCapacity = required;
-                dirtyBrickBuffer = NewBuffer(required, 4, "GI Dirty Bricks");
-            }
-            if (dirtyPhysicalIds.Count > 0)
-                dirtyBrickBuffer.SetData(dirtyPhysicalIds, 0, 0, dirtyPhysicalIds.Count);
+                name = debugName + " Voxel Dispatch Args"
+            };
+            voxelDispatchArgsBuffer.SetData(new uint[] { 0u, 1u, 1u, 0u, 0u });
         }
 
         static GraphicsBuffer NewBuffer(int count, int stride, string name) =>
@@ -367,6 +167,7 @@ namespace RealtimeGI
             surfaceBuffer?.Release();
             surfaceUvBuffer?.Release();
             surfaceIdentityBuffer?.Release();
+            surfaceStableIdBuffer?.Release();
             surfaceKeyBuffer?.Release();
             distanceBuffer?.Release();
             dirtyBrickBuffer?.Release();
@@ -376,11 +177,22 @@ namespace RealtimeGI
             radianceDirtyBuffer?.Release();
             lightCountBuffer?.Release();
             lightIndexBuffer?.Release();
+            dirtyGenerationBuffer?.Release();
+            voxelWorkQueueBuffer?.Release();
+            voxelDispatchArgsBuffer?.Release();
+            requiredPageMaskBuffer?.Release();
+            requiredPageHashBuffer?.Release();
+            physicalPageHashBuffer?.Release();
+            physicalRadianceGenerationBuffer?.Release();
+            freePageListBuffer?.Release();
+            allocatorStateBuffer?.Release();
+            pageDispatchArgsBuffer?.Release();
             pageTableBuffer = null;
             occupancyBuffer = null;
             surfaceBuffer = null;
             surfaceUvBuffer = null;
             surfaceIdentityBuffer = null;
+            surfaceStableIdBuffer = null;
             surfaceKeyBuffer = null;
             distanceBuffer = null;
             dirtyBrickBuffer = null;
@@ -390,16 +202,19 @@ namespace RealtimeGI
             radianceDirtyBuffer = null;
             lightCountBuffer = null;
             lightIndexBuffer = null;
+            dirtyGenerationBuffer = null;
+            voxelWorkQueueBuffer = null;
+            voxelDispatchArgsBuffer = null;
+            requiredPageMaskBuffer = null;
+            requiredPageHashBuffer = null;
+            physicalPageHashBuffer = null;
+            physicalRadianceGenerationBuffer = null;
+            freePageListBuffer = null;
+            allocatorStateBuffer = null;
+            pageDispatchArgsBuffer = null;
+            GpuAllocatorInitialized = false;
+            voxelWorkCapacity = 0;
             lightsPerBrick = 0;
-            allocations.Clear();
-            freePhysicalIds.Clear();
-            dirtyPhysicalSet.Clear();
-            dirtyWorldBricks.Clear();
-            urgentRadianceQueue.Clear();
-            backgroundRadianceQueue.Clear();
-            urgentRadianceQueued.Clear();
-            backgroundRadianceQueued.Clear();
-            radiancePhysicalIds.Clear();
         }
     }
 }

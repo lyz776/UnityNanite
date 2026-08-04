@@ -789,3 +789,25 @@ no longer exposed; fallback resolves automatically from `NaniteMesh.sourceMesh`.
 Evidence: `Logs/proxy-material-refresh-audit.log`,
 `Logs/proxy-editor-interaction-audit.log`, `Logs/proxy-source-binding-build.log`, and
 `Logs/proxy-inspector-selection-smoke.log`.
+
+## 24. Game-view debug replay stability (2026-08-04)
+
+The Cluster/Triangle/Page visualization is now a final presentation overlay. New Renderer Features
+default it to `AfterRendering`, and runtime scheduling clamps an older serialized event to no earlier
+than `AfterRenderingPostProcessing`. Game-camera TAA or another temporal post pass can therefore no
+longer blend the lit history back over the diagnostic colors while the camera moves.
+
+The overlay also no longer replays geometry with exact fixed-function `ZTest LEqual` or writes the
+production depth attachment. That comparison rejected fragments when replay depth differed by a few
+ULPs under temporal camera jitter, producing the observed triangle-shaped patches of normal shading.
+The pass preserves camera color as a sparse `ReadWrite` attachment, samples the current camera depth,
+and applies a derivative-scaled depth tolerance in the pixel shader. Hidden Nanite surfaces still fail
+the comparison, so this does not turn the diagnostic into an x-ray view or perturb later depth users.
+
+An isolated Unity 6000.3.10f1 D3D12 Development Player completed 180 camera renders and captured 52
+frames while moving from close range to far range. The inspected frames retained continuous debug
+color on the visible car surfaces with no progressive lit-material invasion, foreground
+show-through, shader error, RenderGraph resource error, or device removal. Evidence:
+`Logs/debug-viz-build.log`, `Logs/debug-viz-motion-player.log`,
+`Logs/debug-viz-final-compile.log`, and `Validation/DebugVizMotion_20260804` in
+`D:/UnityNanite_CodexVerify`.

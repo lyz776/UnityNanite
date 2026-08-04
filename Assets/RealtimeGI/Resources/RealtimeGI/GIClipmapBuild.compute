@@ -1,7 +1,23 @@
 #pragma kernel ClearBricks
+#pragma kernel ClearBrickRadiance
+#pragma kernel ResetPageAllocatorFrame
+#pragma kernel InitializePhysicalPageAllocator
+#pragma kernel MarkRequiredPages
+#pragma kernel ReprojectResidentPages
+#pragma kernel AllocateRequiredPages
+#pragma kernel BuildDirtyWorkQueues
+#pragma kernel SanitizePendingBricks
+#pragma kernel BuildRadianceWorkQueue
+#pragma kernel AdvanceRadianceCursor
 #pragma kernel VoxelizeInstance
+#pragma kernel MarkDirtyBricks
+#pragma kernel ResetVoxelWorkQueue
+#pragma kernel BuildVoxelWorkQueue
+#pragma kernel ClampVoxelDispatchArgs
+#pragma kernel VoxelizeWorkQueue
 #pragma kernel InitializeDistance
 #pragma kernel PropagateDistance
+#pragma kernel FinalizeDirtyBricks
 #pragma target 5.0
 
 // Geometry, conservative distance, and cache invalidation build kernels.
@@ -9,25 +25,80 @@
 #include "../../Shaders/GISceneCommon.hlsl"
 #include "../../Shaders/GIClipmapCommon.hlsl"
 
-StructuredBuffer<uint> _GIDirtyBricks;
+RWStructuredBuffer<uint> _GIDirtyBricks;
+RWStructuredBuffer<uint> _GIRadianceDirtyBricks;
 RWStructuredBuffer<uint> _GIOccupancy;
 RWStructuredBuffer<uint> _GISurface;
 RWStructuredBuffer<uint> _GISurfaceUV;
 RWStructuredBuffer<uint> _GISurfaceIdentity;
+RWStructuredBuffer<uint2> _GISurfaceStableId;
 RWStructuredBuffer<uint> _GISurfaceKey;
 RWStructuredBuffer<uint> _GIDistance;
 RWStructuredBuffer<uint> _GIRadiance;
 RWStructuredBuffer<uint> _GIValidity;
 
 StructuredBuffer<GIInstanceData> _GIInstances;
+StructuredBuffer<GIGeometryData> _GIGeometries;
+StructuredBuffer<GIMaterialData> _GIMaterials;
 StructuredBuffer<GIMaterialBindingData> _GIMaterialBindings;
 StructuredBuffer<GIGeometryStreamData> _GIGeometryRanges;
 StructuredBuffer<float3> _GIVertices;
 StructuredBuffer<float2> _GIUVs;
 StructuredBuffer<uint> _GIIndices;
 StructuredBuffer<uint> _GITriangleSubMeshes;
+
+struct GINanitePageTableEntry
+{
+    uint slotIndex;
+    uint byteAddress;
+    uint packedBytes;
+    uint flags;
+    uint meshIndex;
+    uint localPageIndex;
+    uint generation;
+    uint reserved;
+};
+
+struct GINaniteResidentPageEntry
+{
+    uint vertexBase;
+    uint indexBase;
+    uint vertexCount;
+    uint indexCount;
+    uint flags;
+    uint generation;
+    uint reserved0;
+    uint reserved1;
+};
+
+struct GINaniteResidentVertex
+{
+    float3 position;
+    float2 uv;
+    float3 normal;
+    float4 tangent;
+};
+
+StructuredBuffer<GINanitePageTableEntry> _GINanitePageTable;
+StructuredBuffer<GINaniteResidentPageEntry> _GINaniteResidentPageTable;
+StructuredBuffer<uint> _GINaniteResidencyBits;
+StructuredBuffer<GINaniteResidentVertex> _GINaniteResidentVertices;
+StructuredBuffer<uint> _GINaniteResidentIndices;
+StructuredBuffer<uint> _GINaniteResidentTriangleSubMeshes;
 StructuredBuffer<GIClipmapLevelData> _GIClipmapLevels;
-StructuredBuffer<int> _GIPageTable;
+RWStructuredBuffer<int> _GIPageTable;
+RWStructuredBuffer<GIGpuClipmapBrickData> _GIBrickData;
+RWStructuredBuffer<uint> _GIRequiredPageMask;
+RWStructuredBuffer<uint> _GIRequiredPageHash;
+RWStructuredBuffer<uint> _GIPhysicalPageHash;
+RWStructuredBuffer<uint> _GIPhysicalRadianceGeneration;
+RWStructuredBuffer<uint> _GIFreePageList;
+RWStructuredBuffer<uint> _GIAllocatorState;
+RWStructuredBuffer<uint> _GIPageDispatchArgs;
+Texture2DArray<float4> _GIBaseColorTextures;
+Texture2DArray<float4> _GINormalTextures;
+Texture2DArray<float4> _GIMaskTextures;
+SamplerState sampler_LinearRepeat;
 
 uint _GIDirtyBrickCount;
 uint _GIInstanceIndex;
@@ -35,6 +106,342 @@ uint _GITriangleBase;
 uint _GIMaxCellsPerTriangle;
 uint _GIPropagationStep;
 uint _GIVoxelizePhase;
+uint _GIMaterialCount;
+uint _GITextureSliceCount;
+RWStructuredBuffer<uint> _GIDirtyGeneration;
+RWStructuredBuffer<uint4> _GIVoxelWorkQueue;
+RWStructuredBuffer<uint> _GIVoxelDispatchArgs;
+StructuredBuffer<uint4> _GIVoxelWorkQueueRead;
+StructuredBuffer<uint> _GIVoxelDispatchArgsRead;
+uint _GIInstanceCount;
+uint _GITargetDynamic;
+uint _GIVoxelWorkCapacity;
+uint _GIWorkGeneration;
+uint _GIPhysicalPageCapacity;
+uint _GIInitializeAllocator;
+uint _GIAllocationLevel;
+uint _GIRadianceBrickBudget;
+uint _GIDirtyBrickBudget;
+uint _GINanitePageCount;
+uint _GINanitePoolGeneration;
+uint _GINaniteGeometryReadyFlag;
+
+// A queue entry is deliberately larger than a single wave.  The old 64-triangle
+// entry exhausted the D3D dispatch-X limit after only 4.19M triangles and silently
+// discarded the tail of large Nanite cuts.  Sixteen cooperative iterations retain
+// enough independent work for occupancy while extending the same 1 MiB queue to
+// roughly 67M triangles.
+#define GI_VOXEL_TRIANGLES_PER_WORK_ITEM 1024u
+#define GI_VOXEL_DISPATCH_ROW_WIDTH 65535u
+
+#define GI_ALLOC_FREE_COUNT       0u
+#define GI_ALLOC_DIRTY_COUNT      1u
+#define GI_ALLOC_RADIANCE_COUNT   2u
+#define GI_ALLOC_ACTIVE_COUNT     3u
+#define GI_ALLOC_DROPPED_COUNT    4u
+#define GI_ALLOC_RADIANCE_CURSOR  5u
+#define GI_ALLOC_FRAME_GENERATION 6u
+#define GI_ALLOC_INITIALIZED      7u
+
+uint GIHashCandidate(uint value);
+
+uint GIPageAddress(uint levelIndex, int3 worldBrick)
+{
+    int3 localBrick = worldBrick - _GIClipmapLevels[levelIndex].originBrick;
+    return levelIndex * GI_BRICKS_PER_LEVEL + (uint)(
+        localBrick.x + localBrick.y * GI_BRICKS_PER_AXIS +
+        localBrick.z * GI_BRICKS_PER_AXIS * GI_BRICKS_PER_AXIS);
+}
+
+uint GIPageContentHash(GIInstanceData instance)
+{
+    GIGeometryData geometry = _GIGeometries[instance.geometryIndex];
+    GIGeometryStreamData stream = _GIGeometryRanges[instance.geometryIndex];
+    uint value = instance.objectId * 0x9e3779b9u ^
+                 instance.revision * 0x85ebca6bu ^
+                 instance.transformSignature * 0xc2b2ae35u ^
+                 geometry.sourceObjectId * 0x27d4eb2fu ^
+                 geometry.sourceRevision * 0x165667b1u ^ instance.flags ^
+                 stream.padding1 * 0xd3a2646cu ^ 0x6a09e667u;
+    [loop]
+    for (uint binding = 0u; binding < instance.materialBindingCount; binding++)
+    {
+        uint materialIndex = _GIMaterialBindings[
+            instance.firstMaterialBinding + binding].materialIndex;
+        if (materialIndex < _GIMaterialCount)
+        {
+            GIMaterialData material = _GIMaterials[materialIndex];
+            value ^= GIHashCandidate(material.materialId ^
+                material.geometryRevision * 0x94d049bbu ^
+                (binding + 1u) * 0x369dea0fu);
+        }
+    }
+    return GIHashCandidate(value) | 1u;
+}
+
+bool GIAppendDirty(uint physicalBrick)
+{
+    uint budget = min(_GIDirtyBrickBudget, _GIPhysicalPageCapacity);
+    uint observed = _GIAllocatorState[GI_ALLOC_DIRTY_COUNT];
+    [allow_uav_condition]
+    while (observed < budget)
+    {
+        uint original;
+        InterlockedCompareExchange(
+            _GIAllocatorState[GI_ALLOC_DIRTY_COUNT], observed, observed + 1u, original);
+        if (original == observed)
+        {
+            _GIDirtyBricks[observed] = physicalBrick;
+            InterlockedMax(_GIPageDispatchArgs[0], observed + 1u);
+            return true;
+        }
+        observed = original;
+    }
+    return false;
+}
+
+void GIAppendRadiance(uint physicalBrick)
+{
+    uint oldGeneration;
+    InterlockedExchange(_GIPhysicalRadianceGeneration[physicalBrick],
+                        _GIWorkGeneration, oldGeneration);
+    if (oldGeneration == _GIWorkGeneration)
+        return;
+    uint slot;
+    InterlockedAdd(_GIAllocatorState[GI_ALLOC_RADIANCE_COUNT], 1u, slot);
+    if (slot < min(_GIRadianceBrickBudget, _GIPhysicalPageCapacity))
+    {
+        _GIRadianceDirtyBricks[slot] = physicalBrick;
+        InterlockedMax(_GIPageDispatchArgs[3], slot + 1u);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ResetPageAllocatorFrame(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint index = dispatchId.x;
+    if (index < GI_CLIPMAP_LEVEL_COUNT * GI_BRICKS_PER_LEVEL)
+    {
+        _GIRequiredPageMask[index] = 0u;
+        _GIRequiredPageHash[index] = 0u;
+        _GIPageTable[index] = -1;
+    }
+    if (index == 0u)
+    {
+        _GIAllocatorState[GI_ALLOC_DIRTY_COUNT] = 0u;
+        _GIAllocatorState[GI_ALLOC_RADIANCE_COUNT] = 0u;
+        _GIAllocatorState[GI_ALLOC_ACTIVE_COUNT] = 0u;
+        _GIAllocatorState[GI_ALLOC_DROPPED_COUNT] = 0u;
+        _GIAllocatorState[GI_ALLOC_FRAME_GENERATION] = _GIWorkGeneration;
+        _GIPageDispatchArgs[0] = 0u;
+        _GIPageDispatchArgs[1] = 1u;
+        _GIPageDispatchArgs[2] = 1u;
+        _GIPageDispatchArgs[3] = 0u;
+        _GIPageDispatchArgs[4] = 1u;
+        _GIPageDispatchArgs[5] = 1u;
+    }
+}
+
+// Physical-pool initialization is separate from the per-frame logical-page reset.
+// Keeping these writes out of ResetPageAllocatorFrame holds both kernels below Unity's
+// eight-UAV D3D11 import limit without reintroducing a CPU allocator.
+[numthreads(64, 1, 1)]
+void InitializePhysicalPageAllocator(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (_GIInitializeAllocator == 0u)
+        return;
+    uint index = dispatchId.x;
+    if (index < _GIPhysicalPageCapacity)
+    {
+        _GIFreePageList[index] = _GIPhysicalPageCapacity - 1u - index;
+        _GIBrickData[index].worldBrick = 0;
+        _GIBrickData[index].level = 0xffffffffu;
+        _GIPhysicalPageHash[index] = 0u;
+        _GIPhysicalRadianceGeneration[index] = 0u;
+    }
+    if (index == 0u)
+    {
+        _GIAllocatorState[GI_ALLOC_FREE_COUNT] = _GIPhysicalPageCapacity;
+        _GIAllocatorState[GI_ALLOC_RADIANCE_CURSOR] = 0u;
+        _GIAllocatorState[GI_ALLOC_INITIALIZED] = 1u;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void MarkRequiredPages(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint instanceIndex = dispatchId.x;
+    if (instanceIndex >= _GIInstanceCount)
+        return;
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    bool dynamic = (instance.flags & GI_INSTANCE_DYNAMIC) != 0u;
+    if (dynamic != (_GITargetDynamic != 0u) ||
+        (instance.flags & (GI_INSTANCE_OCCLUDER | GI_INSTANCE_CONTRIBUTOR)) == 0u)
+        return;
+    float3 center = instance.worldBoundingSphere.xyz;
+    float radius = max(0.01, instance.worldBoundingSphere.w);
+    uint contentHash = GIPageContentHash(instance);
+    [loop]
+    for (uint levelIndex = 0u; levelIndex < GI_CLIPMAP_LEVEL_COUNT; levelIndex++)
+    {
+        GIClipmapLevelData level = _GIClipmapLevels[levelIndex];
+        float brickWorldSize = level.cellSize * GI_BRICK_SIZE;
+        int3 worldMin = max((int3)floor((center - radius.xxx) / brickWorldSize),
+                            level.originBrick);
+        int3 worldMax = min((int3)floor((center + radius.xxx) / brickWorldSize),
+                            level.originBrick + GI_BRICKS_PER_AXIS - 1);
+        if (any(worldMin > worldMax))
+            continue;
+        [loop]
+        for (int z = worldMin.z; z <= worldMax.z; z++)
+        [loop]
+        for (int y = worldMin.y; y <= worldMax.y; y++)
+        [loop]
+        for (int x = worldMin.x; x <= worldMax.x; x++)
+        {
+            uint address = GIPageAddress(levelIndex, int3(x, y, z));
+            InterlockedOr(_GIRequiredPageMask[address], 1u);
+            InterlockedXor(_GIRequiredPageHash[address], contentHash);
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ReprojectResidentPages(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint physicalBrick = dispatchId.x;
+    if (physicalBrick >= _GIPhysicalPageCapacity)
+        return;
+    GIGpuClipmapBrickData brick = _GIBrickData[physicalBrick];
+    if (brick.level >= GI_CLIPMAP_LEVEL_COUNT)
+        return;
+    GIClipmapLevelData level = _GIClipmapLevels[brick.level];
+    int3 localBrick = brick.worldBrick - level.originBrick;
+    bool retained = all(localBrick >= 0) && all(localBrick < GI_BRICKS_PER_AXIS);
+    uint address = 0u;
+    if (retained)
+    {
+        address = GIPageAddress(brick.level, brick.worldBrick);
+        retained = _GIRequiredPageMask[address] != 0u;
+    }
+    if (!retained)
+    {
+        uint freeSlot;
+        InterlockedAdd(_GIAllocatorState[GI_ALLOC_FREE_COUNT], 1u, freeSlot);
+        if (freeSlot < _GIPhysicalPageCapacity)
+            _GIFreePageList[freeSlot] = physicalBrick;
+        _GIBrickData[physicalBrick].level = 0xffffffffu;
+        _GIPhysicalPageHash[physicalBrick] = 0u;
+        return;
+    }
+    InterlockedAdd(_GIAllocatorState[GI_ALLOC_ACTIVE_COUNT], 1u);
+    uint nextHash = _GIRequiredPageHash[address];
+    if (_GIPhysicalPageHash[physicalBrick] != nextHash)
+    {
+        _GIPhysicalPageHash[physicalBrick] = nextHash;
+        _GIDirtyGeneration[physicalBrick] = _GIWorkGeneration;
+    }
+    // Keep stale physical contents unreachable until this page wins the bounded dirty
+    // queue.  -1 means unowned; values <= -2 encode an owned but unpublished page.  Test
+    // the persistent dirty state as well as the hash: after the first waiting frame the
+    // hash already matches, but the page may still be outside this frame's rebuild budget.
+    if (_GIDirtyGeneration[physicalBrick] != 0u)
+        _GIPageTable[address] = -(int)physicalBrick - 2;
+    else
+        _GIPageTable[address] = (int)physicalBrick;
+}
+
+[numthreads(64, 1, 1)]
+void AllocateRequiredPages(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint localAddress = dispatchId.x;
+    if (localAddress >= GI_BRICKS_PER_LEVEL)
+        return;
+    uint address = _GIAllocationLevel * GI_BRICKS_PER_LEVEL + localAddress;
+    // A negative pending-page encoding still owns this logical address.  Only -1 is free;
+    // treating every negative value as unallocated leaked a second physical page while a
+    // budgeted rebuild was waiting.
+    if (_GIRequiredPageMask[address] == 0u || _GIPageTable[address] != -1)
+        return;
+    uint previousFreeCount;
+    InterlockedAdd(_GIAllocatorState[GI_ALLOC_FREE_COUNT], 0xffffffffu,
+                   previousFreeCount);
+    if (previousFreeCount == 0u)
+    {
+        InterlockedAdd(_GIAllocatorState[GI_ALLOC_FREE_COUNT], 1u);
+        InterlockedAdd(_GIAllocatorState[GI_ALLOC_DROPPED_COUNT], 1u);
+        return;
+    }
+    uint physicalBrick = _GIFreePageList[previousFreeCount - 1u];
+    uint xy = GI_BRICKS_PER_AXIS * GI_BRICKS_PER_AXIS;
+    uint z = localAddress / xy;
+    uint remainder = localAddress - z * xy;
+    uint y = remainder / GI_BRICKS_PER_AXIS;
+    uint x = remainder - y * GI_BRICKS_PER_AXIS;
+    _GIBrickData[physicalBrick].worldBrick =
+        _GIClipmapLevels[_GIAllocationLevel].originBrick + int3(x, y, z);
+    _GIBrickData[physicalBrick].level = _GIAllocationLevel;
+    _GIPhysicalPageHash[physicalBrick] = _GIRequiredPageHash[address];
+    _GIPageTable[address] = -(int)physicalBrick - 2;
+    InterlockedAdd(_GIAllocatorState[GI_ALLOC_ACTIVE_COUNT], 1u);
+    _GIDirtyGeneration[physicalBrick] = _GIWorkGeneration;
+}
+
+// Ownership/refit kernels only tag physical pages.  Queue emission is a separate GPU
+// scan so ReprojectResidentPages and AllocateRequiredPages never exceed eight UAVs.
+[numthreads(64, 1, 1)]
+void BuildDirtyWorkQueues(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint physicalBrick = dispatchId.x;
+    if (physicalBrick >= _GIPhysicalPageCapacity ||
+        _GIBrickData[physicalBrick].level >= GI_CLIPMAP_LEVEL_COUNT ||
+        _GIBrickData[physicalBrick].level != _GIAllocationLevel ||
+        _GIDirtyGeneration[physicalBrick] == 0u)
+        return;
+    if (GIAppendDirty(physicalBrick))
+    {
+        // Publish only pages selected by this frame's hard geometry budget.  The screen
+        // lighting pass executes after clear/voxel/distance/finalize, so it can never
+        // observe the transient contents exposed inside this compute command sequence.
+        GIGpuClipmapBrickData brick = _GIBrickData[physicalBrick];
+        uint address = GIPageAddress(brick.level, brick.worldBrick);
+        _GIPageTable[address] = (int)physicalBrick;
+        GIAppendRadiance(physicalBrick);
+    }
+}
+
+// ABI compatibility kernel.  Older live RendererFeature instances cache compute-kernel
+// indices across a shader-only hot reload.  Pending pages are now hidden through their
+// page-table encoding and this kernel is intentionally never dispatched, but retaining its
+// slot prevents every following kernel index from shifting under a running editor.
+[numthreads(1, 1, 1)]
+void SanitizePendingBricks(uint3 dispatchId : SV_DispatchThreadID)
+{
+}
+
+[numthreads(64, 1, 1)]
+void BuildRadianceWorkQueue(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint offset = dispatchId.x;
+    if (offset >= _GIPhysicalPageCapacity ||
+        _GIAllocatorState[GI_ALLOC_RADIANCE_COUNT] >= _GIRadianceBrickBudget)
+        return;
+    uint cursor = _GIAllocatorState[GI_ALLOC_RADIANCE_CURSOR];
+    uint physicalBrick = (cursor + offset) % _GIPhysicalPageCapacity;
+    if (_GIBrickData[physicalBrick].level >= GI_CLIPMAP_LEVEL_COUNT ||
+        _GIDirtyGeneration[physicalBrick] != 0u)
+        return;
+    GIAppendRadiance(physicalBrick);
+}
+
+[numthreads(1, 1, 1)]
+void AdvanceRadianceCursor(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint advance = max(1u, min(_GIRadianceBrickBudget, _GIPhysicalPageCapacity));
+    _GIAllocatorState[GI_ALLOC_RADIANCE_CURSOR] =
+        (_GIAllocatorState[GI_ALLOC_RADIANCE_CURSOR] + advance) %
+        max(1u, _GIPhysicalPageCapacity);
+}
 
 [numthreads(128, 1, 1)]
 void ClearBricks(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
@@ -47,15 +454,23 @@ void ClearBricks(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
         _GISurface[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
         _GISurfaceUV[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
         _GISurfaceIdentity[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
+        _GISurfaceStableId[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0u;
         _GISurfaceKey[physicalBrick * GI_SURFACE_WORDS_PER_BRICK + surfaceWord] = 0xffffffffu;
     }
     if (threadId.x < GI_OCCUPANCY_WORDS_PER_BRICK)
         _GIOccupancy[physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + threadId.x] = 0u;
     for (uint cell = threadId.x; cell < GI_CELLS_PER_BRICK; cell += 128u)
-    {
         _GIDistance[physicalBrick * GI_DISTANCE_WORDS_PER_BRICK + cell] = 255u;
+}
+
+[numthreads(128, 1, 1)]
+void ClearBrickRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIDirtyBrickCount)
+        return;
+    uint physicalBrick = _GIDirtyBricks[groupId.x];
+    for (uint cell = threadId.x; cell < GI_CELLS_PER_BRICK; cell += 128u)
         _GIValidity[physicalBrick * GI_CELLS_PER_BRICK + cell] = 0u;
-    }
     for (uint word = threadId.x; word < GI_RADIANCE_WORDS_PER_BRICK; word += 128u)
         _GIRadiance[physicalBrick * GI_RADIANCE_WORDS_PER_BRICK + word] = 0u;
 }
@@ -131,27 +546,114 @@ uint GIHashCandidate(uint value)
     return value;
 }
 
-uint GIMakeCandidateKey(uint triangleIndex, uint sampleTag, float distanceToSurface, float cellSize)
+uint GIMakeCandidateKey(uint instanceIndex, uint triangleIndex, uint sampleTag,
+                        float distanceToSurface, float cellSize)
 {
     // Distance owns the high bits so the closest conservative sample wins. The low hash
     // makes ties stable without depending on GPU wave/dispatch execution order.
     uint quantizedDistance = (uint)round(saturate(distanceToSurface / max(cellSize, 1e-5)) * 4095.0);
     uint stableHash = GIHashCandidate(
-        (_GIInstanceIndex + 1u) * 0x9e3779b9u ^ triangleIndex * 0x85ebca6bu ^ sampleTag * 0xc2b2ae35u);
+        (instanceIndex + 1u) * 0x9e3779b9u ^ triangleIndex * 0x85ebca6bu ^ sampleTag * 0xc2b2ae35u);
     return (quantizedDistance << 20u) | (stableHash & 0x000fffffu);
 }
 
-void GIWriteCell(uint levelIndex, int3 worldCell, uint packedSurface, uint packedUv,
+bool GIEvaluateVoxelMaterial(
+    uint materialIndex,
+    float2 uv,
+    float3 geometricNormal,
+    float3 tangent,
+    float3 bitangent,
+    uint levelIndex,
+    out uint packedSurface)
+{
+    packedSurface = 0u;
+    if (materialIndex >= _GIMaterialCount)
+        return true;
+
+    GIMaterialData material = _GIMaterials[materialIndex];
+    float mipLevel = min((float)levelIndex, 6.0);
+    float4 baseSample = 1.0;
+    float4 maskSample = 1.0;
+    if (materialIndex < _GITextureSliceCount &&
+        (material.flags & GI_MATERIAL_HAS_BASE_MAP) != 0u)
+    {
+        float2 baseUv = uv * material.baseMapST.xy + material.baseMapST.zw;
+        baseSample = _GIBaseColorTextures.SampleLevel(
+            sampler_LinearRepeat, float3(baseUv, materialIndex), mipLevel);
+    }
+    if (materialIndex < _GITextureSliceCount &&
+        (material.flags & GI_MATERIAL_HAS_MASK_MAP) != 0u)
+    {
+        float2 maskUv = uv * material.maskMapST.xy + material.maskMapST.zw;
+        maskSample = _GIMaskTextures.SampleLevel(
+            sampler_LinearRepeat, float3(maskUv, materialIndex), mipLevel);
+    }
+
+    if ((material.flags & GI_MATERIAL_ALPHA_TESTED) != 0u)
+    {
+        uint alphaSource = GIMaterialAlphaSource(material);
+        float alpha = baseSample.a * material.baseColor.a * material.surface.z;
+        if (alphaSource >= 1u && alphaSource <= 4u)
+        {
+            uint alphaChannel = alphaSource - 1u;
+            alpha = GISelectMaterialChannel(maskSample, alphaChannel, material.surface.z);
+            if (alphaChannel == GIMaterialOpacityChannel(material))
+                alpha = alpha * material.maskRemap1.x + material.maskRemap1.y;
+        }
+        else if (alphaSource == 5u)
+            alpha = material.surface.z;
+        if (alpha < material.surface.w)
+            return false;
+    }
+
+    float3 surfaceNormal = geometricNormal;
+    if (materialIndex < _GITextureSliceCount &&
+        (material.flags & GI_MATERIAL_HAS_NORMAL_MAP) != 0u)
+    {
+        float2 normalUv = uv * material.normalMapST.xy + material.normalMapST.zw;
+        float4 encodedNormal = _GINormalTextures.SampleLevel(
+            sampler_LinearRepeat, float3(normalUv, materialIndex), mipLevel);
+        // Desktop importers may store tangent normals as BC5 RG or legacy DXT5nm AG.
+        float2 packedNormalXY = encodedNormal.r > 0.99 && encodedNormal.a < 0.99
+            ? encodedNormal.wy : encodedNormal.xy;
+        float2 normalXY = (packedNormalXY * 2.0 - 1.0) * material.maskRemap1.z;
+        float3 tangentNormal = float3(normalXY, sqrt(saturate(1.0 - dot(normalXY, normalXY))));
+        surfaceNormal = normalize(tangent * tangentNormal.x +
+                                  bitangent * tangentNormal.y +
+                                  geometricNormal * tangentNormal.z);
+    }
+    packedSurface = 0x80000000u | ((materialIndex & 0x7fffu) << 16u) |
+                    GIPackOctNormal(surfaceNormal);
+    return true;
+}
+
+void GIWriteCell(uint instanceIndex, uint levelIndex, int3 worldCell, uint materialIndex, float2 uv,
+                 float3 geometricNormal, float3 tangent, float3 bitangent,
                  uint triangleIndex, uint sampleTag, float distanceToSurface)
 {
+    uint packedSurface;
+    if (!GIEvaluateVoxelMaterial(materialIndex, uv, geometricNormal, tangent, bitangent,
+                                 levelIndex, packedSurface))
+        return;
     GIClipmapLevelData level = _GIClipmapLevels[levelIndex];
     int physicalBrick;
     uint localCell;
-    if (!GIResolvePhysicalBrick(level, _GIPageTable, worldCell, physicalBrick, localCell))
+    int3 worldBrick = GIFloorDiv8(worldCell);
+    int3 localBrick = worldBrick - level.originBrick;
+    if (any(localBrick < 0) || any(localBrick >= GI_BRICKS_PER_AXIS))
+        return;
+    uint pageAddress = level.pageTableOffset + (uint)(
+        localBrick.x + localBrick.y * GI_BRICKS_PER_AXIS +
+        localBrick.z * GI_BRICKS_PER_AXIS * GI_BRICKS_PER_AXIS);
+    physicalBrick = _GIPageTable[pageAddress];
+    int3 localCellCoordinate = worldCell - worldBrick * GI_BRICK_SIZE;
+    localCell = (uint)(localCellCoordinate.x + localCellCoordinate.y * GI_BRICK_SIZE +
+        localCellCoordinate.z * GI_BRICK_SIZE * GI_BRICK_SIZE);
+    if (physicalBrick < 0)
         return;
     uint surfaceAddress = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
     uint candidateKey = GIMakeCandidateKey(
-        triangleIndex, sampleTag, distanceToSurface, level.cellSize);
+        instanceIndex, triangleIndex, sampleTag, distanceToSurface, level.cellSize);
     if (_GIVoxelizePhase == 0u)
     {
         uint ignored;
@@ -162,42 +664,153 @@ void GIWriteCell(uint levelIndex, int3 worldCell, uint packedSurface, uint packe
         return;
 
     _GISurface[surfaceAddress] = packedSurface;
-    _GISurfaceUV[surfaceAddress] = packedUv;
-    _GISurfaceIdentity[surfaceAddress] = _GIInstanceIndex + 1u;
+    _GISurfaceUV[surfaceAddress] = GIPackHalf2(uv);
+    _GISurfaceIdentity[surfaceAddress] = instanceIndex + 1u;
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    GIGeometryData geometry = _GIGeometries[instance.geometryIndex];
+    // geometryId is a transient table index and changes when unrelated scene geometry is
+    // inserted or removed. sourceObjectId identifies the backing Mesh/Nanite asset, so the
+    // object/surface key survives scene-table compaction and only changes for real revisions.
+    uint stableSurface = GIHashCandidate(
+        geometry.sourceObjectId * 0x9e3779b9u ^ triangleIndex * 0x85ebca6bu ^
+        geometry.sourceRevision * 0xc2b2ae35u ^ instance.revision * 0x27d4eb2fu ^
+        instance.transformSignature * 0x165667b1u);
+    GIGeometryStreamData stream = _GIGeometryRanges[instance.geometryIndex];
+    bool proxySurface = (stream.flags & GI_GEOMETRY_STREAM_NANITE_PROXY) != 0u &&
+                        (triangleIndex & 0x80000000u) == 0u;
+    // Reserve the high bit to identify a complete-mip proxy surface. Exact BVH hits use
+    // authoritative live-page primitive IDs; strict reconnection can then require the same
+    // object plus the exact segment distance without pretending the two triangle indices match.
+    stableSurface = (stableSurface & 0x7fffffffu) |
+                    (proxySurface ? 0x80000000u : 0u);
+    _GISurfaceStableId[surfaceAddress] = uint2(instance.objectId, stableSurface);
+    // Phase zero uses this word as the deterministic winner key.  Once the winner has
+    // committed, retain the exact local triangle index for bounded ray/triangle refinement.
+    _GISurfaceKey[surfaceAddress] = triangleIndex;
     uint occupancyAddress = (uint)physicalBrick * GI_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u;
     InterlockedOr(_GIOccupancy[occupancyAddress], 1u << (localCell & 31u));
 }
 
-[numthreads(64, 1, 1)]
-void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
+bool GINanitePageReady(uint pageId, uint expectedMeshIndex,
+                       out GINaniteResidentPageEntry resident)
 {
-    GIInstanceData instance = _GIInstances[_GIInstanceIndex];
-    GIGeometryStreamData range = _GIGeometryRanges[instance.geometryIndex];
-    uint triangleIndex = _GITriangleBase + dispatchId.x;
-    if (triangleIndex >= range.triangleCount)
-        return;
+    resident = (GINaniteResidentPageEntry)0;
+    if (pageId >= _GINanitePageCount)
+        return false;
+    GINanitePageTableEntry page = _GINanitePageTable[pageId];
+    resident = _GINaniteResidentPageTable[pageId];
+    uint residencyWord = _GINaniteResidencyBits[pageId >> 5u];
+    return page.meshIndex == expectedMeshIndex &&
+           page.generation == _GINanitePoolGeneration &&
+           resident.generation == _GINanitePoolGeneration &&
+           (page.flags & 1u) != 0u &&
+           (resident.flags & _GINaniteGeometryReadyFlag) != 0u &&
+           (residencyWord & (1u << (pageId & 31u))) != 0u;
+}
 
+uint GIEncodeNanitePrimitive(uint pageId, uint localTriangle)
+{
+    return 0x80000000u | ((pageId & 0x1ffffu) << 14u) |
+           (localTriangle & 0x3fffu);
+}
+
+bool GILoadVoxelTriangle(
+    GIGeometryStreamData range, uint triangleIndex, uint pageId,
+    out float3 localP0, out float3 localP1, out float3 localP2,
+    out float2 uv0, out float2 uv1, out float2 uv2,
+    out uint subMesh, out uint primitiveKey)
+{
+    localP0 = 0.0;
+    localP1 = 0.0;
+    localP2 = 0.0;
+    uv0 = 0.0;
+    uv1 = 0.0;
+    uv2 = 0.0;
+    subMesh = 0u;
+    primitiveKey = triangleIndex;
+    if ((range.flags & GI_GEOMETRY_STREAM_NANITE_RESIDENT_PAGES) != 0u &&
+        pageId != 0xffffffffu)
+    {
+        GINaniteResidentPageEntry resident;
+        if (!GINanitePageReady(pageId, range.padding0, resident) ||
+            triangleIndex >= resident.indexCount / 3u || triangleIndex >= 0x4000u)
+            return false;
+        uint firstIndex = resident.indexBase + triangleIndex * 3u;
+        uint i0 = _GINaniteResidentIndices[firstIndex];
+        uint i1 = _GINaniteResidentIndices[firstIndex + 1u];
+        uint i2 = _GINaniteResidentIndices[firstIndex + 2u];
+        GINaniteResidentVertex v0 = _GINaniteResidentVertices[i0];
+        GINaniteResidentVertex v1 = _GINaniteResidentVertices[i1];
+        GINaniteResidentVertex v2 = _GINaniteResidentVertices[i2];
+        localP0 = v0.position;
+        localP1 = v1.position;
+        localP2 = v2.position;
+        uv0 = v0.uv;
+        uv1 = v1.uv;
+        uv2 = v2.uv;
+        subMesh = _GINaniteResidentTriangleSubMeshes[firstIndex / 3u];
+        primitiveKey = GIEncodeNanitePrimitive(pageId, triangleIndex);
+        return true;
+    }
+    if (triangleIndex >= range.triangleCount)
+        return false;
     uint firstIndex = range.indexOffset + triangleIndex * 3u;
-    uint vertex0 = _GIIndices[firstIndex];
-    uint vertex1 = _GIIndices[firstIndex + 1u];
-    uint vertex2 = _GIIndices[firstIndex + 2u];
-    float3 p0 = mul(instance.localToWorld, float4(_GIVertices[vertex0], 1.0)).xyz;
-    float3 p1 = mul(instance.localToWorld, float4(_GIVertices[vertex1], 1.0)).xyz;
-    float3 p2 = mul(instance.localToWorld, float4(_GIVertices[vertex2], 1.0)).xyz;
-    float2 uv0 = _GIUVs[vertex0];
-    float2 uv1 = _GIUVs[vertex1];
-    float2 uv2 = _GIUVs[vertex2];
+    uint i0 = _GIIndices[firstIndex];
+    uint i1 = _GIIndices[firstIndex + 1u];
+    uint i2 = _GIIndices[firstIndex + 2u];
+    localP0 = _GIVertices[i0];
+    localP1 = _GIVertices[i1];
+    localP2 = _GIVertices[i2];
+    uv0 = _GIUVs[i0];
+    uv1 = _GIUVs[i1];
+    uv2 = _GIUVs[i2];
+    subMesh = _GITriangleSubMeshes[range.triangleOffset + triangleIndex];
+    return true;
+}
+
+void GIVoxelizeTriangle(uint instanceIndex, uint triangleIndex, uint pageId)
+{
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    GIGeometryStreamData range = _GIGeometryRanges[instance.geometryIndex];
+    float3 localP0, localP1, localP2;
+    float2 uv0, uv1, uv2;
+    uint subMesh;
+    uint primitiveKey;
+    if (!GILoadVoxelTriangle(range, triangleIndex, pageId,
+            localP0, localP1, localP2, uv0, uv1, uv2, subMesh, primitiveKey))
+        return;
+    float3 p0 = mul(instance.localToWorld, float4(localP0, 1.0)).xyz;
+    float3 p1 = mul(instance.localToWorld, float4(localP1, 1.0)).xyz;
+    float3 p2 = mul(instance.localToWorld, float4(localP2, 1.0)).xyz;
     float3 triangleCross = cross(p1 - p0, p2 - p0);
     float normalLengthSq = dot(triangleCross, triangleCross);
     if (normalLengthSq < 1e-12)
         return;
     float3 triangleNormal = triangleCross * rsqrt(normalLengthSq);
+    float3 edge1 = p1 - p0;
+    float3 edge2 = p2 - p0;
+    float2 uvEdge1 = uv1 - uv0;
+    float2 uvEdge2 = uv2 - uv0;
+    float uvDeterminant = uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x;
+    float3 triangleTangent;
+    float3 triangleBitangent;
+    if (abs(uvDeterminant) > 1e-8)
+    {
+        float inverseDeterminant = rcp(uvDeterminant);
+        triangleTangent = (edge1 * uvEdge2.y - edge2 * uvEdge1.y) * inverseDeterminant;
+        triangleTangent = normalize(triangleTangent - triangleNormal * dot(triangleNormal, triangleTangent));
+        float handedness = uvDeterminant < 0.0 ? -1.0 : 1.0;
+        triangleBitangent = normalize(cross(triangleNormal, triangleTangent)) * handedness;
+    }
+    else
+    {
+        float3 helperAxis = abs(triangleNormal.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+        triangleTangent = normalize(cross(helperAxis, triangleNormal));
+        triangleBitangent = normalize(cross(triangleNormal, triangleTangent));
+    }
 
-    uint subMesh = _GITriangleSubMeshes[range.triangleOffset + triangleIndex];
     uint bindingOffset = min(subMesh, max(1u, instance.materialBindingCount) - 1u);
     uint materialIndex = _GIMaterialBindings[instance.firstMaterialBinding + bindingOffset].materialIndex;
-    uint packedSurface = 0x80000000u | ((materialIndex & 0x7fffu) << 16u) |
-                         GIPackOctNormal(triangleNormal);
 
     [unroll]
     for (uint levelIndex = 0u; levelIndex < GI_CLIPMAP_LEVEL_COUNT; levelIndex++)
@@ -213,15 +826,15 @@ void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
             continue;
         if (candidateCount > _GIMaxCellsPerTriangle)
         {
-            GIWriteCell(levelIndex, (int3)floor(p0 / level.cellSize), packedSurface, GIPackHalf2(uv0),
-                        triangleIndex, 0u, 0.0);
-            GIWriteCell(levelIndex, (int3)floor(p1 / level.cellSize), packedSurface, GIPackHalf2(uv1),
-                        triangleIndex, 1u, 0.0);
-            GIWriteCell(levelIndex, (int3)floor(p2 / level.cellSize), packedSurface, GIPackHalf2(uv2),
-                        triangleIndex, 2u, 0.0);
-            GIWriteCell(levelIndex, (int3)floor(((p0 + p1 + p2) / 3.0) / level.cellSize),
-                        packedSurface, GIPackHalf2((uv0 + uv1 + uv2) / 3.0),
-                        triangleIndex, 3u, 0.0);
+            GIWriteCell(instanceIndex, levelIndex, (int3)floor(p0 / level.cellSize), materialIndex, uv0,
+                        triangleNormal, triangleTangent, triangleBitangent, primitiveKey, 0u, 0.0);
+            GIWriteCell(instanceIndex, levelIndex, (int3)floor(p1 / level.cellSize), materialIndex, uv1,
+                        triangleNormal, triangleTangent, triangleBitangent, primitiveKey, 1u, 0.0);
+            GIWriteCell(instanceIndex, levelIndex, (int3)floor(p2 / level.cellSize), materialIndex, uv2,
+                        triangleNormal, triangleTangent, triangleBitangent, primitiveKey, 2u, 0.0);
+            GIWriteCell(instanceIndex, levelIndex, (int3)floor(((p0 + p1 + p2) / 3.0) / level.cellSize),
+                        materialIndex, (uv0 + uv1 + uv2) / 3.0,
+                        triangleNormal, triangleTangent, triangleBitangent, primitiveKey, 3u, 0.0);
             continue;
         }
         float threshold = level.cellSize * 0.9;
@@ -236,11 +849,157 @@ void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
             if (dot(center - closest, center - closest) <= thresholdSq)
             {
                 float3 barycentric = GIBarycentric(closest, p0, p1, p2);
-                GIWriteCell(levelIndex, cell, packedSurface,
-                            GIPackHalf2(uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z),
-                            triangleIndex, 0u, length(center - closest));
+                GIWriteCell(instanceIndex, levelIndex, cell, materialIndex,
+                            uv0 * barycentric.x + uv1 * barycentric.y + uv2 * barycentric.z,
+                            triangleNormal, triangleTangent, triangleBitangent,
+                            primitiveKey, 0u, length(center - closest));
             }
         }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void VoxelizeInstance(uint3 dispatchId : SV_DispatchThreadID)
+{
+    GIVoxelizeTriangle(_GIInstanceIndex, _GITriangleBase + dispatchId.x, 0xffffffffu);
+}
+
+[numthreads(1, 1, 1)]
+void MarkDirtyBricks(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _GIDirtyBrickCount)
+        return;
+    _GIDirtyGeneration[_GIDirtyBricks[dispatchId.x]] = _GIWorkGeneration;
+}
+
+[numthreads(1, 1, 1)]
+void ResetVoxelWorkQueue(uint3 dispatchId : SV_DispatchThreadID)
+{
+    _GIVoxelDispatchArgs[0] = 0u;
+    _GIVoxelDispatchArgs[1] = 1u;
+    _GIVoxelDispatchArgs[2] = 1u;
+    _GIVoxelDispatchArgs[3] = 0u;
+    _GIVoxelDispatchArgs[4] = 0u;
+}
+
+bool GIInstanceTouchesDirtyBrick(GIInstanceData instance)
+{
+    float3 center = instance.worldBoundingSphere.xyz;
+    float radius = max(0.01, instance.worldBoundingSphere.w);
+    uint dirtyCount = min(_GIPageDispatchArgs[0], _GIDirtyBrickBudget);
+    [loop]
+    for (uint dirtyIndex = 0u; dirtyIndex < dirtyCount; dirtyIndex++)
+    {
+        uint physicalBrick = _GIDirtyBricks[dirtyIndex];
+        GIGpuClipmapBrickData brick = _GIBrickData[physicalBrick];
+        if (brick.level >= GI_CLIPMAP_LEVEL_COUNT)
+            continue;
+        GIClipmapLevelData level = _GIClipmapLevels[brick.level];
+        float brickWorldSize = level.cellSize * GI_BRICK_SIZE;
+        float3 boundsMin = (float3)brick.worldBrick * brickWorldSize;
+        float3 boundsMax = boundsMin + brickWorldSize;
+        float3 closest = clamp(center, boundsMin, boundsMax);
+        float3 offset = center - closest;
+        if (dot(offset, offset) <= radius * radius)
+            return true;
+    }
+    return false;
+}
+
+[numthreads(64, 1, 1)]
+void BuildVoxelWorkQueue(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint instanceIndex = dispatchId.x;
+    if (instanceIndex >= _GIInstanceCount)
+        return;
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    bool dynamic = (instance.flags & GI_INSTANCE_DYNAMIC) != 0u;
+    if (dynamic != (_GITargetDynamic != 0u) ||
+        (instance.flags & (GI_INSTANCE_OCCLUDER | GI_INSTANCE_CONTRIBUTOR)) == 0u ||
+        !GIInstanceTouchesDirtyBrick(instance))
+        return;
+    GIGeometryStreamData range = _GIGeometryRanges[instance.geometryIndex];
+    if ((range.flags & GI_GEOMETRY_STREAM_NANITE_RESIDENT_PAGES) != 0u &&
+        (range.flags & GI_GEOMETRY_STREAM_NANITE_PROXY) == 0u)
+    {
+        uint pageEnd = min(_GINanitePageCount, range.vertexOffset + range.indexOffset);
+        [loop]
+        for (uint pageId = range.vertexOffset; pageId < pageEnd; pageId++)
+        {
+            GINaniteResidentPageEntry resident;
+            if (!GINanitePageReady(pageId, range.padding0, resident))
+                continue;
+            uint groupCount = (resident.indexCount / 3u +
+                               GI_VOXEL_TRIANGLES_PER_WORK_ITEM - 1u) /
+                              GI_VOXEL_TRIANGLES_PER_WORK_ITEM;
+            [loop]
+            for (uint groupIndex = 0u; groupIndex < groupCount; groupIndex++)
+            {
+                uint queueIndex;
+                InterlockedAdd(_GIVoxelDispatchArgs[0], 1u, queueIndex);
+                if (queueIndex < _GIVoxelWorkCapacity)
+                {
+                    uint triangleBase = groupIndex * GI_VOXEL_TRIANGLES_PER_WORK_ITEM;
+                    _GIVoxelWorkQueue[queueIndex] = uint4(
+                        instanceIndex, pageId, triangleBase,
+                        min(GI_VOXEL_TRIANGLES_PER_WORK_ITEM,
+                            resident.indexCount / 3u - triangleBase));
+                }
+                else
+                    InterlockedAdd(_GIVoxelDispatchArgs[3], 1u);
+            }
+        }
+        return;
+    }
+    uint groupCount = (range.triangleCount +
+                       GI_VOXEL_TRIANGLES_PER_WORK_ITEM - 1u) /
+                      GI_VOXEL_TRIANGLES_PER_WORK_ITEM;
+    [loop]
+    for (uint groupIndex = 0u; groupIndex < groupCount; groupIndex++)
+    {
+        uint queueIndex;
+        InterlockedAdd(_GIVoxelDispatchArgs[0], 1u, queueIndex);
+        if (queueIndex < _GIVoxelWorkCapacity)
+        {
+            uint triangleBase = groupIndex * GI_VOXEL_TRIANGLES_PER_WORK_ITEM;
+            _GIVoxelWorkQueue[queueIndex] = uint4(
+                instanceIndex, 0xffffffffu, triangleBase,
+                min(GI_VOXEL_TRIANGLES_PER_WORK_ITEM,
+                    range.triangleCount - triangleBase));
+        }
+        else
+            InterlockedAdd(_GIVoxelDispatchArgs[3], 1u);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ClampVoxelDispatchArgs(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint acceptedCount = min(_GIVoxelDispatchArgs[0], _GIVoxelWorkCapacity);
+    _GIVoxelDispatchArgs[0] = min(acceptedCount, GI_VOXEL_DISPATCH_ROW_WIDTH);
+    _GIVoxelDispatchArgs[1] = acceptedCount > 0u
+        ? (acceptedCount + GI_VOXEL_DISPATCH_ROW_WIDTH - 1u) /
+          GI_VOXEL_DISPATCH_ROW_WIDTH
+        : 1u;
+    _GIVoxelDispatchArgs[2] = 1u;
+    // Indirect dispatch consumes only xyz.  Keep the accepted linear count in the
+    // fifth word so the partial final row cannot read stale queue entries.
+    _GIVoxelDispatchArgs[4] = acceptedCount;
+}
+
+[numthreads(64, 1, 1)]
+void VoxelizeWorkQueue(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint workIndex = groupId.x + groupId.y * GI_VOXEL_DISPATCH_ROW_WIDTH;
+    if (workIndex >= _GIVoxelDispatchArgsRead[4])
+        return;
+    uint4 work = _GIVoxelWorkQueueRead[workIndex];
+    [loop]
+    for (uint triangleOffset = threadId.x;
+         triangleOffset < work.w;
+         triangleOffset += 64u)
+    {
+        GIVoxelizeTriangle(work.x, work.z + triangleOffset, work.y);
     }
 }
 
@@ -294,4 +1053,26 @@ void PropagateDistance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThre
         best = min(best, neighbourDistance + (uint)stepSize);
     }
     _GIDistance[address] = min(best, 255u);
+}
+
+[numthreads(64, 1, 1)]
+void FinalizeDirtyBricks(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= _GIDirtyBrickCount)
+        return;
+    // Never publish a partially voxelized page. A queue overflow retains the selected
+    // pages as pending, so the next frame clears and retries them instead of exposing
+    // holes that would become persistent light leaks.
+    uint physicalBrick = _GIDirtyBricks[dispatchId.x];
+    if (_GIVoxelDispatchArgsRead[3] != 0u)
+    {
+        // BuildDirtyWorkQueues temporarily publishes selected pages so voxel writes can
+        // resolve the page table.  Hide them again when the work queue overflowed; the
+        // next frame will clear and retry rather than exposing partial geometry.
+        GIGpuClipmapBrickData brick = _GIBrickData[physicalBrick];
+        uint address = GIPageAddress(brick.level, brick.worldBrick);
+        _GIPageTable[address] = -(int)physicalBrick - 2;
+        return;
+    }
+    _GIDirtyGeneration[physicalBrick] = 0u;
 }

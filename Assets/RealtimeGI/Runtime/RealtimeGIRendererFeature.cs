@@ -25,7 +25,7 @@ namespace RealtimeGI
         {
             public bool enableInSceneView = true;
             public bool enableDiffuse = true;
-            [Tooltip("Linear diffuse buffer scale. 0.25 is the quality default; 0.125 is the performance fallback for 4K software tracing.")]
+            [Tooltip("Linear diffuse buffer scale. 0.25 is the supported production floor; 0.125 remains available only for diagnostics.")]
             [Range(0.125f, 0.5f)] public float diffuseResolutionScale = 0.25f;
             [Tooltip("Fresh path candidates per low-resolution pixel. ReSTIR is designed around one candidate; use resolution before increasing this value.")]
             [Range(1, 4)] public int diffuseRaysPerProbe = 1;
@@ -33,6 +33,8 @@ namespace RealtimeGI
             [Range(1, 4)] public int disocclusionRays = 3;
             [Tooltip("Maximum extra diffuse rays per camera and frame. At 4K/quarter resolution, 65536 is about 0.126 extra rays per low-resolution pixel.")]
             [Min(0)] public int disocclusionExtraRayBudget = 65536;
+            [Tooltip("Hard budget for strict world-space visibility refreshes. Valid paths cache visibility for at most four stable frames; candidates are distributed uniformly before this cap.")]
+            [Min(0)] public int diffuseVisibilityRayBudget = 16384;
             [Tooltip("Final denoiser history blend only. It no longer throttles candidate generation or changes reservoir M.")]
             [Range(0f, 0.98f)] public float diffuseHistoryWeight = 0.88f;
             [Min(0f)] public float diffuseIntensity = 1f;
@@ -58,6 +60,11 @@ namespace RealtimeGI
             [Range(0f, 1f)] public float minSpecularRoughness = 0f;
             [Range(0f, 1f)] public float maxSpecularRoughness = 1f;
             [Range(1, 8)] public int specularSpatialSamples = 4;
+            [Tooltip("Hard per-frame budget for uniformly distributed specular visibility refreshes. Stable validated paths are reused for at most four frames.")]
+            [Min(0)] public int specularVisibilityRayBudget = 32768;
+            [Tooltip("Hard per-frame cap for exact triangle refinement on fine-level, low-roughness hits.")]
+            [Min(0)] public int triangleRefinementRayBudget = 8192;
+            [Range(1, 16)] public int triangleRefinementCandidates = 8;
             [Tooltip("Diagnostic only: show clipmap-hit material base color instead of cached radiance.")]
             public bool debugHitMaterialColor;
             [Tooltip("Stage-isolation view. Final is the production output; other values identify the first pass that introduces an artifact.")]
@@ -76,6 +83,7 @@ namespace RealtimeGI
         GIInjectionStatePass resetInjectionPass;
         GIKeywordStatePass disableNativeReflectionsPass;
         GIKeywordStatePass restoreNativeReflectionsPass;
+        ClipmapUpdatePass clipmapUpdatePass;
         ScreenLightingPass pass;
         SceneColorHistoryPass sceneColorHistoryPass;
 
@@ -93,6 +101,10 @@ namespace RealtimeGI
             public readonly uint temporalReuseCandidates;
             public readonly uint spatialReuseCandidates;
             public readonly uint spatialVisibilityRejected;
+            public readonly uint disocclusionExtraAllocations;
+            public readonly uint specularVisibilityAttempts;
+            public readonly uint triangleRefinementAttempts;
+            public readonly uint diffuseVisibilityAttempts;
 
             internal TraceCounterSnapshot(uint[] values)
             {
@@ -111,6 +123,10 @@ namespace RealtimeGI
                 temporalReuseCandidates = values.Length > 9 ? values[9] : 0u;
                 spatialReuseCandidates = values.Length > 10 ? values[10] : 0u;
                 spatialVisibilityRejected = values.Length > 11 ? values[11] : 0u;
+                disocclusionExtraAllocations = values.Length > 12 ? values[12] : 0u;
+                specularVisibilityAttempts = values.Length > 13 ? values[13] : 0u;
+                triangleRefinementAttempts = values.Length > 14 ? values[14] : 0u;
+                diffuseVisibilityAttempts = values.Length > 15 ? values[15] : 0u;
             }
 
             public float AverageWorldSteps => worldHits + worldMisses > 0
@@ -284,6 +300,64 @@ namespace RealtimeGI
                 UnityEditor.EditorUtility.SetDirty(this);
 #endif
             }
+            if (settings.pipelineVersion < 19)
+            {
+                // Diffuse reprojection is now computed once and shared by trace/temporal/
+                // denoise; emissive proposal dimensions are low-discrepancy and high-energy
+                // reconnections receive conservative screen visibility.
+                settings.pipelineVersion = 19;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
+            if (settings.pipelineVersion < 20)
+            {
+                settings.specularVisibilityRayBudget = 131072;
+                settings.triangleRefinementRayBudget = 65536;
+                settings.triangleRefinementCandidates = 8;
+                settings.diffuseVisibilityRayBudget = 65536;
+                settings.pipelineVersion = 20;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
+            if (settings.pipelineVersion < 21)
+            {
+                // Visibility/refinement candidates are now distributed across the frame
+                // instead of being consumed in dispatch-row order. Persistent paths cache a
+                // successful validation for four stable frames, so the previous six-figure
+                // budgets only repeated identical world marches and caused a horizontal
+                // budget-exhaustion seam at 4K.
+                settings.specularVisibilityRayBudget = 32768;
+                settings.triangleRefinementRayBudget = 8192;
+                settings.diffuseVisibilityRayBudget = 16384;
+                settings.pipelineVersion = 21;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
+            if (settings.pipelineVersion < 22)
+            {
+                // Preserve the same default ray density as the old quarter-resolution
+                // 2x2 interleave, but stop running temporal/spatial/filter work for the
+                // three lanes which did not trace this frame.
+                settings.diffuseResolutionScale = 0.125f;
+                settings.pipelineVersion = 22;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
+            if (settings.pipelineVersion < 23)
+            {
+                // One-eighth resolution gives every sample an 8x8 full-resolution
+                // footprint and exposes persistent far-field block noise. Quarter
+                // resolution is the supported production floor.
+                settings.diffuseResolutionScale = 0.25f;
+                settings.pipelineVersion = 23;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
             if (settings.screenLightingShader == null)
                 settings.screenLightingShader = Resources.Load<ComputeShader>("RealtimeGI/GIScreenLighting");
             if (settings.compositeShader == null)
@@ -312,6 +386,10 @@ namespace RealtimeGI
             {
                 renderPassEvent = RenderPassEvent.AfterRendering
             };
+            clipmapUpdatePass = new ClipmapUpdatePass
+            {
+                renderPassEvent = RenderPassEvent.BeforeRenderingGbuffer
+            };
             pass?.Dispose();
             pass = new ScreenLightingPass
             {
@@ -336,6 +414,7 @@ namespace RealtimeGI
             resetInjectionPass = null;
             disableNativeReflectionsPass = null;
             restoreNativeReflectionsPass = null;
+            clipmapUpdatePass = null;
             sceneColorHistoryPass = null;
             CoreUtils.Destroy(compositeMaterial);
             compositeMaterial = null;
@@ -347,7 +426,7 @@ namespace RealtimeGI
         {
             if ((!settings.enableDiffuse && !settings.enableSpecular) || pass == null || prepareInjectionPass == null ||
                 resetInjectionPass == null || disableNativeReflectionsPass == null ||
-                restoreNativeReflectionsPass == null || sceneColorHistoryPass == null ||
+                restoreNativeReflectionsPass == null || clipmapUpdatePass == null || sceneColorHistoryPass == null ||
                 settings.screenLightingShader == null ||
                 compositeMaterial == null ||
                 !SystemInfo.supportsComputeShaders)
@@ -359,10 +438,13 @@ namespace RealtimeGI
             GIClipmapSystem clipmaps = GIClipmapSystem.Active;
             if (clipmaps == null || clipmaps.Scene == null)
                 return;
-            clipmaps.UpdateClipmaps();
+            if (!clipmaps.PrepareClipmaps())
+                return;
             if (!clipmaps.TryGetGpuView(out GIClipmapGpuView clipmapView) ||
                 !clipmaps.Scene.TryGetGpuView(out GISceneGpuView sceneView))
                 return;
+            clipmapUpdatePass.Setup(clipmaps);
+            renderer.EnqueuePass(clipmapUpdatePass);
             renderer.EnqueuePass(disableNativeReflectionsPass);
             renderer.EnqueuePass(prepareInjectionPass);
             pass.Setup(settings, compositeMaterial, clipmapView, sceneView);
@@ -372,6 +454,18 @@ namespace RealtimeGI
             renderer.EnqueuePass(resetInjectionPass);
             renderer.EnqueuePass(sceneColorHistoryPass);
             renderer.EnqueuePass(restoreNativeReflectionsPass);
+        }
+
+        sealed class ClipmapUpdatePass : ScriptableRenderPass
+        {
+            GIClipmapSystem owner;
+
+            public void Setup(GIClipmapSystem clipmaps) => owner = clipmaps;
+
+            public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+            {
+                owner?.RecordRenderGraph(renderGraph);
+            }
         }
 
         sealed class GIKeywordStatePass : ScriptableRenderPass
@@ -499,6 +593,11 @@ namespace RealtimeGI
             public readonly RTHandle[] reservoirStats = new RTHandle[2];
             public readonly RTHandle[] reservoirHit = new RTHandle[2];
             public readonly RTHandle[] specular = new RTHandle[2];
+            public readonly RTHandle[] specularReservoirRadiance = new RTHandle[2];
+            public readonly RTHandle[] specularReservoirRay = new RTHandle[2];
+            public readonly RTHandle[] specularReservoirHit = new RTHandle[2];
+            public readonly RTHandle[] specularReservoirStats = new RTHandle[2];
+            public readonly RTHandle[] specularReservoirId = new RTHandle[2];
             public RTHandle hzb;
             public RTHandle sceneColor;
             public bool sceneColorValid;
@@ -528,6 +627,7 @@ namespace RealtimeGI
                     specularWidth == nextSpecularWidth && specularHeight == nextSpecularHeight &&
                     diffuse[0] != null && diffuseMoments[0] != null &&
                     reservoirHit[0] != null && specular[0] != null &&
+                    specularReservoirId[0] != null &&
                     hzb != null && sceneColor != null)
                     return;
                 DisposeTextures();
@@ -552,13 +652,26 @@ namespace RealtimeGI
                         diffuseWidth, diffuseHeight, $"GI Diffuse Reservoir Ray {cameraName} {i}");
                     reservoirStats[i] = Allocate(
                         diffuseWidth, diffuseHeight, $"GI Diffuse Reservoir Stats {cameraName} {i}");
-                    reservoirHit[i] = Allocate(
+                    reservoirHit[i] = AllocatePathHit(
                         diffuseWidth, diffuseHeight, $"GI Diffuse Reservoir Hit Normal {cameraName} {i}");
                     specular[i] = RTHandles.Alloc(
                         fullWidth, fullHeight, 1, DepthBits.None,
                         GraphicsFormat.B10G11R11_UFloatPack32, FilterMode.Bilinear,
                         TextureWrapMode.Clamp, TextureDimension.Tex2D, true,
                         name: $"GI Specular History {cameraName} {i}");
+                    specularReservoirRadiance[i] = Allocate(
+                        specularWidth, specularHeight, $"GI Specular Reservoir Radiance {cameraName} {i}");
+                    specularReservoirRay[i] = Allocate(
+                        specularWidth, specularHeight, $"GI Specular Reservoir Ray {cameraName} {i}");
+                    specularReservoirHit[i] = Allocate(
+                        specularWidth, specularHeight, $"GI Specular Reservoir Hit {cameraName} {i}");
+                    specularReservoirStats[i] = Allocate(
+                        specularWidth, specularHeight, $"GI Specular Reservoir Stats {cameraName} {i}");
+                    specularReservoirId[i] = RTHandles.Alloc(
+                        specularWidth, specularHeight, 1, DepthBits.None,
+                        GraphicsFormat.R32G32_UInt, FilterMode.Point,
+                        TextureWrapMode.Clamp, TextureDimension.Tex2D, true,
+                        name: $"GI Specular Reservoir Stable ID {cameraName} {i}");
                 }
                 hzb = RTHandles.Alloc(
                     hzbWidth, hzbHeight, 1, DepthBits.None, GraphicsFormat.R32_SFloat,
@@ -578,6 +691,11 @@ namespace RealtimeGI
             static RTHandle Allocate(int width, int height, string name) => RTHandles.Alloc(
                 width, height, 1, DepthBits.None, GraphicsFormat.R16G16B16A16_SFloat,
                 FilterMode.Bilinear, TextureWrapMode.Clamp, TextureDimension.Tex2D,
+                true, name: name);
+
+            static RTHandle AllocatePathHit(int width, int height, string name) => RTHandles.Alloc(
+                width, height, 1, DepthBits.None, GraphicsFormat.R32G32B32A32_SFloat,
+                FilterMode.Point, TextureWrapMode.Clamp, TextureDimension.Tex2D,
                 true, name: name);
 
             public bool IsCameraCut(Camera camera)
@@ -611,6 +729,11 @@ namespace RealtimeGI
                     reservoirStats[i]?.Release();
                     reservoirHit[i]?.Release();
                     specular[i]?.Release();
+                    specularReservoirRadiance[i]?.Release();
+                    specularReservoirRay[i]?.Release();
+                    specularReservoirHit[i]?.Release();
+                    specularReservoirStats[i]?.Release();
+                    specularReservoirId[i]?.Release();
                     diffuse[i] = null;
                     diffuseMoments[i] = null;
                     geometry[i] = null;
@@ -619,6 +742,11 @@ namespace RealtimeGI
                     reservoirStats[i] = null;
                     reservoirHit[i] = null;
                     specular[i] = null;
+                    specularReservoirRadiance[i] = null;
+                    specularReservoirRay[i] = null;
+                    specularReservoirHit[i] = null;
+                    specularReservoirStats[i] = null;
+                    specularReservoirId[i] = null;
                 }
                 hzb?.Release();
                 sceneColor?.Release();
@@ -638,7 +766,8 @@ namespace RealtimeGI
             readonly Dictionary<int, CameraHistory> histories = new Dictionary<int, CameraHistory>();
             // Slot 12 is an always-on bounded allocator for disocclusion extra rays.
             // Slots 0..9 are diagnostics; 10..11 stay reserved for ABI compatibility.
-            static readonly uint[] ZeroTraceCounters = new uint[13];
+            // 13 is the strict specular visibility allocator; 14..15 are reserved.
+            static readonly uint[] ZeroTraceCounters = new uint[16];
             Settings settings;
             Material compositeMaterial;
             GIClipmapGpuView clipmapView;
@@ -660,6 +789,9 @@ namespace RealtimeGI
             int denoiseDiffuseKernel = -1;
             int filterDiffuseKernel = -1;
             int traceSpecularKernel = -1;
+            int refineSpecularKernel = -1;
+            int temporalSpecularReservoirKernel = -1;
+            int spatialSpecularReservoirKernel = -1;
             int resolveSpecularKernel = -1;
             int temporalSpecularKernel = -1;
             int spatialSpecularKernel = -1;
@@ -704,6 +836,9 @@ namespace RealtimeGI
                     denoiseDiffuseKernel = shader.FindKernel("DenoiseDiffuse");
                     filterDiffuseKernel = shader.FindKernel("FilterDiffuse");
                     traceSpecularKernel = shader.FindKernel("TraceSpecular");
+                    refineSpecularKernel = shader.FindKernel("RefineSpecular");
+                    temporalSpecularReservoirKernel = shader.FindKernel("TemporalSpecularReservoir");
+                    spatialSpecularReservoirKernel = shader.FindKernel("SpatialSpecularReservoir");
                     resolveSpecularKernel = shader.FindKernel("ResolveSpecular");
                     temporalSpecularKernel = shader.FindKernel("TemporalSpecular");
                     spatialSpecularKernel = shader.FindKernel("SpatialSpecular");
@@ -739,7 +874,7 @@ namespace RealtimeGI
                     var data = request.GetData<uint>();
                     if (data.Length < 5)
                         return;
-                    var values = new uint[12];
+                    var values = new uint[ZeroTraceCounters.Length];
                     int count = Mathf.Min(values.Length, data.Length);
                     for (int i = 0; i < count; i++) values[i] = data[i];
                     LatestTraceCounters = new TraceCounterSnapshot(values);
@@ -756,7 +891,10 @@ namespace RealtimeGI
                                   $"validCache={LatestTraceCounters.validCacheHits}, " +
                                   $"invalidCache={LatestTraceCounters.invalidCacheHits}, " +
                                   $"temporalMatch={LatestTraceCounters.temporalMatches}, " +
-                                  $"temporalReuse={LatestTraceCounters.temporalReuseCandidates}");
+                                  $"temporalReuse={LatestTraceCounters.temporalReuseCandidates}, " +
+                                  $"strictDiffuse={LatestTraceCounters.diffuseVisibilityAttempts}, " +
+                                  $"strictSpecular={LatestTraceCounters.specularVisibilityAttempts}, " +
+                                  $"triangleRefine={LatestTraceCounters.triangleRefinementAttempts}");
                     }
 #endif
                 });
@@ -775,6 +913,9 @@ namespace RealtimeGI
                 public int denoiseDiffuseKernel;
                 public int filterDiffuseKernel;
                 public int traceSpecularKernel;
+                public int refineSpecularKernel;
+                public int temporalSpecularReservoirKernel;
+                public int spatialSpecularReservoirKernel;
                 public int resolveSpecularKernel;
                 public int temporalSpecularKernel;
                 public int spatialSpecularKernel;
@@ -790,6 +931,7 @@ namespace RealtimeGI
                 public TextureHandle currentDiffuseRay;
                 public TextureHandle currentDiffuseStats;
                 public TextureHandle currentDiffuseHit;
+                public TextureHandle currentDiffuseReprojection;
                 public TextureHandle temporalReservoirRadiance;
                 public TextureHandle temporalReservoirRay;
                 public TextureHandle temporalReservoirStats;
@@ -802,6 +944,24 @@ namespace RealtimeGI
                 public TextureHandle diffuseAtrous;
                 public TextureHandle currentSpecular;
                 public TextureHandle currentSpecularRay;
+                public TextureHandle currentSpecularHit;
+                public TextureHandle currentSpecularStats;
+                public TextureHandle currentSpecularId;
+                public TextureHandle specularReservoirRadianceRead;
+                public TextureHandle specularReservoirRadianceWrite;
+                public TextureHandle specularReservoirRayRead;
+                public TextureHandle specularReservoirRayWrite;
+                public TextureHandle specularReservoirHitRead;
+                public TextureHandle specularReservoirHitWrite;
+                public TextureHandle specularReservoirStatsRead;
+                public TextureHandle specularReservoirStatsWrite;
+                public TextureHandle specularReservoirIdRead;
+                public TextureHandle specularReservoirIdWrite;
+                public TextureHandle specularReservoirSpatialRadiance;
+                public TextureHandle specularReservoirSpatialRay;
+                public TextureHandle specularReservoirSpatialHit;
+                public TextureHandle specularReservoirSpatialStats;
+                public TextureHandle specularReservoirSpatialId;
                 public TextureHandle resolvedSpecular;
                 public TextureHandle resolvedSpecularRay;
                 public TextureHandle specularRead;
@@ -820,11 +980,17 @@ namespace RealtimeGI
                 public TextureHandle hzb;
                 public TextureHandle sceneColorHistory;
                 public TextureHandle fullLighting;
+                public TextureHandle materialBaseColorTextures;
+                public TextureHandle materialEmissionTextures;
+                public TextureHandle materialMaskTextures;
                 public GraphicsBuffer levelData;
                 public GraphicsBuffer staticPageTable;
                 public GraphicsBuffer staticOccupancy;
                 public GraphicsBuffer staticSurface;
+                public GraphicsBuffer staticSurfaceUv;
                 public GraphicsBuffer staticSurfaceIdentity;
+                public GraphicsBuffer staticSurfaceStableId;
+                public GraphicsBuffer staticSurfacePrimitive;
                 public GraphicsBuffer staticDistance;
                 public GraphicsBuffer staticRadiance;
                 public GraphicsBuffer staticValidity;
@@ -833,7 +999,10 @@ namespace RealtimeGI
                 public GraphicsBuffer dynamicPageTable;
                 public GraphicsBuffer dynamicOccupancy;
                 public GraphicsBuffer dynamicSurface;
+                public GraphicsBuffer dynamicSurfaceUv;
                 public GraphicsBuffer dynamicSurfaceIdentity;
+                public GraphicsBuffer dynamicSurfaceStableId;
+                public GraphicsBuffer dynamicSurfacePrimitive;
                 public GraphicsBuffer dynamicDistance;
                 public GraphicsBuffer dynamicRadiance;
                 public GraphicsBuffer dynamicValidity;
@@ -841,6 +1010,28 @@ namespace RealtimeGI
                 public GraphicsBuffer dynamicLightIndices;
                 public GraphicsBuffer localLights;
                 public GraphicsBuffer materials;
+                public GraphicsBuffer instances;
+                public GraphicsBuffer geometries;
+                public GraphicsBuffer materialBindings;
+                public GraphicsBuffer geometryRanges;
+                public GraphicsBuffer vertices;
+                public GraphicsBuffer uvs;
+                public GraphicsBuffer indices;
+                public GraphicsBuffer triangleSubMeshes;
+                public GraphicsBuffer bvhNodes;
+                public GraphicsBuffer bvhPrimitives;
+                public GraphicsBuffer bvhRanges;
+                public int tlasNodeCount;
+                public int tlasNodeOffset;
+                public GraphicsBuffer nanitePageTable;
+                public GraphicsBuffer naniteResidentPageTable;
+                public GraphicsBuffer naniteResidencyBits;
+                public GraphicsBuffer naniteResidentVertices;
+                public GraphicsBuffer naniteResidentIndices;
+                public GraphicsBuffer naniteResidentTriangleSubMeshes;
+                public int nanitePageCount;
+                public int nanitePoolGeneration;
+                public int naniteGeometryReadyFlag;
                 public GraphicsBuffer emissiveAliases;
                 public GraphicsBuffer traceCounters;
                 public GraphicsBuffer diffuseMissQueue;
@@ -864,7 +1055,9 @@ namespace RealtimeGI
                 public int diffuseRays;
                 public int disocclusionRays;
                 public int disocclusionExtraRayBudget;
+                public int diffuseVisibilityRayBudget;
                 public int materialCount;
+                public int materialTextureSliceCount;
                 public int emissiveAliasCount;
                 public int localLightCount;
                 public int lightsPerBrick;
@@ -886,6 +1079,10 @@ namespace RealtimeGI
                 public float minSpecularRoughness;
                 public float maxSpecularRoughness;
                 public int specularSpatialSamples;
+                public int specularVisibilityRayBudget;
+                public int triangleRefinementRayBudget;
+                public int triangleRefinementCandidates;
+                public int instanceCount;
                 public bool enableDiffuse;
                 public bool enableSpecular;
                 public bool debugHitMaterialColor;
@@ -921,6 +1118,7 @@ namespace RealtimeGI
                 public TextureHandle specular;
                 public TextureHandle gBuffer0;
                 public TextureHandle gBuffer1;
+                public float specularIntensity;
             }
 
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -977,16 +1175,29 @@ namespace RealtimeGI
                 TextureHandle currentDiffuseRay = renderGraph.CreateTexture(lowDesc);
                 lowDesc.name = "GI Current Diffuse Reservoir Stats";
                 TextureHandle currentDiffuseStats = renderGraph.CreateTexture(lowDesc);
-                lowDesc.name = "GI Current Diffuse Reservoir Hit Normal";
-                TextureHandle currentDiffuseHit = renderGraph.CreateTexture(lowDesc);
+                TextureDesc diffuseHitDesc = lowDesc;
+                diffuseHitDesc.name = "GI Current Diffuse Reservoir Hit + Stable ID";
+                diffuseHitDesc.colorFormat = GraphicsFormat.R32G32B32A32_SFloat;
+                diffuseHitDesc.filterMode = FilterMode.Point;
+                TextureHandle currentDiffuseHit = renderGraph.CreateTexture(diffuseHitDesc);
+                TextureDesc reprojectionDesc = new TextureDesc(diffuseWidth, diffuseHeight)
+                {
+                    name = "GI Current Diffuse Reprojection",
+                    colorFormat = GraphicsFormat.R32_UInt,
+                    enableRandomWrite = true,
+                    clearBuffer = false,
+                    filterMode = FilterMode.Point
+                };
+                TextureHandle currentDiffuseReprojection =
+                    renderGraph.CreateTexture(reprojectionDesc);
                 lowDesc.name = "GI Temporal Reservoir Radiance Scratch";
                 TextureHandle temporalReservoirRadiance = renderGraph.CreateTexture(lowDesc);
                 lowDesc.name = "GI Temporal Reservoir Ray Scratch";
                 TextureHandle temporalReservoirRay = renderGraph.CreateTexture(lowDesc);
                 lowDesc.name = "GI Temporal Reservoir Stats Scratch";
                 TextureHandle temporalReservoirStats = renderGraph.CreateTexture(lowDesc);
-                lowDesc.name = "GI Temporal Reservoir Hit Scratch";
-                TextureHandle temporalReservoirHit = renderGraph.CreateTexture(lowDesc);
+                diffuseHitDesc.name = "GI Temporal Reservoir Hit + Stable ID Scratch";
+                TextureHandle temporalReservoirHit = renderGraph.CreateTexture(diffuseHitDesc);
                 TextureDesc specularLowDesc = new TextureDesc(specularWidth, specularHeight)
                 {
                     name = "GI Current Specular Radiance",
@@ -998,6 +1209,29 @@ namespace RealtimeGI
                 TextureHandle currentSpecular = renderGraph.CreateTexture(specularLowDesc);
                 specularLowDesc.name = "GI Current Specular Ray";
                 TextureHandle currentSpecularRay = renderGraph.CreateTexture(specularLowDesc);
+                specularLowDesc.name = "GI Current Specular Hit Payload";
+                TextureHandle currentSpecularHit = renderGraph.CreateTexture(specularLowDesc);
+                specularLowDesc.name = "GI Current Specular Reservoir Stats";
+                TextureHandle currentSpecularStats = renderGraph.CreateTexture(specularLowDesc);
+                specularLowDesc.name = "GI Spatial Specular Reservoir Radiance";
+                TextureHandle specularReservoirSpatialRadiance = renderGraph.CreateTexture(specularLowDesc);
+                specularLowDesc.name = "GI Spatial Specular Reservoir Ray";
+                TextureHandle specularReservoirSpatialRay = renderGraph.CreateTexture(specularLowDesc);
+                specularLowDesc.name = "GI Spatial Specular Reservoir Hit";
+                TextureHandle specularReservoirSpatialHit = renderGraph.CreateTexture(specularLowDesc);
+                specularLowDesc.name = "GI Spatial Specular Reservoir Stats";
+                TextureHandle specularReservoirSpatialStats = renderGraph.CreateTexture(specularLowDesc);
+                TextureDesc specularIdDesc = new TextureDesc(specularWidth, specularHeight)
+                {
+                    name = "GI Current Specular Stable ID",
+                    colorFormat = GraphicsFormat.R32G32_UInt,
+                    enableRandomWrite = true,
+                    clearBuffer = false,
+                    filterMode = FilterMode.Point
+                };
+                TextureHandle currentSpecularId = renderGraph.CreateTexture(specularIdDesc);
+                specularIdDesc.name = "GI Spatial Specular Reservoir Stable ID";
+                TextureHandle specularReservoirSpatialId = renderGraph.CreateTexture(specularIdDesc);
                 TextureDesc fullDesc = new TextureDesc(fullWidth, fullHeight)
                 {
                     name = "GI Full Resolution Irradiance",
@@ -1036,6 +1270,26 @@ namespace RealtimeGI
                 TextureHandle geometryWrite = renderGraph.ImportTexture(history.geometry[writeIndex]);
                 TextureHandle specularRead = renderGraph.ImportTexture(history.specular[readIndex]);
                 TextureHandle specularWrite = renderGraph.ImportTexture(history.specular[writeIndex]);
+                TextureHandle specularReservoirRadianceRead = renderGraph.ImportTexture(
+                    history.specularReservoirRadiance[readIndex]);
+                TextureHandle specularReservoirRadianceWrite = renderGraph.ImportTexture(
+                    history.specularReservoirRadiance[writeIndex]);
+                TextureHandle specularReservoirRayRead = renderGraph.ImportTexture(
+                    history.specularReservoirRay[readIndex]);
+                TextureHandle specularReservoirRayWrite = renderGraph.ImportTexture(
+                    history.specularReservoirRay[writeIndex]);
+                TextureHandle specularReservoirHitRead = renderGraph.ImportTexture(
+                    history.specularReservoirHit[readIndex]);
+                TextureHandle specularReservoirHitWrite = renderGraph.ImportTexture(
+                    history.specularReservoirHit[writeIndex]);
+                TextureHandle specularReservoirStatsRead = renderGraph.ImportTexture(
+                    history.specularReservoirStats[readIndex]);
+                TextureHandle specularReservoirStatsWrite = renderGraph.ImportTexture(
+                    history.specularReservoirStats[writeIndex]);
+                TextureHandle specularReservoirIdRead = renderGraph.ImportTexture(
+                    history.specularReservoirId[readIndex]);
+                TextureHandle specularReservoirIdWrite = renderGraph.ImportTexture(
+                    history.specularReservoirId[writeIndex]);
                 TextureHandle hzb = renderGraph.ImportTexture(history.hzb);
                 TextureHandle sceneColorHistory = renderGraph.ImportTexture(history.sceneColor);
 
@@ -1060,6 +1314,9 @@ namespace RealtimeGI
                     data.denoiseDiffuseKernel = denoiseDiffuseKernel;
                     data.filterDiffuseKernel = filterDiffuseKernel;
                     data.traceSpecularKernel = traceSpecularKernel;
+                    data.refineSpecularKernel = refineSpecularKernel;
+                    data.temporalSpecularReservoirKernel = temporalSpecularReservoirKernel;
+                    data.spatialSpecularReservoirKernel = spatialSpecularReservoirKernel;
                     data.resolveSpecularKernel = resolveSpecularKernel;
                     data.temporalSpecularKernel = temporalSpecularKernel;
                     data.spatialSpecularKernel = spatialSpecularKernel;
@@ -1077,6 +1334,7 @@ namespace RealtimeGI
                     data.currentDiffuseRay = currentDiffuseRay;
                     data.currentDiffuseStats = currentDiffuseStats;
                     data.currentDiffuseHit = currentDiffuseHit;
+                    data.currentDiffuseReprojection = currentDiffuseReprojection;
                     data.temporalReservoirRadiance = temporalReservoirRadiance;
                     data.temporalReservoirRay = temporalReservoirRay;
                     data.temporalReservoirStats = temporalReservoirStats;
@@ -1089,6 +1347,24 @@ namespace RealtimeGI
                     data.diffuseAtrous = diffuseAtrous;
                     data.currentSpecular = currentSpecular;
                     data.currentSpecularRay = currentSpecularRay;
+                    data.currentSpecularHit = currentSpecularHit;
+                    data.currentSpecularStats = currentSpecularStats;
+                    data.currentSpecularId = currentSpecularId;
+                    data.specularReservoirRadianceRead = specularReservoirRadianceRead;
+                    data.specularReservoirRadianceWrite = specularReservoirRadianceWrite;
+                    data.specularReservoirRayRead = specularReservoirRayRead;
+                    data.specularReservoirRayWrite = specularReservoirRayWrite;
+                    data.specularReservoirHitRead = specularReservoirHitRead;
+                    data.specularReservoirHitWrite = specularReservoirHitWrite;
+                    data.specularReservoirStatsRead = specularReservoirStatsRead;
+                    data.specularReservoirStatsWrite = specularReservoirStatsWrite;
+                    data.specularReservoirIdRead = specularReservoirIdRead;
+                    data.specularReservoirIdWrite = specularReservoirIdWrite;
+                    data.specularReservoirSpatialRadiance = specularReservoirSpatialRadiance;
+                    data.specularReservoirSpatialRay = specularReservoirSpatialRay;
+                    data.specularReservoirSpatialHit = specularReservoirSpatialHit;
+                    data.specularReservoirSpatialStats = specularReservoirSpatialStats;
+                    data.specularReservoirSpatialId = specularReservoirSpatialId;
                     data.resolvedSpecular = resolvedSpecular;
                     data.resolvedSpecularRay = resolvedSpecularRay;
                     data.specularRead = specularRead;
@@ -1107,11 +1383,17 @@ namespace RealtimeGI
                     data.hzb = hzb;
                     data.sceneColorHistory = sceneColorHistory;
                     data.fullLighting = fullLighting;
+                    data.materialBaseColorTextures = renderGraph.ImportTexture(clipmapView.baseColorTextures);
+                    data.materialEmissionTextures = renderGraph.ImportTexture(clipmapView.emissionTextures);
+                    data.materialMaskTextures = renderGraph.ImportTexture(clipmapView.maskTextures);
                     data.levelData = clipmapView.levelData;
                     data.staticPageTable = clipmapView.staticPageTable;
                     data.staticOccupancy = clipmapView.staticOccupancy;
                     data.staticSurface = clipmapView.staticSurface;
+                    data.staticSurfaceUv = clipmapView.staticSurfaceUv;
                     data.staticSurfaceIdentity = clipmapView.staticSurfaceIdentity;
+                    data.staticSurfaceStableId = clipmapView.staticSurfaceStableId;
+                    data.staticSurfacePrimitive = clipmapView.staticSurfacePrimitive;
                     data.staticDistance = clipmapView.staticDistance;
                     data.staticRadiance = clipmapView.staticRadiance;
                     data.staticValidity = clipmapView.staticValidity;
@@ -1120,7 +1402,10 @@ namespace RealtimeGI
                     data.dynamicPageTable = clipmapView.dynamicPageTable;
                     data.dynamicOccupancy = clipmapView.dynamicOccupancy;
                     data.dynamicSurface = clipmapView.dynamicSurface;
+                    data.dynamicSurfaceUv = clipmapView.dynamicSurfaceUv;
                     data.dynamicSurfaceIdentity = clipmapView.dynamicSurfaceIdentity;
+                    data.dynamicSurfaceStableId = clipmapView.dynamicSurfaceStableId;
+                    data.dynamicSurfacePrimitive = clipmapView.dynamicSurfacePrimitive;
                     data.dynamicDistance = clipmapView.dynamicDistance;
                     data.dynamicRadiance = clipmapView.dynamicRadiance;
                     data.dynamicValidity = clipmapView.dynamicValidity;
@@ -1128,6 +1413,30 @@ namespace RealtimeGI
                     data.dynamicLightIndices = clipmapView.dynamicLightIndices;
                     data.localLights = clipmapView.localLights;
                     data.materials = sceneView.materials;
+                    data.instances = sceneView.instances;
+                    data.geometries = sceneView.geometries;
+                    data.materialBindings = sceneView.materialBindings;
+                    data.geometryRanges = clipmapView.geometryRanges;
+                    data.vertices = clipmapView.vertices;
+                    data.uvs = clipmapView.uvs;
+                    data.indices = clipmapView.indices;
+                    data.triangleSubMeshes = clipmapView.triangleSubMeshes;
+                    data.bvhNodes = clipmapView.bvhNodes;
+                    data.bvhPrimitives = clipmapView.bvhPrimitives;
+                    data.bvhRanges = clipmapView.bvhRanges;
+                    data.tlasNodeCount = clipmapView.tlasNodeCount;
+                    data.tlasNodeOffset = clipmapView.tlasNodeOffset;
+                    data.nanitePageTable = clipmapView.nanitePageTable;
+                    data.naniteResidentPageTable = clipmapView.naniteResidentPageTable;
+                    data.naniteResidencyBits = clipmapView.naniteResidencyBits;
+                    data.naniteResidentVertices = clipmapView.naniteResidentVertices;
+                    data.naniteResidentIndices = clipmapView.naniteResidentIndices;
+                    data.naniteResidentTriangleSubMeshes =
+                        clipmapView.naniteResidentTriangleSubMeshes;
+                    data.nanitePageCount = clipmapView.nanitePageCount;
+                    data.nanitePoolGeneration = unchecked((int)clipmapView.nanitePoolGeneration);
+                    data.naniteGeometryReadyFlag =
+                        unchecked((int)clipmapView.naniteGeometryReadyFlag);
                     data.emissiveAliases = sceneView.emissiveAliases;
                     data.traceCounters = traceCounterBuffer;
                     data.diffuseMissQueue = diffuseMissQueue;
@@ -1154,7 +1463,10 @@ namespace RealtimeGI
                         ? settings.disocclusionRays : 1;
                     data.disocclusionExtraRayBudget = settings.enableDiffuse
                         ? Mathf.Max(0, settings.disocclusionExtraRayBudget) : 0;
+                    data.diffuseVisibilityRayBudget = settings.enableDiffuse
+                        ? Mathf.Max(0, settings.diffuseVisibilityRayBudget) : 0;
                     data.materialCount = sceneView.materialCount;
+                    data.materialTextureSliceCount = clipmapView.textureSliceCount;
                     data.emissiveAliasCount = sceneView.emissiveAliasCount;
                     data.localLightCount = clipmapView.localLightCount;
                     data.lightsPerBrick = clipmapView.lightsPerBrick;
@@ -1177,6 +1489,10 @@ namespace RealtimeGI
                     data.minSpecularRoughness = settings.minSpecularRoughness;
                     data.maxSpecularRoughness = settings.maxSpecularRoughness;
                     data.specularSpatialSamples = settings.specularSpatialSamples;
+                    data.specularVisibilityRayBudget = settings.specularVisibilityRayBudget;
+                    data.triangleRefinementRayBudget = settings.triangleRefinementRayBudget;
+                    data.triangleRefinementCandidates = settings.triangleRefinementCandidates;
+                    data.instanceCount = sceneView.instanceCount;
                     data.enableDiffuse = settings.enableDiffuse;
                     data.enableSpecular = settings.enableSpecular;
                     data.debugHitMaterialColor = settings.debugHitMaterialColor;
@@ -1193,6 +1509,7 @@ namespace RealtimeGI
                     builder.UseTexture(data.currentDiffuseRay, AccessFlags.ReadWrite);
                     builder.UseTexture(data.currentDiffuseStats, AccessFlags.ReadWrite);
                     builder.UseTexture(data.currentDiffuseHit, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.currentDiffuseReprojection, AccessFlags.ReadWrite);
                     builder.UseTexture(data.temporalReservoirRadiance, AccessFlags.ReadWrite);
                     builder.UseTexture(data.temporalReservoirRay, AccessFlags.ReadWrite);
                     builder.UseTexture(data.temporalReservoirStats, AccessFlags.ReadWrite);
@@ -1205,11 +1522,28 @@ namespace RealtimeGI
                     builder.UseTexture(data.diffuseAtrous, AccessFlags.ReadWrite);
                     builder.UseTexture(data.currentSpecular, AccessFlags.ReadWrite);
                     builder.UseTexture(data.currentSpecularRay, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.currentSpecularHit, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.currentSpecularStats, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.currentSpecularId, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirRadianceRead, AccessFlags.Read);
+                    builder.UseTexture(data.specularReservoirRadianceWrite, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirRayRead, AccessFlags.Read);
+                    builder.UseTexture(data.specularReservoirRayWrite, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirHitRead, AccessFlags.Read);
+                    builder.UseTexture(data.specularReservoirHitWrite, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirStatsRead, AccessFlags.Read);
+                    builder.UseTexture(data.specularReservoirStatsWrite, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirIdRead, AccessFlags.Read);
+                    builder.UseTexture(data.specularReservoirIdWrite, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirSpatialRadiance, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirSpatialRay, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirSpatialHit, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirSpatialStats, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularReservoirSpatialId, AccessFlags.ReadWrite);
                     builder.UseTexture(data.resolvedSpecular, AccessFlags.ReadWrite);
                     builder.UseTexture(data.resolvedSpecularRay, AccessFlags.ReadWrite);
                     builder.UseTexture(data.specularRead, AccessFlags.Read);
                     builder.UseTexture(data.specularWrite, AccessFlags.ReadWrite);
-                    builder.UseTexture(data.specularSpatial, AccessFlags.ReadWrite);
                     builder.UseTexture(data.reservoirRadianceRead, AccessFlags.Read);
                     builder.UseTexture(data.reservoirRadianceWrite, AccessFlags.ReadWrite);
                     builder.UseTexture(data.reservoirRayRead, AccessFlags.Read);
@@ -1223,10 +1557,36 @@ namespace RealtimeGI
                     builder.UseTexture(data.hzb, AccessFlags.ReadWrite);
                     builder.UseTexture(data.sceneColorHistory, AccessFlags.Read);
                     builder.UseTexture(data.fullLighting, AccessFlags.Write);
+                    builder.UseTexture(data.materialBaseColorTextures, AccessFlags.Read);
+                    builder.UseTexture(data.materialEmissionTextures, AccessFlags.Read);
+                    builder.UseTexture(data.materialMaskTextures, AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.levelData), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.staticSurfaceStableId), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.staticSurfacePrimitive), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicSurfaceStableId), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicSurfacePrimitive), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.instances), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.geometries), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.materialBindings), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.geometryRanges), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.vertices), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.uvs), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.indices), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.triangleSubMeshes), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.bvhNodes), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.bvhPrimitives), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.bvhRanges), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.nanitePageTable), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.naniteResidentPageTable), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.naniteResidencyBits), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.naniteResidentVertices), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.naniteResidentIndices), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(
+                        data.naniteResidentTriangleSubMeshes), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.staticPageTable), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.staticOccupancy), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.staticSurface), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.staticSurfaceUv), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.staticSurfaceIdentity), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.staticDistance), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.staticRadiance), AccessFlags.Read);
@@ -1236,6 +1596,7 @@ namespace RealtimeGI
                     builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicPageTable), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicOccupancy), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicSurface), AccessFlags.Read);
+                    builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicSurfaceUv), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicSurfaceIdentity), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicDistance), AccessFlags.Read);
                     builder.UseBuffer(renderGraph.ImportBuffer(data.dynamicRadiance), AccessFlags.Read);
@@ -1258,9 +1619,14 @@ namespace RealtimeGI
                 {
                     injectionData.material = compositeMaterial;
                     injectionData.irradiance = fullLighting;
-                    injectionData.specular = specularSpatial;
+                    // Reservoir spatial reuse already runs at ray resolution.  Temporal
+                    // resolve performs a deterministic cross reconstruction at 4K, so the
+                    // former second full-resolution random spatial pass was redundant.
+                    injectionData.specular = specularWrite;
                     injectionData.gBuffer0 = resources.gBuffer[0];
                     injectionData.gBuffer1 = resources.gBuffer[1];
+                    injectionData.specularIntensity = settings.enableSpecular
+                        ? settings.specularIntensity : 0f;
                     builder.UseTexture(injectionData.irradiance, AccessFlags.Read);
                     builder.UseTexture(injectionData.specular, AccessFlags.Read);
                     builder.UseTexture(injectionData.gBuffer0, AccessFlags.Read);
@@ -1275,6 +1641,8 @@ namespace RealtimeGI
                         context.cmd.SetGlobalTexture(ShaderIds.SpecularLightingTexture, data.specular);
                         context.cmd.SetGlobalTexture(ShaderIds.GBuffer0, data.gBuffer0);
                         context.cmd.SetGlobalTexture(ShaderIds.GBuffer1, data.gBuffer1);
+                        context.cmd.SetGlobalFloat(
+                            ShaderIds.SpecularIntensity, data.specularIntensity);
                         context.cmd.DrawProcedural(Matrix4x4.identity, data.material, 0,
                             MeshTopology.Triangles, 3, 1);
                     });
@@ -1315,13 +1683,26 @@ namespace RealtimeGI
                 cmd.SetComputeFloatParam(shader, ShaderIds.MinSpecularRoughness, data.minSpecularRoughness);
                 cmd.SetComputeFloatParam(shader, ShaderIds.MaxSpecularRoughness, data.maxSpecularRoughness);
                 cmd.SetComputeIntParam(shader, ShaderIds.SpecularSpatialSamples, data.specularSpatialSamples);
+                cmd.SetComputeIntParam(shader, ShaderIds.SpecularVisibilityBudget, data.specularVisibilityRayBudget);
+                cmd.SetComputeIntParam(shader, ShaderIds.TriangleRefinementBudget, data.triangleRefinementRayBudget);
+                cmd.SetComputeIntParam(shader, ShaderIds.TriangleRefinementCandidateLimit, data.triangleRefinementCandidates);
+                cmd.SetComputeIntParam(shader, ShaderIds.NanitePageCount, data.nanitePageCount);
+                cmd.SetComputeIntParam(shader, ShaderIds.NanitePoolGeneration,
+                    data.nanitePoolGeneration);
+                cmd.SetComputeIntParam(shader, ShaderIds.NaniteGeometryReadyFlag,
+                    data.naniteGeometryReadyFlag);
+                cmd.SetComputeIntParam(shader, ShaderIds.InstanceCount, data.instanceCount);
                 cmd.SetComputeIntParam(shader, ShaderIds.FrameIndex, data.frameIndex);
                 cmd.SetComputeIntParam(shader, ShaderIds.DiffuseRayCount, data.enableDiffuse ? data.diffuseRays : 1);
                 cmd.SetComputeIntParam(shader, ShaderIds.DisocclusionRayCount,
                     data.disocclusionRays);
                 cmd.SetComputeIntParam(shader, ShaderIds.DisocclusionExtraRayBudget,
                     data.disocclusionExtraRayBudget);
+                cmd.SetComputeIntParam(shader, ShaderIds.DiffuseVisibilityBudget,
+                    data.diffuseVisibilityRayBudget);
                 cmd.SetComputeIntParam(shader, ShaderIds.MaterialCount, data.materialCount);
+                cmd.SetComputeIntParam(shader, ShaderIds.MaterialTextureSliceCount,
+                    data.materialTextureSliceCount);
                 cmd.SetComputeIntParam(shader, ShaderIds.EmissiveAliasCount, data.emissiveAliasCount);
                 cmd.SetComputeIntParam(shader, ShaderIds.LocalLightCount, data.localLightCount);
                 cmd.SetComputeIntParam(shader, ShaderIds.MaxLightsPerBrick, data.lightsPerBrick);
@@ -1340,6 +1721,8 @@ namespace RealtimeGI
                 // Also resets the always-on disocclusion allocator in slot 12.
                 cmd.SetBufferData(data.traceCounters, ZeroTraceCounters);
 
+                if (data.enableDiffuse)
+                {
                 cmd.BeginSample("RealtimeGI/Build Screen HZB");
                 cmd.SetComputeVectorParam(shader, ShaderIds.HzbSourceSize,
                     new Vector4(data.fullWidth, data.fullHeight, 0f, 0f));
@@ -1382,6 +1765,8 @@ namespace RealtimeGI
                 cmd.SetComputeTextureParam(shader, data.traceDiffuseScreenKernel,
                     ShaderIds.CurrentDiffuseHit, data.currentDiffuseHit);
                 cmd.SetComputeTextureParam(shader, data.traceDiffuseScreenKernel,
+                    ShaderIds.CurrentDiffuseReprojection, data.currentDiffuseReprojection);
+                cmd.SetComputeTextureParam(shader, data.traceDiffuseScreenKernel,
                     ShaderIds.DiffuseHistoryRead, data.diffuseRead);
                 cmd.SetComputeTextureParam(shader, data.traceDiffuseScreenKernel,
                     ShaderIds.GeometryHistoryRead, data.geometryRead);
@@ -1416,13 +1801,12 @@ namespace RealtimeGI
                 cmd.EndSample("RealtimeGI/Diffuse Compact World Misses");
 
                 cmd.BeginSample("RealtimeGI/Diffuse Temporal");
-                BindScreenInputs(cmd, shader, data, data.temporalDiffuseKernel);
-                cmd.SetComputeBufferParam(shader, data.temporalDiffuseKernel,
-                    ShaderIds.Levels, data.levelData);
-                cmd.SetComputeBufferParam(shader, data.temporalDiffuseKernel,
-                    ShaderIds.TraceCounters, data.traceCounters);
-                cmd.SetComputeBufferParam(shader, data.temporalDiffuseKernel,
-                    ShaderIds.EmissiveAliases, data.emissiveAliases);
+                // Temporal reconnection is no longer a screen-only reprojection pass.
+                // Every finite reused path is traced back through the current clipmaps and,
+                // for the finest glossy cases, through the retained triangle primitive.
+                // Bind the complete scene view so a strict rejection never depends on a
+                // stale compute-shader binding left behind by another kernel.
+                BindSceneInputs(cmd, shader, data, data.temporalDiffuseKernel);
                 cmd.SetComputeTextureParam(shader, data.temporalDiffuseKernel, ShaderIds.CurrentDiffuseRead, data.currentDiffuse);
                 cmd.SetComputeTextureParam(shader, data.temporalDiffuseKernel,
                     ShaderIds.CurrentDiffuseRayRead, data.currentDiffuseRay);
@@ -1430,6 +1814,9 @@ namespace RealtimeGI
                     ShaderIds.CurrentDiffuseStatsRead, data.currentDiffuseStats);
                 cmd.SetComputeTextureParam(shader, data.temporalDiffuseKernel,
                     ShaderIds.CurrentDiffuseHitRead, data.currentDiffuseHit);
+                cmd.SetComputeTextureParam(shader, data.temporalDiffuseKernel,
+                    ShaderIds.CurrentDiffuseReprojectionRead,
+                    data.currentDiffuseReprojection);
                 cmd.SetComputeTextureParam(shader, data.temporalDiffuseKernel, ShaderIds.GeometryHistoryRead, data.geometryRead);
                 cmd.SetComputeTextureParam(shader, data.temporalDiffuseKernel,
                     ShaderIds.DiffuseReservoirRadianceRead, data.reservoirRadianceRead);
@@ -1458,6 +1845,10 @@ namespace RealtimeGI
                     DivRoundUp(data.diffuseWidth, 8), DivRoundUp(data.diffuseHeight, 8), 1);
 
                 cmd.BeginSample("RealtimeGI/Diffuse Spatial");
+                // Spatial diffuse is deliberately local: temporal reuse validates long
+                // reconnections, while this pass combines the aligned screen-probe lanes
+                // and tight coplanar neighbours. Avoid binding/traversing the complete
+                // TLAS/BLAS payload for every quarter-resolution pixel.
                 BindScreenInputs(cmd, shader, data, data.spatialDiffuseKernel);
                 cmd.SetComputeBufferParam(shader, data.spatialDiffuseKernel,
                     ShaderIds.Levels, data.levelData);
@@ -1496,7 +1887,13 @@ namespace RealtimeGI
                 cmd.SetComputeTextureParam(shader, data.denoiseDiffuseKernel,
                     ShaderIds.CurrentDiffuseRead, data.currentDiffuse);
                 cmd.SetComputeTextureParam(shader, data.denoiseDiffuseKernel,
-                    ShaderIds.CurrentDiffuseStatsRead, data.currentDiffuseStats);
+                    // SpatialDiffuse persists its final W/M/target/age directly. Reading
+                    // that history payload avoids three duplicate UAV writes in the
+                    // spatial kernel and keeps strict visibility under D3D11's UAV limit.
+                    ShaderIds.CurrentDiffuseStatsRead, data.reservoirStatsWrite);
+                cmd.SetComputeTextureParam(shader, data.denoiseDiffuseKernel,
+                    ShaderIds.CurrentDiffuseReprojectionRead,
+                    data.currentDiffuseReprojection);
                 cmd.SetComputeTextureParam(shader, data.denoiseDiffuseKernel,
                     ShaderIds.DiffuseHistoryRead, data.diffuseRead);
                 cmd.SetComputeTextureParam(shader, data.denoiseDiffuseKernel,
@@ -1530,7 +1927,10 @@ namespace RealtimeGI
                 cmd.DispatchCompute(shader, data.filterDiffuseKernel,
                     DivRoundUp(data.diffuseWidth, 8), DivRoundUp(data.diffuseHeight, 8), 1);
                 cmd.EndSample("RealtimeGI/Diffuse Geometry Filter");
+                }
 
+                if (data.enableSpecular)
+                {
                 cmd.BeginSample("RealtimeGI/Specular Trace");
                 BindSceneInputs(cmd, shader, data, data.traceSpecularKernel);
                 cmd.SetComputeTextureParam(shader, data.traceSpecularKernel,
@@ -1543,16 +1943,104 @@ namespace RealtimeGI
                     ShaderIds.CurrentSpecular, data.currentSpecular);
                 cmd.SetComputeTextureParam(shader, data.traceSpecularKernel,
                     ShaderIds.CurrentSpecularRay, data.currentSpecularRay);
+                cmd.SetComputeTextureParam(shader, data.traceSpecularKernel,
+                    ShaderIds.CurrentSpecularHit, data.currentSpecularHit);
+                cmd.SetComputeTextureParam(shader, data.traceSpecularKernel,
+                    ShaderIds.CurrentSpecularStats, data.currentSpecularStats);
+                cmd.SetComputeTextureParam(shader, data.traceSpecularKernel,
+                    ShaderIds.CurrentSpecularId, data.currentSpecularId);
                 cmd.DispatchCompute(shader, data.traceSpecularKernel,
                     DivRoundUp(data.specularWidth, 8), DivRoundUp(data.specularHeight, 8), 1);
                 cmd.EndSample("RealtimeGI/Specular Trace");
 
+                cmd.BeginSample("RealtimeGI/Specular Triangle Refine");
+                BindSceneInputs(cmd, shader, data, data.refineSpecularKernel);
+                cmd.SetComputeTextureParam(shader, data.refineSpecularKernel,
+                    ShaderIds.CurrentSpecular, data.currentSpecular);
+                cmd.SetComputeTextureParam(shader, data.refineSpecularKernel,
+                    ShaderIds.CurrentSpecularRay, data.currentSpecularRay);
+                cmd.SetComputeTextureParam(shader, data.refineSpecularKernel,
+                    ShaderIds.CurrentSpecularHit, data.currentSpecularHit);
+                cmd.SetComputeTextureParam(shader, data.refineSpecularKernel,
+                    ShaderIds.CurrentSpecularStats, data.currentSpecularStats);
+                cmd.SetComputeTextureParam(shader, data.refineSpecularKernel,
+                    ShaderIds.CurrentSpecularId, data.currentSpecularId);
+                cmd.DispatchCompute(shader, data.refineSpecularKernel,
+                    DivRoundUp(data.specularWidth, 8), DivRoundUp(data.specularHeight, 8), 1);
+                cmd.EndSample("RealtimeGI/Specular Triangle Refine");
+
+                cmd.BeginSample("RealtimeGI/Specular Reservoir Temporal");
+                BindSceneInputs(cmd, shader, data, data.temporalSpecularReservoirKernel);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.CurrentSpecularRead, data.currentSpecular);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.CurrentSpecularRayRead, data.currentSpecularRay);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.CurrentSpecularHitRead, data.currentSpecularHit);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.CurrentSpecularStatsRead, data.currentSpecularStats);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.CurrentSpecularIdRead, data.currentSpecularId);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirRadianceRead, data.specularReservoirRadianceRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirRayRead, data.specularReservoirRayRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirHitRead, data.specularReservoirHitRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirStatsRead, data.specularReservoirStatsRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirIdRead, data.specularReservoirIdRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirRadianceWrite, data.specularReservoirRadianceWrite);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirRayWrite, data.specularReservoirRayWrite);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirHitWrite, data.specularReservoirHitWrite);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirStatsWrite, data.specularReservoirStatsWrite);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirIdWrite, data.specularReservoirIdWrite);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.GeometryHistoryRead, data.geometryRead);
+                cmd.DispatchCompute(shader, data.temporalSpecularReservoirKernel,
+                    DivRoundUp(data.specularWidth, 8), DivRoundUp(data.specularHeight, 8), 1);
+                cmd.EndSample("RealtimeGI/Specular Reservoir Temporal");
+
+                cmd.BeginSample("RealtimeGI/Specular Reservoir Spatial");
+                BindSceneInputs(cmd, shader, data, data.spatialSpecularReservoirKernel);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirRadianceRead, data.specularReservoirRadianceWrite);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirRayRead, data.specularReservoirRayWrite);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirHitRead, data.specularReservoirHitWrite);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirStatsRead, data.specularReservoirStatsWrite);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirIdRead, data.specularReservoirIdWrite);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirSpatialRadiance, data.specularReservoirSpatialRadiance);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirSpatialRay, data.specularReservoirSpatialRay);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirSpatialHit, data.specularReservoirSpatialHit);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirSpatialStats, data.specularReservoirSpatialStats);
+                cmd.SetComputeTextureParam(shader, data.spatialSpecularReservoirKernel,
+                    ShaderIds.SpecularReservoirSpatialId, data.specularReservoirSpatialId);
+                cmd.DispatchCompute(shader, data.spatialSpecularReservoirKernel,
+                    DivRoundUp(data.specularWidth, 8), DivRoundUp(data.specularHeight, 8), 1);
+                cmd.EndSample("RealtimeGI/Specular Reservoir Spatial");
+
                 cmd.BeginSample("RealtimeGI/Specular Ray Resolve");
                 BindScreenInputs(cmd, shader, data, data.resolveSpecularKernel);
                 cmd.SetComputeTextureParam(shader, data.resolveSpecularKernel,
-                    ShaderIds.CurrentSpecularRead, data.currentSpecular);
+                    ShaderIds.SpecularReservoirSpatialRadiance, data.specularReservoirSpatialRadiance);
                 cmd.SetComputeTextureParam(shader, data.resolveSpecularKernel,
-                    ShaderIds.CurrentSpecularRayRead, data.currentSpecularRay);
+                    ShaderIds.SpecularReservoirSpatialRay, data.specularReservoirSpatialRay);
+                cmd.SetComputeTextureParam(shader, data.resolveSpecularKernel,
+                    ShaderIds.SpecularReservoirSpatialStats, data.specularReservoirSpatialStats);
                 cmd.SetComputeTextureParam(shader, data.resolveSpecularKernel,
                     ShaderIds.ResolvedSpecular, data.resolvedSpecular);
                 cmd.SetComputeTextureParam(shader, data.resolveSpecularKernel,
@@ -1577,15 +2065,7 @@ namespace RealtimeGI
                     DivRoundUp(data.fullWidth, 8), DivRoundUp(data.fullHeight, 8), 1);
                 cmd.EndSample("RealtimeGI/Specular Temporal");
 
-                cmd.BeginSample("RealtimeGI/Specular Spatial");
-                BindScreenInputs(cmd, shader, data, data.spatialSpecularKernel);
-                cmd.SetComputeTextureParam(shader, data.spatialSpecularKernel,
-                    ShaderIds.SpecularTemporalRead, data.specularWrite);
-                cmd.SetComputeTextureParam(shader, data.spatialSpecularKernel,
-                    ShaderIds.SpecularSpatial, data.specularSpatial);
-                cmd.DispatchCompute(shader, data.spatialSpecularKernel,
-                    DivRoundUp(data.fullWidth, 8), DivRoundUp(data.fullHeight, 8), 1);
-                cmd.EndSample("RealtimeGI/Specular Spatial");
+                }
 
                 cmd.BeginSample("RealtimeGI/Upsample");
                 BindScreenInputs(cmd, shader, data, data.upsampleKernel);
@@ -1622,7 +2102,10 @@ namespace RealtimeGI
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticPageTable, data.staticPageTable);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticOccupancy, data.staticOccupancy);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticSurface, data.staticSurface);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticSurfaceUv, data.staticSurfaceUv);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticSurfaceIdentity, data.staticSurfaceIdentity);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticSurfaceStableId, data.staticSurfaceStableId);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticSurfacePrimitive, data.staticSurfacePrimitive);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticDistance, data.staticDistance);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticRadiance, data.staticRadiance);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.StaticValidity, data.staticValidity);
@@ -1633,7 +2116,10 @@ namespace RealtimeGI
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicPageTable, data.dynamicPageTable);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicOccupancy, data.dynamicOccupancy);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicSurface, data.dynamicSurface);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicSurfaceUv, data.dynamicSurfaceUv);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicSurfaceIdentity, data.dynamicSurfaceIdentity);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicSurfaceStableId, data.dynamicSurfaceStableId);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicSurfacePrimitive, data.dynamicSurfacePrimitive);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicDistance, data.dynamicDistance);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicRadiance, data.dynamicRadiance);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.DynamicValidity, data.dynamicValidity);
@@ -1643,6 +2129,38 @@ namespace RealtimeGI
                     data.dynamicLightIndices);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.LocalLights, data.localLights);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.Materials, data.materials);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.Instances, data.instances);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.Geometries, data.geometries);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.MaterialBindings, data.materialBindings);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.GeometryRanges, data.geometryRanges);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.Vertices, data.vertices);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.Uvs, data.uvs);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.Indices, data.indices);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.TriangleSubMeshes, data.triangleSubMeshes);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.BvhNodes, data.bvhNodes);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.BvhPrimitives, data.bvhPrimitives);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.BvhRanges, data.bvhRanges);
+                cmd.SetComputeIntParam(shader, ShaderIds.TlasNodeCount, data.tlasNodeCount);
+                cmd.SetComputeIntParam(shader, ShaderIds.TlasNodeOffset, data.tlasNodeOffset);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.NanitePageTable,
+                    data.nanitePageTable);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.NaniteResidentPageTable,
+                    data.naniteResidentPageTable);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.NaniteResidencyBits,
+                    data.naniteResidencyBits);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.NaniteResidentVertices,
+                    data.naniteResidentVertices);
+                cmd.SetComputeBufferParam(shader, kernel, ShaderIds.NaniteResidentIndices,
+                    data.naniteResidentIndices);
+                cmd.SetComputeBufferParam(shader, kernel,
+                    ShaderIds.NaniteResidentTriangleSubMeshes,
+                    data.naniteResidentTriangleSubMeshes);
+                cmd.SetComputeTextureParam(shader, kernel, ShaderIds.MaterialBaseColorTextures,
+                    data.materialBaseColorTextures);
+                cmd.SetComputeTextureParam(shader, kernel, ShaderIds.MaterialEmissionTextures,
+                    data.materialEmissionTextures);
+                cmd.SetComputeTextureParam(shader, kernel, ShaderIds.MaterialMaskTextures,
+                    data.materialMaskTextures);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.EmissiveAliases, data.emissiveAliases);
                 cmd.SetComputeBufferParam(shader, kernel, ShaderIds.TraceCounters, data.traceCounters);
             }
@@ -1679,10 +2197,35 @@ namespace RealtimeGI
             public static readonly int CurrentDiffuseHit = Shader.PropertyToID("_GICurrentDiffuseHit");
             public static readonly int CurrentSpecular = Shader.PropertyToID("_GICurrentSpecular");
             public static readonly int CurrentSpecularRay = Shader.PropertyToID("_GICurrentSpecularRay");
+            public static readonly int CurrentSpecularHit = Shader.PropertyToID("_GICurrentSpecularHit");
+            public static readonly int CurrentSpecularStats = Shader.PropertyToID("_GICurrentSpecularStats");
+            public static readonly int CurrentSpecularId = Shader.PropertyToID("_GICurrentSpecularId");
+            public static readonly int CurrentSpecularHitRead = Shader.PropertyToID("_GICurrentSpecularHitRead");
+            public static readonly int CurrentSpecularStatsRead = Shader.PropertyToID("_GICurrentSpecularStatsRead");
+            public static readonly int CurrentSpecularIdRead = Shader.PropertyToID("_GICurrentSpecularIdRead");
+            public static readonly int SpecularReservoirRadianceRead = Shader.PropertyToID("_GISpecularReservoirRadianceRead");
+            public static readonly int SpecularReservoirRadianceWrite = Shader.PropertyToID("_GISpecularReservoirRadianceWrite");
+            public static readonly int SpecularReservoirRayRead = Shader.PropertyToID("_GISpecularReservoirRayRead");
+            public static readonly int SpecularReservoirRayWrite = Shader.PropertyToID("_GISpecularReservoirRayWrite");
+            public static readonly int SpecularReservoirHitRead = Shader.PropertyToID("_GISpecularReservoirHitRead");
+            public static readonly int SpecularReservoirHitWrite = Shader.PropertyToID("_GISpecularReservoirHitWrite");
+            public static readonly int SpecularReservoirStatsRead = Shader.PropertyToID("_GISpecularReservoirStatsRead");
+            public static readonly int SpecularReservoirStatsWrite = Shader.PropertyToID("_GISpecularReservoirStatsWrite");
+            public static readonly int SpecularReservoirIdRead = Shader.PropertyToID("_GISpecularReservoirIdRead");
+            public static readonly int SpecularReservoirIdWrite = Shader.PropertyToID("_GISpecularReservoirIdWrite");
+            public static readonly int SpecularReservoirSpatialRadiance = Shader.PropertyToID("_GISpecularReservoirSpatialRadiance");
+            public static readonly int SpecularReservoirSpatialRay = Shader.PropertyToID("_GISpecularReservoirSpatialRay");
+            public static readonly int SpecularReservoirSpatialHit = Shader.PropertyToID("_GISpecularReservoirSpatialHit");
+            public static readonly int SpecularReservoirSpatialStats = Shader.PropertyToID("_GISpecularReservoirSpatialStats");
+            public static readonly int SpecularReservoirSpatialId = Shader.PropertyToID("_GISpecularReservoirSpatialId");
             public static readonly int CurrentDiffuseRead = Shader.PropertyToID("_GICurrentDiffuseRead");
             public static readonly int CurrentDiffuseRayRead = Shader.PropertyToID("_GICurrentDiffuseRayRead");
             public static readonly int CurrentDiffuseStatsRead = Shader.PropertyToID("_GICurrentDiffuseStatsRead");
             public static readonly int CurrentDiffuseHitRead = Shader.PropertyToID("_GICurrentDiffuseHitRead");
+            public static readonly int CurrentDiffuseReprojection =
+                Shader.PropertyToID("_GICurrentDiffuseReprojection");
+            public static readonly int CurrentDiffuseReprojectionRead =
+                Shader.PropertyToID("_GICurrentDiffuseReprojectionRead");
             public static readonly int CurrentSpecularRead = Shader.PropertyToID("_GICurrentSpecularRead");
             public static readonly int CurrentSpecularRayRead = Shader.PropertyToID("_GICurrentSpecularRayRead");
             public static readonly int ResolvedSpecular = Shader.PropertyToID("_GIResolvedSpecular");
@@ -1725,7 +2268,10 @@ namespace RealtimeGI
             public static readonly int StaticPageTable = Shader.PropertyToID("_GIStaticPageTable");
             public static readonly int StaticOccupancy = Shader.PropertyToID("_GIStaticOccupancy");
             public static readonly int StaticSurface = Shader.PropertyToID("_GIStaticSurface");
+            public static readonly int StaticSurfaceUv = Shader.PropertyToID("_GIStaticSurfaceUV");
             public static readonly int StaticSurfaceIdentity = Shader.PropertyToID("_GIStaticSurfaceIdentity");
+            public static readonly int StaticSurfaceStableId = Shader.PropertyToID("_GIStaticSurfaceStableId");
+            public static readonly int StaticSurfacePrimitive = Shader.PropertyToID("_GIStaticSurfacePrimitive");
             public static readonly int StaticDistance = Shader.PropertyToID("_GIStaticDistance");
             public static readonly int StaticRadiance = Shader.PropertyToID("_GIStaticRadiance");
             public static readonly int StaticValidity = Shader.PropertyToID("_GIStaticValidity");
@@ -1734,13 +2280,48 @@ namespace RealtimeGI
             public static readonly int DynamicPageTable = Shader.PropertyToID("_GIDynamicPageTable");
             public static readonly int DynamicOccupancy = Shader.PropertyToID("_GIDynamicOccupancy");
             public static readonly int DynamicSurface = Shader.PropertyToID("_GIDynamicSurface");
+            public static readonly int DynamicSurfaceUv = Shader.PropertyToID("_GIDynamicSurfaceUV");
             public static readonly int DynamicSurfaceIdentity = Shader.PropertyToID("_GIDynamicSurfaceIdentity");
+            public static readonly int DynamicSurfaceStableId = Shader.PropertyToID("_GIDynamicSurfaceStableId");
+            public static readonly int DynamicSurfacePrimitive = Shader.PropertyToID("_GIDynamicSurfacePrimitive");
             public static readonly int DynamicDistance = Shader.PropertyToID("_GIDynamicDistance");
             public static readonly int DynamicRadiance = Shader.PropertyToID("_GIDynamicRadiance");
             public static readonly int DynamicValidity = Shader.PropertyToID("_GIDynamicValidity");
             public static readonly int DynamicLightCounts = Shader.PropertyToID("_GIDynamicLightCounts");
             public static readonly int DynamicLightIndices = Shader.PropertyToID("_GIDynamicLightIndices");
             public static readonly int Materials = Shader.PropertyToID("_GIMaterials");
+            public static readonly int Instances = Shader.PropertyToID("_GIInstances");
+            public static readonly int Geometries = Shader.PropertyToID("_GIGeometries");
+            public static readonly int MaterialBindings = Shader.PropertyToID("_GIMaterialBindings");
+            public static readonly int GeometryRanges = Shader.PropertyToID("_GIGeometryRanges");
+            public static readonly int Vertices = Shader.PropertyToID("_GIVertices");
+            public static readonly int Uvs = Shader.PropertyToID("_GIUVs");
+            public static readonly int Indices = Shader.PropertyToID("_GIIndices");
+            public static readonly int TriangleSubMeshes = Shader.PropertyToID("_GITriangleSubMeshes");
+            public static readonly int BvhNodes = Shader.PropertyToID("_GIBvhNodes");
+            public static readonly int BvhPrimitives = Shader.PropertyToID("_GIBvhPrimitives");
+            public static readonly int BvhRanges = Shader.PropertyToID("_GIBvhRanges");
+            public static readonly int TlasNodeCount = Shader.PropertyToID("_GITlasNodeCount");
+            public static readonly int TlasNodeOffset = Shader.PropertyToID("_GITlasNodeOffset");
+            public static readonly int NanitePageTable = Shader.PropertyToID("_GINanitePageTable");
+            public static readonly int NaniteResidentPageTable =
+                Shader.PropertyToID("_GINaniteResidentPageTable");
+            public static readonly int NaniteResidencyBits =
+                Shader.PropertyToID("_GINaniteResidencyBits");
+            public static readonly int NaniteResidentVertices =
+                Shader.PropertyToID("_GINaniteResidentVertices");
+            public static readonly int NaniteResidentIndices =
+                Shader.PropertyToID("_GINaniteResidentIndices");
+            public static readonly int NaniteResidentTriangleSubMeshes =
+                Shader.PropertyToID("_GINaniteResidentTriangleSubMeshes");
+            public static readonly int NanitePageCount = Shader.PropertyToID("_GINanitePageCount");
+            public static readonly int NanitePoolGeneration =
+                Shader.PropertyToID("_GINanitePoolGeneration");
+            public static readonly int NaniteGeometryReadyFlag =
+                Shader.PropertyToID("_GINaniteGeometryReadyFlag");
+            public static readonly int MaterialBaseColorTextures = Shader.PropertyToID("_GIBaseColorTextures");
+            public static readonly int MaterialEmissionTextures = Shader.PropertyToID("_GIEmissionTextures");
+            public static readonly int MaterialMaskTextures = Shader.PropertyToID("_GIMaskTextures");
             public static readonly int EmissiveAliases = Shader.PropertyToID("_GIEmissiveAliases");
             public static readonly int EmissiveAliasCount = Shader.PropertyToID("_GIEmissiveAliasCount");
             public static readonly int LocalLights = Shader.PropertyToID("_GILocalLights");
@@ -1776,7 +2357,10 @@ namespace RealtimeGI
                 Shader.PropertyToID("_GIDisocclusionRayCount");
             public static readonly int DisocclusionExtraRayBudget =
                 Shader.PropertyToID("_GIDisocclusionExtraRayBudget");
+            public static readonly int DiffuseVisibilityBudget =
+                Shader.PropertyToID("_GIDiffuseVisibilityBudget");
             public static readonly int MaterialCount = Shader.PropertyToID("_GIMaterialCount");
+            public static readonly int MaterialTextureSliceCount = Shader.PropertyToID("_GITextureSliceCount");
             public static readonly int HistoryValid = Shader.PropertyToID("_GIHistoryValid");
             public static readonly int SceneColorHistoryValid =
                 Shader.PropertyToID("_GISceneColorHistoryValid");
@@ -1788,6 +2372,10 @@ namespace RealtimeGI
             public static readonly int DiffuseAtrousStep = Shader.PropertyToID("_GIDiffuseAtrousStep");
             public static readonly int EnableSpecular = Shader.PropertyToID("_GIEnableSpecular");
             public static readonly int SpecularSpatialSamples = Shader.PropertyToID("_GISpecularSpatialSamples");
+            public static readonly int SpecularVisibilityBudget = Shader.PropertyToID("_GISpecularVisibilityBudget");
+            public static readonly int TriangleRefinementBudget = Shader.PropertyToID("_GITriangleRefinementBudget");
+            public static readonly int TriangleRefinementCandidateLimit = Shader.PropertyToID("_GITriangleRefinementCandidateLimit");
+            public static readonly int InstanceCount = Shader.PropertyToID("_GIInstanceCount");
             public static readonly int TraceCounters = Shader.PropertyToID("_GITraceCounters");
             public static readonly int EnableTraceCounters = Shader.PropertyToID("_GIEnableTraceCounters");
             public static readonly int HzbTexture = Shader.PropertyToID("_GIHzbTexture");

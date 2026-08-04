@@ -410,7 +410,7 @@ GameObject:
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
-  m_StaticEditorFlags: 126
+  m_StaticEditorFlags: 2147483647
   m_IsActive: 1
 --- !u!4 &11089251
 Transform:
@@ -22292,12 +22292,10 @@ MonoBehaviour:
   staticBrickCapacity: 8192
   dynamicBrickCapacity: 2048
   maxCellsPerTriangle: 4096
+  maxVoxelWorkItems: 65535
   distancePropagationPasses: 7
   staticGeometryBricksPerFrame: 8
   dynamicGeometryBricksPerFrame: 12
-  staticTriangleInvocationsPerFrame: 131072
-  dynamicTriangleInvocationsPerFrame: 65536
-  allowCoarseOversizedGeometry: 1
   staticRadianceBricksPerFrame: 12
   dynamicRadianceBricksPerFrame: 24
   enableRadianceShadows: 1
@@ -22314,8 +22312,9 @@ MonoBehaviour:
   radianceClamp: 32
   materialTextureResolution: 128
   automaticUpdate: 1
-  generation: 986637
-  staticBrickCount: 2002
+  enableAsyncCompute: 1
+  generation: 996614
+  staticBrickCount: 0
   dynamicBrickCount: 0
   droppedStaticBricks: 0
   droppedDynamicBricks: 0
@@ -22324,21 +22323,14 @@ MonoBehaviour:
   invalidGeometryCount: 0
   invalidatedStaticBrickCount: 0
   invalidatedDynamicBrickCount: 0
-  pendingStaticGeometryBricks: 1647
-  pendingDynamicGeometryBricks: 0
-  oversizedGeometryBricks: 78
-  largestOversizedTriangleInvocations: 7778304
-  oldestPendingGeometryFrames: 69
-  coarseGeometryFallbackThisFrame: 0
+  staticVoxelWorkOverflow: 0
+  dynamicVoxelWorkOverflow: 0
   pendingStaticRadianceBricks: 0
   pendingDynamicRadianceBricks: 0
-  updatedRadianceBricks: 5
+  updatedRadianceBricks: 0
   activeLocalLightCount: 0
-  localLightUploadOverflow: 0
-  lightOverflowBrickCount: 0
-  droppedBrickLightReferences: 0
-  remainingStaticBounceSweeps: 2
-  estimatedPoolMiB: 358.51587
+  remainingStaticBounceSweeps: 0
+  estimatedPoolMiB: 398.0103
 --- !u!114 &910652242
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -22355,7 +22347,7 @@ MonoBehaviour:
   includeOrdinaryMeshes: 1
   includeSkinnedMeshes: 1
   includeNaniteMeshes: 1
-  sceneRevision: 1240970
+  sceneRevision: 1254987
   instanceCount: 432
   geometryCount: 1
   materialCount: 4

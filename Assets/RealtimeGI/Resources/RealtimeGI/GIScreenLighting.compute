@@ -7,7 +7,10 @@
 #pragma kernel SpatialDiffuse
 #pragma kernel DenoiseDiffuse
 #pragma kernel FilterDiffuse
-#pragma kernel TraceSpecular
+#pragma kernel TraceSpecular GI_SPECULAR_COARSE_PASS
+#pragma kernel RefineSpecular
+#pragma kernel TemporalSpecularReservoir
+#pragma kernel SpatialSpecularReservoir
 #pragma kernel ResolveSpecular
 #pragma kernel TemporalSpecular
 #pragma kernel SpatialSpecular
@@ -17,7 +20,9 @@
 #pragma multi_compile _ _GBUFFER_NORMALS_OCT
 #pragma target 5.0
 
-// Final gather consumes persistent world-space radiance. Analytic world-hit shading is only
+// Final gather consumes persistent world-space radiance. All scene-BVH buffers share a
+// unified node/primitive namespace so trace kernels stay below Unity's 32-buffer limit.
+// Analytic world-hit shading is only
 // used while a cache cell is pending and for the local-light GGX term at glossy hit points.
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
@@ -42,12 +47,16 @@ Texture2D<float4> _GICurrentDiffuseRead;
 Texture2D<float4> _GICurrentDiffuseRayRead;
 Texture2D<float4> _GICurrentDiffuseStatsRead;
 Texture2D<float4> _GICurrentDiffuseHitRead;
+Texture2D<uint> _GICurrentDiffuseReprojectionRead;
 Texture2D<float4> _GIDiffuseReservoirRadianceRead;
 Texture2D<float4> _GIDiffuseReservoirRayRead;
 Texture2D<float4> _GIDiffuseReservoirStatsRead;
 Texture2D<float4> _GIDiffuseReservoirHitRead;
 Texture2D<float4> _GICurrentSpecularRead;
 Texture2D<float4> _GICurrentSpecularRayRead;
+Texture2D<float4> _GICurrentSpecularHitRead;
+Texture2D<float4> _GICurrentSpecularStatsRead;
+Texture2D<uint2> _GICurrentSpecularIdRead;
 Texture2D<float4> _GIResolvedSpecularRead;
 Texture2D<float4> _GIResolvedSpecularRayRead;
 Texture2D<float4> _GIDiffuseHistoryRead;
@@ -57,10 +66,16 @@ Texture2D<float4> _GIGeometryHistoryRead;
 Texture2D<float4> _GIDiffuseFiltered;
 Texture2D<float4> _GISpecularFiltered;
 Texture2D<float4> _GISpecularTemporalRead;
+Texture2D<float4> _GISpecularReservoirRadianceRead;
+Texture2D<float4> _GISpecularReservoirRayRead;
+Texture2D<float4> _GISpecularReservoirHitRead;
+Texture2D<float4> _GISpecularReservoirStatsRead;
+Texture2D<uint2> _GISpecularReservoirIdRead;
 RWTexture2D<float4> _GICurrentDiffuse;
 RWTexture2D<float4> _GICurrentDiffuseRay;
 RWTexture2D<float4> _GICurrentDiffuseStats;
 RWTexture2D<float4> _GICurrentDiffuseHit;
+RWTexture2D<uint> _GICurrentDiffuseReprojection;
 RWTexture2D<float4> _GIDiffuseReservoirRadianceWrite;
 RWTexture2D<float4> _GIDiffuseReservoirRayWrite;
 RWTexture2D<float4> _GIDiffuseReservoirStatsWrite;
@@ -74,6 +89,19 @@ RWTexture2D<float4> _GIDiffuseMomentsWrite;
 RWTexture2D<float4> _GIDiffuseDenoised;
 RWTexture2D<float4> _GISpecularHistoryWrite;
 RWTexture2D<float4> _GISpecularSpatial;
+RWTexture2D<float4> _GICurrentSpecularHit;
+RWTexture2D<float4> _GICurrentSpecularStats;
+RWTexture2D<uint2> _GICurrentSpecularId;
+RWTexture2D<float4> _GISpecularReservoirRadianceWrite;
+RWTexture2D<float4> _GISpecularReservoirRayWrite;
+RWTexture2D<float4> _GISpecularReservoirHitWrite;
+RWTexture2D<float4> _GISpecularReservoirStatsWrite;
+RWTexture2D<uint2> _GISpecularReservoirIdWrite;
+RWTexture2D<float4> _GISpecularReservoirSpatialRadiance;
+RWTexture2D<float4> _GISpecularReservoirSpatialRay;
+RWTexture2D<float4> _GISpecularReservoirSpatialHit;
+RWTexture2D<float4> _GISpecularReservoirSpatialStats;
+RWTexture2D<uint2> _GISpecularReservoirSpatialId;
 RWTexture2D<float4> _GIGeometryHistoryWrite;
 RWTexture2D<float4> _GIFullLighting;
 
@@ -81,7 +109,10 @@ StructuredBuffer<GIClipmapLevelData> _GIClipmapLevels;
 StructuredBuffer<int> _GIStaticPageTable;
 StructuredBuffer<uint> _GIStaticOccupancy;
 StructuredBuffer<uint> _GIStaticSurface;
+StructuredBuffer<uint> _GIStaticSurfaceUV;
 StructuredBuffer<uint> _GIStaticSurfaceIdentity;
+StructuredBuffer<uint2> _GIStaticSurfaceStableId;
+StructuredBuffer<uint> _GIStaticSurfacePrimitive;
 StructuredBuffer<uint> _GIStaticDistance;
 StructuredBuffer<uint> _GIStaticRadiance;
 StructuredBuffer<uint> _GIStaticValidity;
@@ -90,7 +121,10 @@ StructuredBuffer<uint> _GIStaticLightIndices;
 StructuredBuffer<int> _GIDynamicPageTable;
 StructuredBuffer<uint> _GIDynamicOccupancy;
 StructuredBuffer<uint> _GIDynamicSurface;
+StructuredBuffer<uint> _GIDynamicSurfaceUV;
 StructuredBuffer<uint> _GIDynamicSurfaceIdentity;
+StructuredBuffer<uint2> _GIDynamicSurfaceStableId;
+StructuredBuffer<uint> _GIDynamicSurfacePrimitive;
 StructuredBuffer<uint> _GIDynamicDistance;
 StructuredBuffer<uint> _GIDynamicRadiance;
 StructuredBuffer<uint> _GIDynamicValidity;
@@ -99,6 +133,44 @@ StructuredBuffer<uint> _GIDynamicLightIndices;
 StructuredBuffer<GIMaterialData> _GIMaterials;
 StructuredBuffer<GIEmissiveAliasData> _GIEmissiveAliases;
 StructuredBuffer<GILocalLightData> _GILocalLights;
+StructuredBuffer<GIInstanceData> _GIInstances;
+StructuredBuffer<GIGeometryData> _GIGeometries;
+StructuredBuffer<GIMaterialBindingData> _GIMaterialBindings;
+StructuredBuffer<GIGeometryStreamData> _GIGeometryRanges;
+StructuredBuffer<float3> _GIVertices;
+StructuredBuffer<float2> _GIUVs;
+StructuredBuffer<uint> _GIIndices;
+StructuredBuffer<uint> _GITriangleSubMeshes;
+StructuredBuffer<GIBvhNode> _GIBvhNodes;
+StructuredBuffer<GIBvhPrimitive> _GIBvhPrimitives;
+StructuredBuffer<GIBvhRange> _GIBvhRanges;
+
+struct GINanitePageTableEntry
+{
+    uint slotIndex; uint byteAddress; uint packedBytes; uint flags;
+    uint meshIndex; uint localPageIndex; uint generation; uint reserved;
+};
+struct GINaniteResidentPageEntry
+{
+    uint vertexBase; uint indexBase; uint vertexCount; uint indexCount;
+    uint flags; uint generation; uint reserved0; uint reserved1;
+};
+struct GINaniteResidentVertex
+{
+    float3 position;
+    float2 uv;
+    float3 normal;
+    float4 tangent;
+};
+StructuredBuffer<GINanitePageTableEntry> _GINanitePageTable;
+StructuredBuffer<GINaniteResidentPageEntry> _GINaniteResidentPageTable;
+StructuredBuffer<uint> _GINaniteResidencyBits;
+StructuredBuffer<GINaniteResidentVertex> _GINaniteResidentVertices;
+StructuredBuffer<uint> _GINaniteResidentIndices;
+StructuredBuffer<uint> _GINaniteResidentTriangleSubMeshes;
+Texture2DArray<float4> _GIBaseColorTextures;
+Texture2DArray<float4> _GIEmissionTextures;
+Texture2DArray<float4> _GIMaskTextures;
 RWStructuredBuffer<uint> _GITraceCounters;
 AppendStructuredBuffer<uint> _GIDiffuseMissQueue;
 StructuredBuffer<uint> _GIDiffuseMissQueueRead;
@@ -106,6 +178,7 @@ RWStructuredBuffer<uint> _GIDiffuseMissDispatchArgs;
 
 SamplerState sampler_LinearClamp;
 SamplerState sampler_PointClamp;
+SamplerState sampler_LinearRepeat;
 
 float4x4 _GIInverseViewProjection;
 float4x4 _GIViewProjection;
@@ -137,6 +210,7 @@ uint _GIDiffuseSpatialSamples;
 uint _GIDisocclusionRayCount;
 uint _GIDisocclusionExtraRayBudget;
 uint _GIMaterialCount;
+uint _GITextureSliceCount;
 uint _GIEmissiveAliasCount;
 uint _GILocalLightCount;
 uint _GIMaxLightsPerBrick;
@@ -152,12 +226,26 @@ uint _GISpecularSpatialSamples;
 uint _GIEnableTraceCounters;
 uint _GIHzbMipCount;
 uint _GIUseHzb;
+uint _GIInstanceCount;
+uint _GISpecularVisibilityBudget;
+uint _GITriangleRefinementBudget;
+uint _GITriangleRefinementCandidateLimit;
+uint _GIDiffuseVisibilityBudget;
+uint _GINanitePageCount;
+uint _GINanitePoolGeneration;
+uint _GINaniteGeometryReadyFlag;
+uint _GITlasNodeCount;
+uint _GITlasNodeOffset;
 float4 _GIHzbSourceSize;
 float4 _GISpecularBufferSize;
 
 float GITemporalDiffuseMatch(float2 uv, float currentDepth, float3 currentNormal,
                              uint currentMaterial, out uint2 previousPixel,
                              out float2 previousUv);
+float GIGgxReuseWeight(float3 normal, float3 viewDirection, float3 lightDirection, float roughness);
+bool GIConsumeDiffuseVisibilityBudget();
+bool GIStrictReconnectionVisibility(float3 origin, float3 targetPosition,
+                                    uint2 targetStableId, float roughness);
 
 uint2 GIGetFullSize()
 {
@@ -293,18 +381,39 @@ float2 GIDiffuseSequence(uint2 pixel, uint rayIndex)
 {
     uint pixelSeed = pixel.x + pixel.y * _GIDiffuseSize.x;
     float2 rotation = GIRandom2(pixelSeed ^ 0xa511e9b3u);
-    float sequenceIndex = (float)(_GIFrameIndex * max(_GIDiffuseRayCount, 1u) +
-                                  rayIndex + 1u);
+    // Reserve four sequence slots per frame so bounded disocclusion rays never reuse the
+    // indices consumed by the following frame's base ray.
+    float sequenceIndex = (float)(_GIFrameIndex * 4u + rayIndex + 1u);
     float2 sequence = frac(
         rotation + sequenceIndex * float2(0.754877666, 0.569840296));
     // A 2x2 low-resolution quad corresponds to one 8x8 full-resolution screen probe at
     // the default quarter scale.  Stratify its four lanes over the 2-D cosine sample
     // domain, and rotate lane ownership every frame so each pixel remains unbiased even
     // when geometry discontinuities prevent cross-lane reuse.
+    bool interleavedProbe = _GIDiffuseRayCount == 1u &&
+        _GIDiffuseSize.x * 4u >= _GIFullSize.x &&
+        _GIDiffuseSize.y * 4u >= _GIFullSize.y;
     uint lane = (pixel.x & 1u) | ((pixel.y & 1u) << 1u);
-    uint stratum = (lane + _GIFrameIndex + rayIndex) & 3u;
+    // In the interleaved path the active lane already rotates with FrameIndex. Adding
+    // FrameIndex a second time sampled only strata 0/2.  Compact 1/8-resolution probes
+    // instead cycle all four strata temporally at one fresh ray per probe per frame.
+    uint stratum = interleavedProbe
+        ? lane : ((_GIFrameIndex + rayIndex) & 3u);
     float2 stratumOffset = float2(stratum & 1u, (stratum >> 1u) & 1u);
     return (stratumOffset + sequence) * 0.5;
+}
+
+// Separate low-discrepancy dimensions for proposal-family, alias-entry and cone
+// selection.  The former implementation hashed the frame number for all three choices,
+// turning a well-stratified cosine sequence back into white noise whenever emissive NEE
+// was enabled.  A Cranley-Patterson rotation keeps pixels decorrelated while successive
+// frames cover each dimension evenly.
+float2 GIDiffuseProposalSequence(uint2 pixel, uint rayIndex, uint salt)
+{
+    uint pixelSeed = pixel.x + pixel.y * _GIDiffuseSize.x;
+    float2 rotation = GIRandom2(pixelSeed ^ salt);
+    float sequenceIndex = (float)(_GIFrameIndex * 4u + rayIndex + 1u);
+    return frac(rotation + sequenceIndex * float2(0.754877666, 0.569840296));
 }
 
 void GIBasis(float3 n, out float3 tangent, out float3 bitangent)
@@ -350,12 +459,14 @@ float GIEmissiveDirectionalPdf(float3 origin, float3 direction)
     return pdf;
 }
 
-bool GISampleEmissiveDirection(float3 origin, uint seed, out float3 direction)
+bool GISampleEmissiveDirection(float3 origin, uint2 pixel, uint rayIndex,
+                               out float3 direction)
 {
     direction = 0.0;
     if (_GIEmissiveAliasCount == 0u)
         return false;
-    float2 aliasRandom = GIRandom2(seed ^ 0xd1b54a35u);
+    float2 aliasRandom = GIDiffuseProposalSequence(
+        pixel, rayIndex, 0xd1b54a35u);
     uint tableIndex = min((uint)(aliasRandom.x * _GIEmissiveAliasCount),
                           _GIEmissiveAliasCount - 1u);
     GIEmissiveAliasData tableEntry = _GIEmissiveAliases[tableIndex];
@@ -369,7 +480,8 @@ bool GISampleEmissiveDirection(float3 origin, uint seed, out float3 direction)
         return false;
     float3 axis = toCenter * rsqrt(distanceSquared);
     float cosThetaMax = sqrt(saturate(1.0 - radius * radius / distanceSquared));
-    float2 coneRandom = GIRandom2(seed ^ 0x94d049bbu);
+    float2 coneRandom = GIDiffuseProposalSequence(
+        pixel, rayIndex, 0x94d049bbu);
     float cosTheta = lerp(1.0, cosThetaMax, coneRandom.x);
     float sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
     float phi = TWO_PI * coneRandom.y;
@@ -392,23 +504,45 @@ float GIDiffuseMixturePdf(float3 origin, float3 normal, float3 direction)
 }
 
 bool GIChooseDiffuseDirection(uint2 pixel, uint ray, float3 origin, float3 normal,
-                              uint seed, out float3 direction, out float sourcePdf)
+                              out float3 direction, out float sourcePdf)
 {
+    direction = normal;
+    sourcePdf = 1.0;
     const float emissiveProbability = 0.35;
     float qEmissive = _GIEmissiveAliasCount > 0u ? emissiveProbability : 0.0;
-    bool choseEmissive = qEmissive > 0.0 &&
-        GIRandom2(seed ^ 0x632be59bu).x < qEmissive;
+    // Stratify the proposal family across the aligned 2x2 screen-probe lanes.  At the
+    // default q=0.35 every probe receives one or two emissive proposals instead of
+    // occasionally receiving four or none, which was visible as swapping red blocks.
+    uint lane = (pixel.x & 1u) | ((pixel.y & 1u) << 1u);
+    uint2 probe = pixel >> 1u;
+    float probeRotation = GIRandom2(
+        probe.x + probe.y * max(1u, (_GIDiffuseSize.x + 1u) >> 1u) ^ 0x632be59bu).x;
+    float familyValue = frac(probeRotation +
+        ((float)lane + (float)ray * 0.618033989 +
+         (float)_GIFrameIndex * 0.754877666) * 0.25);
+    bool choseEmissive = qEmissive > 0.0 && familyValue < qEmissive;
     if (!choseEmissive)
-        direction = GICosineDirection(normal, GIDiffuseSequence(pixel, ray));
-    else if (!GISampleEmissiveDirection(origin, seed, direction) ||
-             dot(normal, direction) <= 1e-4)
     {
-        // Do not silently turn a rejected emissive proposal into another cosine sample.
-        // That changes the actual mixture probability without changing its PDF and creates
-        // a systematic bright bias for receivers inside/behind large emitter bounds.
-        direction = normal;
-        sourcePdf = 1.0;
-        return false;
+        direction = GICosineDirection(normal, GIDiffuseSequence(pixel, ray));
+    }
+    else
+    {
+        // Keep the out-parameter initialized across the short-circuit path.  Unity's
+        // D3D11 frontend otherwise treats direction as potentially undefined when the
+        // emitter sampler rejects before the hemisphere test.
+        float3 emissiveDirection = normal;
+        bool validEmissive = GISampleEmissiveDirection(
+            origin, pixel, ray, emissiveDirection);
+        if (!validEmissive || dot(normal, emissiveDirection) <= 1e-4)
+        {
+            // Do not silently turn a rejected emissive proposal into another cosine sample.
+            // That changes the actual mixture probability without changing its PDF and creates
+            // a systematic bright bias for receivers inside/behind large emitter bounds.
+            direction = normal;
+            sourcePdf = 1.0;
+            return false;
+        }
+        direction = emissiveDirection;
     }
     sourcePdf = GIDiffuseMixturePdf(origin, normal, direction);
     return true;
@@ -433,6 +567,18 @@ float3 GIGgxDirection(float3 normal, float3 viewDirection, float roughness, floa
     return dot(direction, normal) > 0.001 ? normalize(direction) : reflect(-viewDirection, normal);
 }
 
+float GIGgxDirectionPdf(float3 normal, float3 viewDirection, float3 direction, float roughness)
+{
+    float3 halfVector = normalize(viewDirection + direction);
+    float noH = max(0.0, dot(normal, halfVector));
+    float voH = max(1e-5, dot(viewDirection, halfVector));
+    float alpha = max(roughness * roughness, 0.0025);
+    float alpha2 = alpha * alpha;
+    float denominator = max(PI * pow(noH * noH * (alpha2 - 1.0) + 1.0, 2.0), 1e-6);
+    float distribution = alpha2 / denominator;
+    return max(1e-6, distribution * noH / (4.0 * voH));
+}
+
 float3 GIUnpackSurfaceNormal(uint packedSurface)
 {
     float2 oct = float2(packedSurface & 0xffu, (packedSurface >> 8u) & 0xffu) / 255.0 * 2.0 - 1.0;
@@ -443,6 +589,116 @@ float3 GIUnpackSurfaceNormal(uint packedSurface)
         normal.xy = (1.0 - abs(normal.yx)) * signNotZero;
     }
     return normalize(normal);
+}
+
+float4 GIEncodeDiffuseHit(float3 normal, float valid, uint2 stableId)
+{
+    normal /= max(abs(normal.x) + abs(normal.y) + abs(normal.z), 1e-6);
+    float2 oct = normal.xy;
+    if (normal.z < 0.0)
+    {
+        float2 signNotZero = float2(oct.x >= 0.0 ? 1.0 : -1.0,
+                                    oct.y >= 0.0 ? 1.0 : -1.0);
+        oct = (1.0 - abs(oct.yx)) * signNotZero;
+    }
+    uint2 encoded = (uint2)round(saturate(oct * 0.5 + 0.5) * 65535.0);
+    uint packedNormal = encoded.x | (encoded.y << 16u);
+    return float4(asfloat(packedNormal), asfloat(stableId.x), asfloat(stableId.y), valid);
+}
+
+float3 GIDecodeDiffuseHitNormal(float4 record)
+{
+    uint packed = asuint(record.x);
+    float2 oct = float2(packed & 0xffffu, packed >> 16u) / 65535.0 * 2.0 - 1.0;
+    float3 normal = float3(oct, 1.0 - abs(oct.x) - abs(oct.y));
+    if (normal.z < 0.0)
+    {
+        float2 signNotZero = float2(normal.x >= 0.0 ? 1.0 : -1.0,
+                                    normal.y >= 0.0 ? 1.0 : -1.0);
+        normal.xy = (1.0 - abs(normal.yx)) * signNotZero;
+    }
+    return normalize(normal);
+}
+
+uint2 GIDecodeDiffuseHitStableId(float4 record)
+{
+    return uint2(asuint(record.y), asuint(record.z));
+}
+
+void GIEvaluateMaterialAtUv(
+    uint materialIndex,
+    float2 uv,
+    uint hitLevel,
+    out float3 baseColor,
+    out float3 emissive,
+    out float roughness,
+    out float metallic)
+{
+    baseColor = 0.6;
+    emissive = 0.0;
+    roughness = 0.5;
+    metallic = 0.0;
+    if (materialIndex >= _GIMaterialCount)
+        return;
+
+    GIMaterialData material = _GIMaterials[materialIndex];
+    baseColor = max(0.0, material.baseColor.rgb);
+    emissive = max(0.0, material.emissive.rgb);
+    roughness = saturate(material.surface.x);
+    metallic = saturate(material.surface.y);
+    if (materialIndex >= _GITextureSliceCount)
+        return;
+    float mipLevel = min((float)hitLevel, 6.0);
+    if ((material.flags & GI_MATERIAL_HAS_BASE_MAP) != 0u)
+        baseColor *= _GIBaseColorTextures.SampleLevel(
+            sampler_LinearRepeat,
+            float3(uv * material.baseMapST.xy + material.baseMapST.zw, materialIndex),
+            mipLevel).rgb;
+    if ((material.flags & GI_MATERIAL_HAS_EMISSION_MAP) != 0u)
+        emissive *= _GIEmissionTextures.SampleLevel(
+            sampler_LinearRepeat,
+            float3(uv * material.emissionMapST.xy + material.emissionMapST.zw, materialIndex),
+            mipLevel).rgb;
+    if ((material.flags & GI_MATERIAL_HAS_MASK_MAP) != 0u)
+    {
+        float4 mask = _GIMaskTextures.SampleLevel(
+            sampler_LinearRepeat,
+            float3(uv * material.maskMapST.xy + material.maskMapST.zw, materialIndex),
+            mipLevel);
+        uint metallicChannel = GIMaterialMetallicChannel(material);
+        uint roughnessChannel = GIMaterialRoughnessChannel(material);
+        if (metallicChannel != GI_MASK_CHANNEL_CONSTANT)
+            metallic = saturate(GISelectMaterialChannel(mask, metallicChannel, metallic) *
+                                material.maskRemap0.x + material.maskRemap0.y);
+        if (roughnessChannel != GI_MASK_CHANNEL_CONSTANT)
+            roughness = saturate(GISelectMaterialChannel(mask, roughnessChannel, roughness) *
+                                 material.maskRemap0.z + material.maskRemap0.w);
+    }
+}
+
+void GIEvaluateHitMaterial(
+    uint packedSurface,
+    uint hitLayer,
+    int hitPhysicalBrick,
+    uint hitLocalCell,
+    uint hitLevel,
+    out float3 baseColor,
+    out float3 emissive,
+    out float roughness,
+    out float metallic)
+{
+    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
+    float2 uv = 0.0;
+    if (hitPhysicalBrick >= 0)
+    {
+        uint uvAddress = (uint)hitPhysicalBrick * GI_SURFACE_UV_WORDS_PER_BRICK + hitLocalCell;
+        uint packedUv = hitLayer == 0u
+            ? _GIStaticSurfaceUV[uvAddress]
+            : _GIDynamicSurfaceUV[uvAddress];
+        uv = float2(f16tof32(packedUv & 0xffffu), f16tof32(packedUv >> 16u));
+    }
+    GIEvaluateMaterialAtUv(materialIndex, uv, hitLevel,
+                           baseColor, emissive, roughness, metallic);
 }
 
 float3 GIUnpackRgb9E5(uint packed)
@@ -462,6 +718,15 @@ float3 GIReadDirectionalCell(int physicalBrick, uint localCell, uint hitLayer,
     uint validity = hitLayer == 0u ? _GIStaticValidity[cellAddress] : _GIDynamicValidity[cellAddress];
     float confidence = (validity & 0xffu) / 255.0;
     if (confidence < 0.125)
+        return 0.0;
+    uint surfaceAddress = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
+    uint packedSurface = hitLayer == 0u ? _GIStaticSurface[surfaceAddress]
+                                        : _GIDynamicSurface[surfaceAddress];
+    float3 surfaceNormal = GIUnpackSurfaceNormal(packedSurface);
+    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
+    bool twoSided = materialIndex < _GIMaterialCount &&
+        (_GIMaterials[materialIndex].flags & GI_MATERIAL_DOUBLE_SIDED) != 0u;
+    if (!twoSided && dot(surfaceNormal, normalize(outgoingDirection)) <= 0.0)
         return 0.0;
     float3 direction = normalize(outgoingDirection);
     float3 weights = abs(direction);
@@ -687,19 +952,15 @@ uint GIBrickLightIndex(uint hitLayer, int hitPhysicalBrick, uint slot)
 }
 
 float3 GIAnalyticDiffuseHit(uint packedSurface, float3 hitPosition, float3 hitNormal,
-                            uint hitLayer, int hitPhysicalBrick)
+                            uint hitLayer, int hitPhysicalBrick, uint hitLocalCell,
+                            uint hitLevel)
 {
-    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
-    float3 baseColor = 0.6;
-    float3 emissive = 0.0;
-    float metallic = 0.0;
-    if (materialIndex < _GIMaterialCount)
-    {
-        GIMaterialData material = _GIMaterials[materialIndex];
-        baseColor = max(0.0, material.baseColor.rgb);
-        emissive = max(0.0, material.emissive.rgb);
-        metallic = saturate(material.surface.y);
-    }
+    float3 baseColor;
+    float3 emissive;
+    float roughness;
+    float metallic;
+    GIEvaluateHitMaterial(packedSurface, hitLayer, hitPhysicalBrick, hitLocalCell,
+                          hitLevel, baseColor, emissive, roughness, metallic);
 
     float3 diffuseColor = baseColor * (1.0 - metallic);
     float3 mainDirection = normalize(-_GIMainLightDirection);
@@ -731,12 +992,13 @@ float3 GIAnalyticDiffuseHit(uint packedSurface, float3 hitPosition, float3 hitNo
 
 void GITraceRadianceDetailed(float3 origin, float3 direction, uint preferredLevel,
                              out float3 radiance, out float hitDistance,
-                             out float3 hitNormal, out float hitValid)
+                             out float3 hitNormal, out float hitValid, out uint2 stableId)
 {
     hitDistance = _GIMaxTraceDistance;
     hitNormal = -direction;
     hitValid = 0.0;
     radiance = GIEvaluateTODSky(direction);
+    stableId = 0u;
     hitDistance = _GIMaxTraceDistance;
     float hitT = _GIMaxTraceDistance;
     uint packedSurface = 0u;
@@ -763,6 +1025,9 @@ void GITraceRadianceDetailed(float3 origin, float3 direction, uint preferredLeve
     }
     if (worldHit)
     {
+        uint surfaceAddress = (uint)hitPhysicalBrick * GI_SURFACE_WORDS_PER_BRICK + hitLocalCell;
+        stableId = hitLayer == 0u ? _GIStaticSurfaceStableId[surfaceAddress]
+                                  : _GIDynamicSurfaceStableId[surfaceAddress];
         hitDistance = hitT;
         hitNormal = GIUnpackSurfaceNormal(packedSurface);
         hitValid = 1.0;
@@ -826,7 +1091,8 @@ void GITraceRadianceDetailed(float3 origin, float3 direction, uint preferredLeve
         else
         {
             radiance = GIAnalyticDiffuseHit(
-                packedSurface, hitPosition, hitNormal, hitLayer, hitPhysicalBrick);
+                packedSurface, hitPosition, hitNormal, hitLayer, hitPhysicalBrick,
+                hitLocalCell, hitLevel);
             if (_GIEnableTraceCounters != 0u)
                 InterlockedAdd(_GITraceCounters[6], 1u);
         }
@@ -838,9 +1104,10 @@ float3 GITraceRadiance(float3 origin, float3 direction, uint preferredLevel)
     float ignoredDistance = _GIMaxTraceDistance;
     float3 ignoredNormal;
     float ignoredHitValid;
+    uint2 ignoredStableId;
     float3 radiance = 0.0;
     GITraceRadianceDetailed(origin, direction, preferredLevel, radiance, ignoredDistance,
-                            ignoredNormal, ignoredHitValid);
+                            ignoredNormal, ignoredHitValid, ignoredStableId);
     return radiance;
 }
 
@@ -868,19 +1135,20 @@ float3 GIEvaluateHitGgx(float3 normal, float3 viewDirection, float3 lightDirecti
 
 float3 GIShadeSpecularWorldHit(uint packedSurface, float3 hitPosition, float3 hitNormal,
                                float3 viewDirection, float3 cachedRadiance, float cacheWeight,
-                               uint hitLayer, int hitPhysicalBrick)
+                               uint hitLayer, int hitPhysicalBrick, uint hitLocalCell,
+                               uint hitLevel, bool useExactMaterial,
+                               uint exactMaterialIndex, float2 exactUv)
 {
-    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
-    float3 baseColor = 0.6;
-    float roughness = 0.5;
-    float metallic = 0.0;
-    if (materialIndex < _GIMaterialCount)
-    {
-        GIMaterialData material = _GIMaterials[materialIndex];
-        baseColor = material.baseColor.rgb;
-        roughness = saturate(material.surface.x);
-        metallic = saturate(material.surface.y);
-    }
+    float3 baseColor;
+    float3 emissive;
+    float roughness;
+    float metallic;
+    if (useExactMaterial)
+        GIEvaluateMaterialAtUv(exactMaterialIndex, exactUv, hitLevel,
+                               baseColor, emissive, roughness, metallic);
+    else
+        GIEvaluateHitMaterial(packedSurface, hitLayer, hitPhysicalBrick, hitLocalCell,
+                              hitLevel, baseColor, emissive, roughness, metallic);
 
     // Cache radiance is the low-frequency diffuse/emissive base.  If geometry became
     // traceable before its cache update, use the shared analytic fallback so diffuse and
@@ -888,7 +1156,8 @@ float3 GIShadeSpecularWorldHit(uint packedSurface, float3 hitPosition, float3 hi
     float3 outgoing = cacheWeight > 1e-5
         ? cachedRadiance
         : GIAnalyticDiffuseHit(
-            packedSurface, hitPosition, hitNormal, hitLayer, hitPhysicalBrick);
+            packedSurface, hitPosition, hitNormal, hitLayer, hitPhysicalBrick,
+            hitLocalCell, hitLevel);
     float3 mainDirection = normalize(-_GIMainLightDirection);
     float3 f0 = lerp(0.04.xxx, baseColor, metallic);
     outgoing += _GIMainLightColor *
@@ -914,14 +1183,614 @@ float3 GIShadeSpecularWorldHit(uint packedSurface, float3 hitPosition, float3 hi
     return max(0.0, outgoing);
 }
 
-void GITraceSpecularWorld(float3 origin, float3 direction, uint preferredLevel,
-                          float receiverRoughness, out float3 radiance,
-                          out float hitDistance, out float3 hitNormal, out float hitValid)
+bool GIRefinementAlphaPass(uint materialIndex, float2 uv, uint levelIndex)
 {
-    hitDistance = _GIMaxTraceDistance;
+    if (materialIndex >= _GIMaterialCount)
+        return true;
+    GIMaterialData material = _GIMaterials[materialIndex];
+    if ((material.flags & GI_MATERIAL_ALPHA_TESTED) == 0u)
+        return true;
+    float4 baseSample = 1.0;
+    float4 maskSample = 1.0;
+    float mipLevel = min((float)levelIndex, 6.0);
+    if (materialIndex < _GITextureSliceCount &&
+        (material.flags & GI_MATERIAL_HAS_BASE_MAP) != 0u)
+        baseSample = _GIBaseColorTextures.SampleLevel(
+            sampler_LinearRepeat,
+            float3(uv * material.baseMapST.xy + material.baseMapST.zw, materialIndex), mipLevel);
+    if (materialIndex < _GITextureSliceCount &&
+        (material.flags & GI_MATERIAL_HAS_MASK_MAP) != 0u)
+        maskSample = _GIMaskTextures.SampleLevel(
+            sampler_LinearRepeat,
+            float3(uv * material.maskMapST.xy + material.maskMapST.zw, materialIndex), mipLevel);
+    uint source = GIMaterialAlphaSource(material);
+    float alpha = baseSample.a * material.baseColor.a * material.surface.z;
+    if (source >= 1u && source <= 4u)
+    {
+        uint channel = source - 1u;
+        alpha = GISelectMaterialChannel(maskSample, channel, material.surface.z);
+        if (channel == GIMaterialOpacityChannel(material))
+            alpha = alpha * material.maskRemap1.x + material.maskRemap1.y;
+    }
+    else if (source == 5u)
+        alpha = material.surface.z;
+    return alpha >= material.surface.w;
+}
+
+bool GIScreenNanitePageReady(uint pageId, uint expectedMeshIndex,
+                             out GINaniteResidentPageEntry resident)
+{
+    resident = (GINaniteResidentPageEntry)0;
+    if (pageId >= _GINanitePageCount)
+        return false;
+    GINanitePageTableEntry page = _GINanitePageTable[pageId];
+    resident = _GINaniteResidentPageTable[pageId];
+    uint residencyWord = _GINaniteResidencyBits[pageId >> 5u];
+    return page.meshIndex == expectedMeshIndex &&
+           page.generation == _GINanitePoolGeneration &&
+           resident.generation == _GINanitePoolGeneration &&
+           (page.flags & 1u) != 0u &&
+           (resident.flags & _GINaniteGeometryReadyFlag) != 0u &&
+           (residencyWord & (1u << (pageId & 31u))) != 0u;
+}
+
+bool GILoadRefinementTriangle(
+    GIGeometryStreamData range, uint primitiveKey,
+    out float3 p0, out float3 p1, out float3 p2,
+    out float2 uv0, out float2 uv1, out float2 uv2, out uint subMesh)
+{
+    p0 = p1 = p2 = 0.0;
+    uv0 = uv1 = uv2 = 0.0;
+    subMesh = 0u;
+    if ((primitiveKey & 0x80000000u) != 0u &&
+        (range.flags & GI_GEOMETRY_STREAM_NANITE_RESIDENT_PAGES) != 0u)
+    {
+        uint pageId = (primitiveKey >> 14u) & 0x1ffffu;
+        uint localTriangle = primitiveKey & 0x3fffu;
+        GINaniteResidentPageEntry resident;
+        if (!GIScreenNanitePageReady(pageId, range.padding0, resident) ||
+            localTriangle >= resident.indexCount / 3u)
+            return false;
+        uint firstIndex = resident.indexBase + localTriangle * 3u;
+        uint i0 = _GINaniteResidentIndices[firstIndex];
+        uint i1 = _GINaniteResidentIndices[firstIndex + 1u];
+        uint i2 = _GINaniteResidentIndices[firstIndex + 2u];
+        GINaniteResidentVertex v0 = _GINaniteResidentVertices[i0];
+        GINaniteResidentVertex v1 = _GINaniteResidentVertices[i1];
+        GINaniteResidentVertex v2 = _GINaniteResidentVertices[i2];
+        p0 = v0.position; p1 = v1.position; p2 = v2.position;
+        uv0 = v0.uv; uv1 = v1.uv; uv2 = v2.uv;
+        subMesh = _GINaniteResidentTriangleSubMeshes[firstIndex / 3u];
+        return true;
+    }
+    if (primitiveKey >= range.triangleCount)
+        return false;
+    uint firstIndex = range.indexOffset + primitiveKey * 3u;
+    uint i0 = _GIIndices[firstIndex];
+    uint i1 = _GIIndices[firstIndex + 1u];
+    uint i2 = _GIIndices[firstIndex + 2u];
+    p0 = _GIVertices[i0]; p1 = _GIVertices[i1]; p2 = _GIVertices[i2];
+    uv0 = _GIUVs[i0]; uv1 = _GIUVs[i1]; uv2 = _GIUVs[i2];
+    subMesh = _GITriangleSubMeshes[range.triangleOffset + primitiveKey];
+    return true;
+}
+
+bool GIRayTriangleCandidate(uint instanceIndex, uint triangleIndex,
+                            float3 origin, float3 direction, float minimumT, float maximumT,
+                            uint levelIndex, out float hitT, out float3 hitNormal,
+                            out uint materialIndex, out uint materialSlot,
+                            out float2 barycentrics, out uint2 stableId)
+{
+    hitT = maximumT;
     hitNormal = -direction;
-    hitValid = 0.0;
-    radiance = GIEvaluateTODGlossySky(direction, receiverRoughness);
+    materialIndex = 0u;
+    materialSlot = 0u;
+    barycentrics = 0.0;
+    stableId = 0u;
+    if (instanceIndex >= _GIInstanceCount)
+        return false;
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    GIGeometryStreamData range = _GIGeometryRanges[instance.geometryIndex];
+    float3 localP0, localP1, localP2;
+    float2 uv0, uv1, uv2;
+    uint subMesh;
+    if (!GILoadRefinementTriangle(
+            range, triangleIndex, localP0, localP1, localP2,
+            uv0, uv1, uv2, subMesh))
+        return false;
+    float3 p0 = mul(instance.localToWorld, float4(localP0, 1.0)).xyz;
+    float3 p1 = mul(instance.localToWorld, float4(localP1, 1.0)).xyz;
+    float3 p2 = mul(instance.localToWorld, float4(localP2, 1.0)).xyz;
+    float3 edge1 = p1 - p0;
+    float3 edge2 = p2 - p0;
+    float3 pvec = cross(direction, edge2);
+    float determinant = dot(edge1, pvec);
+    bool twoSided = (instance.flags & GI_INSTANCE_TWO_SIDED) != 0u;
+    if ((!twoSided && determinant <= 1e-7) || (twoSided && abs(determinant) <= 1e-7))
+        return false;
+    float inverseDeterminant = rcp(determinant);
+    float3 tvec = origin - p0;
+    float baryU = dot(tvec, pvec) * inverseDeterminant;
+    if (baryU < -1e-4 || baryU > 1.0001)
+        return false;
+    float3 qvec = cross(tvec, edge1);
+    float baryV = dot(direction, qvec) * inverseDeterminant;
+    if (baryV < -1e-4 || baryU + baryV > 1.0001)
+        return false;
+    float candidateT = dot(edge2, qvec) * inverseDeterminant;
+    if (candidateT < minimumT || candidateT > maximumT)
+        return false;
+    uint bindingOffset = min(subMesh, max(1u, instance.materialBindingCount) - 1u);
+    materialIndex = _GIMaterialBindings[instance.firstMaterialBinding + bindingOffset].materialIndex;
+    float baryW = 1.0 - baryU - baryV;
+    float2 uv = uv0 * baryW + uv1 * baryU + uv2 * baryV;
+    if (!GIRefinementAlphaPass(materialIndex, uv, levelIndex))
+        return false;
+    hitT = candidateT;
+    materialSlot = subMesh;
+    barycentrics = float2(baryU, baryV);
+    hitNormal = normalize(cross(edge1, edge2));
+    if (twoSided && dot(hitNormal, direction) > 0.0)
+        hitNormal = -hitNormal;
+    GIGeometryData geometry = _GIGeometries[instance.geometryIndex];
+    uint surfaceKey = geometry.sourceObjectId * 0x9e3779b9u ^ triangleIndex * 0x85ebca6bu ^
+                      geometry.sourceRevision * 0xc2b2ae35u ^ instance.revision * 0x27d4eb2fu ^
+                      instance.transformSignature * 0x165667b1u;
+    surfaceKey ^= surfaceKey >> 16u;
+    surfaceKey *= 0x7feb352du;
+    surfaceKey ^= surfaceKey >> 15u;
+    surfaceKey *= 0x846ca68bu;
+    surfaceKey ^= surfaceKey >> 16u;
+    // High bit is reserved by the Clipmap representation for complete-mip proxy IDs.
+    // Authoritative BVH triangles always publish an exact (non-proxy) surface key.
+    surfaceKey &= 0x7fffffffu;
+    stableId = uint2(instance.objectId, surfaceKey);
+    return true;
+}
+
+bool GIRayAabb(float3 origin, float3 direction, float3 boundsMin, float3 boundsMax,
+               float minimumT, float maximumT, out float entryT)
+{
+    float3 safeDirection = float3(
+        abs(direction.x) < 1e-8 ? (direction.x < 0.0 ? -1e-8 : 1e-8) : direction.x,
+        abs(direction.y) < 1e-8 ? (direction.y < 0.0 ? -1e-8 : 1e-8) : direction.y,
+        abs(direction.z) < 1e-8 ? (direction.z < 0.0 ? -1e-8 : 1e-8) : direction.z);
+    float3 inverseDirection = rcp(safeDirection);
+    float3 t0 = (boundsMin - origin) * inverseDirection;
+    float3 t1 = (boundsMax - origin) * inverseDirection;
+    float3 nearAxis = min(t0, t1);
+    float3 farAxis = max(t0, t1);
+    entryT = max(minimumT, max(nearAxis.x, max(nearAxis.y, nearAxis.z)));
+    float exitT = min(maximumT, min(farAxis.x, min(farAxis.y, farAxis.z)));
+    return exitT >= entryT;
+}
+
+void GITransformLocalBounds(GIInstanceData instance, float3 localMin, float3 localMax,
+                            out float3 worldMin, out float3 worldMax)
+{
+    float3 center = (localMin + localMax) * 0.5;
+    float3 extent = max(0.0, (localMax - localMin) * 0.5);
+    float3 worldCenter = mul(instance.localToWorld, float4(center, 1.0)).xyz;
+    float3 worldExtent = mul(abs((float3x3)instance.localToWorld), extent);
+    worldMin = worldCenter - worldExtent;
+    worldMax = worldCenter + worldExtent;
+}
+
+bool GITraceInstanceBlas(
+    uint instanceIndex, float3 origin, float3 direction, float minimumT, float maximumT,
+    uint levelIndex, inout uint testedTriangles,
+    out float hitT, out float3 hitNormal, out uint materialIndex, out uint materialSlot,
+    out float2 barycentrics, out uint triangleIndex, out uint2 stableId)
+{
+    hitT = maximumT;
+    hitNormal = -direction;
+    materialIndex = 0u;
+    materialSlot = 0u;
+    barycentrics = 0.0;
+    triangleIndex = 0xffffffffu;
+    stableId = 0u;
+    if (instanceIndex >= _GIInstanceCount)
+        return false;
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    GIBvhRange range = _GIBvhRanges[instance.geometryIndex];
+    if (range.nodeCount == 0u || range.primitiveCount == 0u)
+        return false;
+
+    bool found = false;
+    uint stack[32];
+    uint stackSize = 1u;
+    stack[0] = range.rootNode;
+    [loop]
+    while (stackSize > 0u)
+    {
+        uint nodeIndex = stack[--stackSize];
+        if (nodeIndex < range.rootNode || nodeIndex >= range.rootNode + range.nodeCount)
+            continue;
+        GIBvhNode node = _GIBvhNodes[nodeIndex];
+        float3 worldMin, worldMax;
+        GITransformLocalBounds(instance, node.boundsMin, node.boundsMax, worldMin, worldMax);
+        float entryT;
+        if (!GIRayAabb(origin, direction, worldMin, worldMax, minimumT,
+                       found ? hitT : maximumT, entryT))
+            continue;
+        if (node.primitiveCount == 0u)
+        {
+            if (stackSize + 2u <= 32u)
+            {
+                uint leftIndex = node.leftFirst;
+                uint rightIndex = node.leftFirst + 1u;
+                GIBvhNode leftNode = _GIBvhNodes[leftIndex];
+                GIBvhNode rightNode = _GIBvhNodes[rightIndex];
+                float3 leftMin, leftMax, rightMin, rightMax;
+                GITransformLocalBounds(instance, leftNode.boundsMin, leftNode.boundsMax,
+                                       leftMin, leftMax);
+                GITransformLocalBounds(instance, rightNode.boundsMin, rightNode.boundsMax,
+                                       rightMin, rightMax);
+                float leftEntry, rightEntry;
+                bool hitLeft = GIRayAabb(origin, direction, leftMin, leftMax, minimumT,
+                                         found ? hitT : maximumT, leftEntry);
+                bool hitRight = GIRayAabb(origin, direction, rightMin, rightMax, minimumT,
+                                          found ? hitT : maximumT, rightEntry);
+                if (hitLeft && hitRight)
+                {
+                    uint nearIndex = leftEntry <= rightEntry ? leftIndex : rightIndex;
+                    uint farIndex = leftEntry <= rightEntry ? rightIndex : leftIndex;
+                    stack[stackSize++] = farIndex;
+                    stack[stackSize++] = nearIndex;
+                }
+                else if (hitLeft)
+                    stack[stackSize++] = leftIndex;
+                else if (hitRight)
+                    stack[stackSize++] = rightIndex;
+            }
+            continue;
+        }
+
+        [loop]
+        for (uint leafIndex = 0u; leafIndex < node.primitiveCount; leafIndex++)
+        {
+            GIBvhPrimitive primitive = _GIBvhPrimitives[node.leftFirst + leafIndex];
+            uint firstTriangle = primitive.firstTriangle;
+            uint triangleCount = primitive.triangleCount;
+            if ((primitive.flags & GI_BVH_PRIMITIVE_NANITE_PAGE) != 0u)
+            {
+                GIGeometryStreamData geometryRange = _GIGeometryRanges[instance.geometryIndex];
+                GINaniteResidentPageEntry resident;
+                if (!GIScreenNanitePageReady(primitive.primitiveKey, geometryRange.padding0, resident))
+                    continue;
+                firstTriangle = min(firstTriangle, resident.indexCount / 3u);
+                triangleCount = min(triangleCount, resident.indexCount / 3u - firstTriangle);
+                triangleCount = min(triangleCount, 0x4000u - min(firstTriangle, 0x4000u));
+            }
+            [loop]
+            for (uint localTriangle = 0u; localTriangle < triangleCount; localTriangle++)
+            {
+                uint candidateLimit = (primitive.flags & GI_BVH_PRIMITIVE_NANITE_PAGE) != 0u
+                    ? max(128u, _GITriangleRefinementCandidateLimit)
+                    : max(1u, _GITriangleRefinementCandidateLimit);
+                if (testedTriangles++ >= candidateLimit)
+                    return found;
+                uint pageTriangle = firstTriangle + localTriangle;
+                uint candidateKey = (primitive.flags & GI_BVH_PRIMITIVE_NANITE_PAGE) != 0u
+                    ? (0x80000000u | ((primitive.primitiveKey & 0x1ffffu) << 14u) |
+                       (pageTriangle & 0x3fffu))
+                    : pageTriangle;
+                float candidateT;
+                float3 candidateNormal;
+                uint candidateMaterial, candidateMaterialSlot;
+                float2 candidateBarycentrics;
+                uint2 candidateStableId;
+                if (GIRayTriangleCandidate(
+                        instanceIndex, candidateKey, origin, direction, minimumT,
+                        found ? hitT : maximumT, levelIndex, candidateT, candidateNormal,
+                        candidateMaterial, candidateMaterialSlot, candidateBarycentrics,
+                        candidateStableId))
+                {
+                    found = true;
+                    hitT = candidateT;
+                    hitNormal = candidateNormal;
+                    materialIndex = candidateMaterial;
+                    materialSlot = candidateMaterialSlot;
+                    barycentrics = candidateBarycentrics;
+                    triangleIndex = candidateKey;
+                    stableId = candidateStableId;
+                }
+            }
+        }
+    }
+    return found;
+}
+
+bool GITraceSceneBvh(
+    float3 origin, float3 direction, float minimumT, float maximumT, uint levelIndex,
+    out float hitT, out float3 hitNormal, out uint materialIndex, out uint materialSlot,
+    out float2 barycentrics, out uint instanceIndex, out uint triangleIndex,
+    out uint2 stableId)
+{
+    hitT = maximumT;
+    hitNormal = -direction;
+    materialIndex = materialSlot = 0u;
+    barycentrics = 0.0;
+    instanceIndex = triangleIndex = 0xffffffffu;
+    stableId = 0u;
+    if (_GITlasNodeCount == 0u)
+        return false;
+
+    bool found = false;
+    uint testedTriangles = 0u;
+    uint stack[32];
+    uint stackSize = 1u;
+    stack[0] = _GITlasNodeOffset;
+    [loop]
+    while (stackSize > 0u)
+    {
+        uint nodeIndex = stack[--stackSize];
+        if (nodeIndex < _GITlasNodeOffset ||
+            nodeIndex >= _GITlasNodeOffset + _GITlasNodeCount)
+            continue;
+        GIBvhNode node = _GIBvhNodes[nodeIndex];
+        float entryT;
+        if (!GIRayAabb(origin, direction, node.boundsMin, node.boundsMax, minimumT,
+                       found ? hitT : maximumT, entryT))
+            continue;
+        if (node.primitiveCount == 0u)
+        {
+            if (stackSize + 2u <= 32u)
+            {
+                uint leftIndex = node.leftFirst;
+                uint rightIndex = node.leftFirst + 1u;
+                GIBvhNode leftNode = _GIBvhNodes[leftIndex];
+                GIBvhNode rightNode = _GIBvhNodes[rightIndex];
+                float leftEntry, rightEntry;
+                bool hitLeft = GIRayAabb(origin, direction, leftNode.boundsMin,
+                                         leftNode.boundsMax, minimumT,
+                                         found ? hitT : maximumT, leftEntry);
+                bool hitRight = GIRayAabb(origin, direction, rightNode.boundsMin,
+                                          rightNode.boundsMax, minimumT,
+                                          found ? hitT : maximumT, rightEntry);
+                if (hitLeft && hitRight)
+                {
+                    uint nearIndex = leftEntry <= rightEntry ? leftIndex : rightIndex;
+                    uint farIndex = leftEntry <= rightEntry ? rightIndex : leftIndex;
+                    stack[stackSize++] = farIndex;
+                    stack[stackSize++] = nearIndex;
+                }
+                else if (hitLeft)
+                    stack[stackSize++] = leftIndex;
+                else if (hitRight)
+                    stack[stackSize++] = rightIndex;
+            }
+            continue;
+        }
+        [loop]
+        for (uint leafIndex = 0u; leafIndex < node.primitiveCount; leafIndex++)
+        {
+            GIBvhPrimitive primitive = _GIBvhPrimitives[node.leftFirst + leafIndex];
+            uint candidateInstance = primitive.primitiveKey;
+            float candidateT;
+            float3 candidateNormal;
+            uint candidateMaterial, candidateMaterialSlot, candidateTriangle;
+            float2 candidateBarycentrics;
+            uint2 candidateStableId;
+            if (GITraceInstanceBlas(
+                    candidateInstance, origin, direction, minimumT,
+                    found ? hitT : maximumT, levelIndex, testedTriangles,
+                    candidateT, candidateNormal, candidateMaterial, candidateMaterialSlot,
+                    candidateBarycentrics, candidateTriangle, candidateStableId))
+            {
+                found = true;
+                hitT = candidateT;
+                hitNormal = candidateNormal;
+                materialIndex = candidateMaterial;
+                materialSlot = candidateMaterialSlot;
+                barycentrics = candidateBarycentrics;
+                instanceIndex = candidateInstance;
+                triangleIndex = candidateTriangle;
+                stableId = candidateStableId;
+            }
+        }
+    }
+    return found;
+}
+
+bool GIRefineClipmapHit(float3 origin, float3 direction, float voxelHitT,
+                        uint hitLayer, uint hitLevel, int3 hitWorldCell,
+                        out float refinedT, out float3 refinedNormal,
+                        out uint refinedMaterial, out uint refinedMaterialSlot,
+                        out float2 refinedBarycentrics, out uint refinedInstanceIndex,
+                        out uint refinedTriangleIndex, out uint2 refinedStableId)
+{
+    refinedT = voxelHitT;
+    refinedNormal = -direction;
+    refinedMaterial = 0u;
+    refinedMaterialSlot = 0u;
+    refinedBarycentrics = 0.0;
+    refinedInstanceIndex = 0xffffffffu;
+    refinedTriangleIndex = 0xffffffffu;
+    refinedStableId = 0u;
+    GIClipmapLevelData level = _GIClipmapLevels[hitLevel];
+    float minimumT = max(0.0, voxelHitT - level.cellSize * 2.0);
+    float maximumT = min(_GIMaxTraceDistance, voxelHitT + level.cellSize * 2.5);
+    if (GITraceSceneBvh(
+            origin, direction, minimumT, maximumT, hitLevel,
+            refinedT, refinedNormal, refinedMaterial, refinedMaterialSlot,
+            refinedBarycentrics, refinedInstanceIndex, refinedTriangleIndex,
+            refinedStableId))
+        return true;
+    bool found = false;
+    uint candidateCount = 0u;
+    [loop]
+    for (int z = -1; z <= 1; z++)
+    [loop]
+    for (int y = -1; y <= 1; y++)
+    [loop]
+    for (int x = -1; x <= 1; x++)
+    {
+        int3 cell = hitWorldCell + int3(x, y, z);
+        int physicalBrick;
+        uint localCell;
+        bool occupied = hitLayer == 0u
+            ? GIReadOccupancy(level, _GIStaticPageTable, _GIStaticOccupancy,
+                              cell, physicalBrick, localCell)
+            : GIReadOccupancy(level, _GIDynamicPageTable, _GIDynamicOccupancy,
+                              cell, physicalBrick, localCell);
+        if (!occupied)
+            continue;
+        uint address = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
+        uint identity = hitLayer == 0u ? _GIStaticSurfaceIdentity[address]
+                                      : _GIDynamicSurfaceIdentity[address];
+        uint triangleIndex = hitLayer == 0u ? _GIStaticSurfacePrimitive[address]
+                                           : _GIDynamicSurfacePrimitive[address];
+        if (identity == 0u)
+            continue;
+        if (candidateCount++ >= max(1u, _GITriangleRefinementCandidateLimit))
+            return found;
+        float candidateT;
+        float3 candidateNormal;
+        uint candidateMaterial;
+        uint candidateMaterialSlot;
+        float2 candidateBarycentrics;
+        uint2 candidateStableId;
+        if (GIRayTriangleCandidate(identity - 1u, triangleIndex, origin, direction,
+                                   minimumT, found ? refinedT : maximumT, hitLevel,
+                                   candidateT, candidateNormal, candidateMaterial,
+                                   candidateMaterialSlot, candidateBarycentrics,
+                                   candidateStableId))
+        {
+            found = true;
+            refinedT = candidateT;
+            refinedNormal = candidateNormal;
+            refinedMaterial = candidateMaterial;
+            refinedMaterialSlot = candidateMaterialSlot;
+            refinedBarycentrics = candidateBarycentrics;
+            refinedInstanceIndex = identity - 1u;
+            refinedTriangleIndex = triangleIndex;
+            refinedStableId = candidateStableId;
+        }
+    }
+    return found;
+}
+
+bool GIConsumeTriangleRefinementBudget()
+{
+    if (_GITriangleRefinementBudget == 0u)
+        return false;
+    if (_GITraceCounters[14] >= _GITriangleRefinementBudget)
+        return false;
+    uint allocation;
+    InterlockedAdd(_GITraceCounters[14], 1u, allocation);
+    return allocation < _GITriangleRefinementBudget;
+}
+
+// The hard budgets used to be consumed in dispatch order. Once an atomic counter filled,
+// every row below that point took a different lighting path and exposed a horizontal seam.
+// Hash-gate an oversubscribed set across the whole screen first; the atomic remains the
+// authoritative cap, while eligible work is spatially uniform and rotates over time.
+bool GIValidationGate(uint2 pixel, uint candidateIndex, uint2 size,
+                      uint budget, uint candidatesPerPixel, uint salt,
+                      float oversubscription)
+{
+    if (budget == 0u)
+        return false;
+    float potentialCount = (float)max(size.x, 1u) * (float)max(size.y, 1u) *
+                           (float)max(candidatesPerPixel, 1u);
+    float probability = saturate(
+        (float)budget * oversubscription / max(potentialCount, 1.0));
+    if (probability >= 1.0)
+        return true;
+    uint seed = pixel.x + pixel.y * max(size.x, 1u) +
+                candidateIndex * 0x85ebca6bu + _GIFrameIndex * 0x9e3779b9u;
+    return GIRandom2(GIHash(seed ^ salt)).x < probability;
+}
+
+bool GITraceBvhOnlySpecular(float3 origin, float3 direction, out GIPathPayload payload)
+{
+    payload = (GIPathPayload)0;
+    float hitT;
+    float3 hitNormal;
+    uint materialIndex, materialSlot, instanceIndex, triangleIndex;
+    float2 barycentrics;
+    uint2 stableId;
+    if (!GITraceSceneBvh(
+            origin, direction, 0.02, _GIMaxTraceDistance, 0u,
+            hitT, hitNormal, materialIndex, materialSlot, barycentrics,
+            instanceIndex, triangleIndex, stableId))
+        return false;
+
+    GIInstanceData instance = _GIInstances[instanceIndex];
+    GIGeometryData geometry = _GIGeometries[instance.geometryIndex];
+    GIGeometryStreamData range = _GIGeometryRanges[instance.geometryIndex];
+    float3 ignoredP0, ignoredP1, ignoredP2;
+    float2 uv0, uv1, uv2;
+    uint loadedSubMesh;
+    if (!GILoadRefinementTriangle(
+            range, triangleIndex, ignoredP0, ignoredP1, ignoredP2,
+            uv0, uv1, uv2, loadedSubMesh))
+        return false;
+    float baryW = 1.0 - barycentrics.x - barycentrics.y;
+    float2 uv = uv0 * baryW + uv1 * barycentrics.x + uv2 * barycentrics.y;
+    float3 baseColor, emissive;
+    float roughness, metallic;
+    GIEvaluateMaterialAtUv(materialIndex, uv, 0u, baseColor, emissive, roughness, metallic);
+    bool twoSided = materialIndex < _GIMaterialCount &&
+        (_GIMaterials[materialIndex].flags & GI_MATERIAL_DOUBLE_SIDED) != 0u;
+    float mainDot = dot(hitNormal, normalize(-_GIMainLightDirection));
+    float mainNoL = twoSided ? abs(mainDot) : saturate(mainDot);
+    float3 directIrradiance = GIEvaluateTODDiffuseSky(hitNormal) * _GISkyIrradianceScale +
+                              _GIMainLightColor * (mainNoL * _GIMainLightBounceScale);
+    float3 outgoing = emissive + baseColor * (1.0 - metallic) * directIrradiance * (1.0 / PI);
+    float3 f0 = lerp(0.04.xxx, baseColor, metallic);
+    outgoing += _GIMainLightColor * GIEvaluateHitGgx(
+        hitNormal, normalize(-direction), normalize(-_GIMainLightDirection), f0, roughness);
+
+    payload.radiance = max(0.0, outgoing);
+    payload.throughput = 1.0;
+    payload.pathLength = payload.hitDistance = hitT;
+    payload.solidAnglePdf = payload.proposalPdf = 1.0;
+    payload.incomingDirection = direction;
+    payload.outgoingDirection = -direction;
+    payload.hitPosition = origin + direction * hitT;
+    payload.barycentrics = barycentrics;
+    payload.geometryId = geometry.sourceObjectId;
+    payload.triangleId = triangleIndex;
+    payload.geometricNormal = payload.shadingNormal = hitNormal;
+    payload.objectId = stableId.x;
+    payload.surfaceId = stableId.y;
+    payload.materialId = materialIndex < _GIMaterialCount
+        ? _GIMaterials[materialIndex].materialId : materialIndex;
+    payload.materialSlot = materialSlot;
+    payload.instanceRevision = instance.revision;
+    payload.geometryRevision = geometry.sourceRevision;
+    payload.pathFlags = GI_PATH_VALID | GI_PATH_VISIBILITY_VALID |
+                        GI_PATH_FINITE_HIT | GI_PATH_TRIANGLE_REFINED;
+    payload.pathDepth = 1u;
+    payload.visibilityState = GI_VISIBILITY_VISIBLE;
+    return true;
+}
+
+void GITraceSpecularWorld(float3 origin, float3 direction, uint preferredLevel,
+                          float receiverRoughness, uint2 tracePixel,
+                          out GIPathPayload payload)
+{
+    payload = (GIPathPayload)0;
+    payload.radiance = GIEvaluateTODGlossySky(direction, receiverRoughness);
+    payload.pathLength = _GIMaxTraceDistance;
+    payload.throughput = 1.0;
+    payload.solidAnglePdf = 1.0;
+    payload.incomingDirection = direction;
+    payload.proposalPdf = 1.0;
+    payload.outgoingDirection = -direction;
+    payload.hitPosition = origin + direction * _GIMaxTraceDistance;
+    payload.hitDistance = _GIMaxTraceDistance;
+    payload.barycentrics = -1.0;
+    payload.geometryId = 0xffffffffu;
+    payload.triangleId = 0xffffffffu;
+    payload.geometricNormal = -direction;
+    payload.shadingNormal = -direction;
+    payload.pathFlags = GI_PATH_VALID | GI_PATH_VISIBILITY_VALID;
+    payload.materialId = 0xffffffffu;
+    payload.materialSlot = 0xffffffffu;
+    payload.visibilityState = GI_VISIBILITY_VISIBLE;
     float hitT = _GIMaxTraceDistance;
     uint packedSurface = 0u;
     uint hitIdentity = 0u;
@@ -946,27 +1815,138 @@ void GITraceSpecularWorld(float3 origin, float3 direction, uint preferredLevel,
         InterlockedAdd(_GITraceCounters[worldHit ? 3u : 4u], 1u);
     }
     if (!worldHit)
-        return;
-
-    hitDistance = hitT;
-    hitNormal = GIUnpackSurfaceNormal(packedSurface);
-    hitValid = 1.0;
-    uint materialIndex = (packedSurface >> 16u) & 0x7fffu;
-    if (_GIDebugHitMaterialColor != 0u)
     {
-        radiance = materialIndex < _GIMaterialCount
-            ? _GIMaterials[materialIndex].baseColor.rgb : float3(1.0, 0.0, 1.0);
+#if !defined(GI_SPECULAR_COARSE_PASS)
+        bool bvhFallback = receiverRoughness <= 0.35 &&
+            GIValidationGate(tracePixel, 1u, _GISpecularSize,
+                             _GITriangleRefinementBudget, 1u,
+                             0x243f6a88u, 4.0) &&
+            GIConsumeTriangleRefinementBudget();
+        if (bvhFallback)
+        {
+            GIPathPayload exactPayload;
+            if (GITraceBvhOnlySpecular(origin, direction, exactPayload))
+                payload = exactPayload;
+        }
+#endif
         return;
     }
 
-    float3 hitPosition = origin + direction * hitT;
+    uint surfaceAddress = (uint)hitPhysicalBrick * GI_SURFACE_WORDS_PER_BRICK + hitLocalCell;
+    uint2 stableId = hitLayer == 0u ? _GIStaticSurfaceStableId[surfaceAddress]
+                                    : _GIDynamicSurfaceStableId[surfaceAddress];
+    uint selectedInstanceIndex = hitIdentity > 0u ? hitIdentity - 1u : 0xffffffffu;
+    uint selectedTriangleIndex = hitLayer == 0u
+        ? _GIStaticSurfacePrimitive[surfaceAddress]
+        : _GIDynamicSurfacePrimitive[surfaceAddress];
+    uint selectedMaterialIndex = (packedSurface >> 16u) & 0x7fffu;
+    uint selectedMaterialSlot = 0xffffffffu;
+    float2 selectedBarycentrics = -1.0;
+    float2 selectedUv = 0.0;
+    float3 hitNormal = GIUnpackSurfaceNormal(packedSurface);
+#if defined(GI_SPECULAR_COARSE_PASS)
+    bool needsTriangleRefinement = false;
+#else
+    bool needsTriangleRefinement = hitLevel <= 1u && receiverRoughness <= 0.35 &&
+                                   GIValidationGate(
+                                       tracePixel, 0u, _GISpecularSize,
+                                       _GITriangleRefinementBudget, 1u,
+                                       0x7f4a7c15u, 6.0) &&
+                                   GIConsumeTriangleRefinementBudget();
+#endif
+    if (needsTriangleRefinement)
+    {
+        float refinedT;
+        float3 refinedNormal;
+        uint refinedMaterial;
+        uint refinedMaterialSlot;
+        float2 refinedBarycentrics;
+        uint refinedInstanceIndex;
+        uint refinedTriangleIndex;
+        uint2 refinedStableId;
+        if (!GIRefineClipmapHit(origin, direction, hitT, hitLayer, hitLevel, hitWorldCell,
+                                refinedT, refinedNormal, refinedMaterial,
+                                refinedMaterialSlot, refinedBarycentrics,
+                                refinedInstanceIndex, refinedTriangleIndex,
+                                refinedStableId))
+        {
+            payload.radiance = 0.0;
+            payload.pathFlags = 0u;
+            payload.visibilityState = GI_VISIBILITY_BLOCKED;
+            return;
+        }
+        hitT = refinedT;
+        hitNormal = refinedNormal;
+        selectedMaterialIndex = refinedMaterial;
+        selectedMaterialSlot = refinedMaterialSlot;
+        selectedBarycentrics = refinedBarycentrics;
+        selectedInstanceIndex = refinedInstanceIndex;
+        selectedTriangleIndex = refinedTriangleIndex;
+        stableId = refinedStableId;
+        payload.pathFlags |= GI_PATH_TRIANGLE_REFINED;
+        GIInstanceData refinedInstance = _GIInstances[selectedInstanceIndex];
+        GIGeometryStreamData refinedRange = _GIGeometryRanges[refinedInstance.geometryIndex];
+        float3 ignoredP0, ignoredP1, ignoredP2;
+        float2 refinedUv0, refinedUv1, refinedUv2;
+        uint ignoredSubMesh;
+        GILoadRefinementTriangle(
+            refinedRange, selectedTriangleIndex,
+            ignoredP0, ignoredP1, ignoredP2,
+            refinedUv0, refinedUv1, refinedUv2, ignoredSubMesh);
+        float baryW = 1.0 - selectedBarycentrics.x - selectedBarycentrics.y;
+        selectedUv = refinedUv0 * baryW + refinedUv1 * selectedBarycentrics.x +
+                     refinedUv2 * selectedBarycentrics.y;
+    }
+
+    payload.pathLength = hitT;
+    payload.hitDistance = hitT;
+    payload.hitPosition = origin + direction * hitT;
+    payload.geometricNormal = hitNormal;
+    payload.shadingNormal = hitNormal;
+    payload.objectId = stableId.x;
+    payload.surfaceId = stableId.y;
+    payload.barycentrics = selectedBarycentrics;
+    payload.triangleId = selectedTriangleIndex;
+    payload.pathDepth = 1u;
+    payload.pathFlags |= GI_PATH_FINITE_HIT;
+    if (selectedInstanceIndex < _GIInstanceCount)
+    {
+        GIInstanceData selectedInstance = _GIInstances[selectedInstanceIndex];
+        GIGeometryData selectedGeometry = _GIGeometries[selectedInstance.geometryIndex];
+        payload.geometryId = selectedGeometry.sourceObjectId;
+        payload.instanceRevision = selectedInstance.revision;
+        payload.geometryRevision = selectedGeometry.sourceRevision;
+        if (selectedMaterialSlot == 0xffffffffu)
+        {
+            GIGeometryStreamData selectedRange = _GIGeometryRanges[selectedInstance.geometryIndex];
+            float3 ignoredP0, ignoredP1, ignoredP2;
+            float2 ignoredUv0, ignoredUv1, ignoredUv2;
+            uint loadedSubMesh;
+            if (GILoadRefinementTriangle(
+                    selectedRange, selectedTriangleIndex,
+                    ignoredP0, ignoredP1, ignoredP2,
+                    ignoredUv0, ignoredUv1, ignoredUv2, loadedSubMesh))
+                selectedMaterialSlot = loadedSubMesh;
+        }
+    }
+    payload.materialSlot = selectedMaterialSlot;
+    payload.materialId = selectedMaterialIndex < _GIMaterialCount
+        ? _GIMaterials[selectedMaterialIndex].materialId : selectedMaterialIndex;
+    if (_GIDebugHitMaterialColor != 0u)
+    {
+        payload.radiance = selectedMaterialIndex < _GIMaterialCount
+            ? _GIMaterials[selectedMaterialIndex].baseColor.rgb : float3(1.0, 0.0, 1.0);
+        return;
+    }
+
     float cacheWeight = 0.0;
     float3 cachedRadiance = GIReadCachedRadiance(
         hitPhysicalBrick, hitLocalCell, hitWorldCell, hitIdentity, hitLayer, hitLevel,
-        hitPosition, -direction, cacheWeight);
-    radiance = GIShadeSpecularWorldHit(
-        packedSurface, hitPosition, hitNormal, normalize(-direction),
-        cachedRadiance, cacheWeight, hitLayer, hitPhysicalBrick);
+        payload.hitPosition, -direction, cacheWeight);
+    payload.radiance = GIShadeSpecularWorldHit(
+        packedSurface, payload.hitPosition, hitNormal, normalize(-direction),
+        cachedRadiance, cacheWeight, hitLayer, hitPhysicalBrick, hitLocalCell, hitLevel,
+        needsTriangleRefinement, selectedMaterialIndex, selectedUv);
     if (_GIEnableTraceCounters != 0u)
         InterlockedAdd(_GITraceCounters[cacheWeight > 1e-5 ? 5u : 6u], 1u);
 }
@@ -1154,10 +2134,48 @@ bool GITryReadScreenHitRadiance(float3 hitPosition, float3 screenNormal,
 // containing voxel in each clipmap level before falling back to a second world march.
 // The former 5 * 7 * 2 search was removed because it cost more than the world trace and
 // selected discontinuous neighbours.  Exact containment is both cheaper and stable.
+bool GITryGetScreenHitStableId(float3 hitPosition, float3 screenNormal,
+                               out uint2 stableId)
+{
+    stableId = 0u;
+    [loop]
+    for (uint levelIndex = 0u; levelIndex < GI_CLIPMAP_LEVEL_COUNT; levelIndex++)
+    {
+        GIClipmapLevelData level = _GIClipmapLevels[levelIndex];
+        int3 worldCell = (int3)floor(hitPosition / level.cellSize);
+        [unroll]
+        for (uint layer = 0u; layer < 2u; layer++)
+        {
+            int physicalBrick = -1;
+            uint localCell = 0u;
+            bool occupied = layer == 0u
+                ? GIReadOccupancy(level, _GIStaticPageTable, _GIStaticOccupancy,
+                                  worldCell, physicalBrick, localCell)
+                : GIReadOccupancy(level, _GIDynamicPageTable, _GIDynamicOccupancy,
+                                  worldCell, physicalBrick, localCell);
+            if (!occupied)
+                continue;
+            uint address = (uint)physicalBrick * GI_SURFACE_WORDS_PER_BRICK + localCell;
+            uint packedSurface = layer == 0u
+                ? _GIStaticSurface[address] : _GIDynamicSurface[address];
+            if (abs(dot(GIUnpackSurfaceNormal(packedSurface), screenNormal)) < 0.55)
+                continue;
+            stableId = layer == 0u
+                ? _GIStaticSurfaceStableId[address] : _GIDynamicSurfaceStableId[address];
+            if (!any(stableId == 0u))
+                return true;
+        }
+    }
+    stableId = 0u;
+    return false;
+}
+
 bool GITryReadScreenHitRadianceFast(float3 hitPosition, float3 screenNormal,
-                                    float3 outgoingDirection, out float3 radiance)
+                                    float3 outgoingDirection, out float3 radiance,
+                                    out uint2 stableId)
 {
     radiance = 0.0;
+    stableId = 0u;
     [loop]
     for (uint levelIndex = 0u; levelIndex < GI_CLIPMAP_LEVEL_COUNT; levelIndex++)
     {
@@ -1184,6 +2202,10 @@ bool GITryReadScreenHitRadianceFast(float3 hitPosition, float3 screenNormal,
                 continue;
             uint identity = layer == 0u
                 ? _GIStaticSurfaceIdentity[address] : _GIDynamicSurfaceIdentity[address];
+            uint2 candidateStableId = layer == 0u
+                ? _GIStaticSurfaceStableId[address] : _GIDynamicSurfaceStableId[address];
+            if (any(candidateStableId == 0u))
+                continue;
             float cacheWeight;
             float3 candidate = GIReadCachedRadiance(
                 physicalBrick, localCell, worldCell, identity, layer, levelIndex,
@@ -1191,6 +2213,7 @@ bool GITryReadScreenHitRadianceFast(float3 hitPosition, float3 screenNormal,
             if (cacheWeight > 1e-5)
             {
                 radiance = candidate;
+                stableId = candidateStableId;
                 return true;
             }
         }
@@ -1300,12 +2323,13 @@ bool GITryReadScreenHistory(float2 hitUv, float3 hitPosition, float3 hitNormal,
 
 bool GIScreenTrace(float3 origin, float3 direction, float perceptualRoughness,
                    out float3 radiance, out float hitDistance,
-                   out float3 hitNormal, out float hitValid)
+                   out float3 hitNormal, out float hitValid, out uint2 stableId)
 {
     radiance = 0.0;
     hitDistance = _GIMaxTraceDistance;
     hitNormal = -direction;
     hitValid = 0.0;
+    stableId = 0u;
     bool recordedGeometryHit = false;
     uint hzbWidth, hzbHeight;
     _GIHzbTexture.GetDimensions(hzbWidth, hzbHeight);
@@ -1405,6 +2429,10 @@ bool GIScreenTrace(float3 origin, float3 direction, float perceptualRoughness,
         if (GITryReadScreenHistory(
                 hitUv, hitPosition, screenHitNormal, historyMip, radiance))
         {
+            // Screen history supplies radiance, but the persistent path still needs the
+            // exact world-cache identity.  Without it strict temporal/spatial
+            // reconnection rejects every finite screen hit on the following frame.
+            GITryGetScreenHitStableId(hitPosition, screenHitNormal, stableId);
             hitDistance = length(hitPosition - origin);
             hitNormal = screenHitNormal;
             hitValid = 1.0;
@@ -1415,7 +2443,7 @@ bool GIScreenTrace(float3 origin, float3 direction, float perceptualRoughness,
         // geometry is nevertheless known, so sample its containing clipmap voxel instead
         // of enqueueing a second 50+ step march from the primary surface.
         if (GITryReadScreenHitRadianceFast(
-                hitPosition, screenHitNormal, -direction, radiance))
+                hitPosition, screenHitNormal, -direction, radiance, stableId))
         {
             hitDistance = length(hitPosition - origin);
             hitNormal = screenHitNormal;
@@ -1442,6 +2470,7 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
         _GICurrentDiffuseRay[dispatchId.xy] = 0.0;
         _GICurrentDiffuseStats[dispatchId.xy] = 0.0;
         _GICurrentDiffuseHit[dispatchId.xy] = 0.0;
+        _GICurrentDiffuseReprojection[dispatchId.xy] = 0xffffffffu;
         return;
     }
 
@@ -1454,6 +2483,7 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
     float selectedDistance = _GIMaxTraceDistance;
     float3 selectedHitNormal = normal;
     float selectedHitValid = 0.0;
+    uint2 selectedStableId = 0u;
     float selectedSourcePdf = 1.0 / PI;
     float selectedAge = 0.0;
     float selectedTarget = 1e-5;
@@ -1461,11 +2491,36 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
     float sampleCount = 0.0;
     uint missMask = 0u;
     uint rayCount = clamp(_GIDiffuseRayCount, 1u, 4u);
-    uint2 ignoredPreviousPixel;
-    float2 ignoredPreviousUv;
+    uint2 previousPixel;
+    float2 previousUv;
     float historyValidity = GITemporalDiffuseMatch(
         uv, depth, normal, GIMaterialSignature(uv),
-        ignoredPreviousPixel, ignoredPreviousUv);
+        previousPixel, previousUv);
+    _GICurrentDiffuseReprojection[dispatchId.xy] = historyValidity > 0.0
+        ? previousPixel.x + previousPixel.y * _GIDiffuseSize.x
+        : 0xffffffffu;
+    // A 2x2 low-resolution quad is one screen probe. At the default one-ray setting,
+    // rotate the emitting lane every frame instead of tracing all four lanes and then
+    // throwing three vector estimates away during reservoir selection. SpatialDiffuse
+    // broadcasts the active lane through its geometry-gated probe reconstruction, while
+    // per-pixel temporal reservoirs retain the other lanes. Disoccluded pixels still get
+    // a valid depth/normal record and are reconstructed from their active probe lane.
+    bool interleavedProbe = _GIDiffuseRayCount == 1u &&
+        _GIDiffuseSize.x * 4u >= _GIFullSize.x &&
+        _GIDiffuseSize.y * 4u >= _GIFullSize.y;
+    if (interleavedProbe)
+    {
+        uint lane = (dispatchId.x & 1u) | ((dispatchId.y & 1u) << 1u);
+        uint activeLane = _GIFrameIndex & 3u;
+        if (lane != activeLane)
+        {
+            _GICurrentDiffuse[dispatchId.xy] = float4(0.0, 0.0, 0.0, depth);
+            _GICurrentDiffuseRay[dispatchId.xy] = float4(normal, _GIMaxTraceDistance);
+            _GICurrentDiffuseStats[dispatchId.xy] = 0.0;
+            _GICurrentDiffuseHit[dispatchId.xy] = 0.0;
+            return;
+        }
+    }
     if (historyValidity <= 0.0 && _GIDisocclusionExtraRayBudget > 0u &&
         _GIDisocclusionRayCount > rayCount)
     {
@@ -1497,7 +2552,7 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
         // pixel this removes the avoidable cosine variance of uniform-hemisphere rays.
         float3 direction;
         float sourcePdf;
-        if (!GIChooseDiffuseDirection(dispatchId.xy, ray, origin, normal, seed,
+        if (!GIChooseDiffuseDirection(dispatchId.xy, ray, origin, normal,
                                        direction, sourcePdf))
         {
             // Rejected emissive-cone proposals are valid null samples from the mixture.
@@ -1510,10 +2565,11 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
         float candidateDistance;
         float3 candidateHitNormal;
         float candidateHitValid;
+        uint2 candidateStableId;
         if (_GIEnableTraceCounters != 0u)
             InterlockedAdd(_GITraceCounters[0], 1u);
         if (GIScreenTrace(origin, direction, 0.0, candidateRadiance, candidateDistance,
-                          candidateHitNormal, candidateHitValid))
+                          candidateHitNormal, candidateHitValid, candidateStableId))
         {
             candidateRadiance = GIClampDiffuseCandidate(candidateRadiance);
             if (_GIEnableTraceCounters != 0u)
@@ -1528,6 +2584,7 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
                 selectedDistance = candidateDistance;
                 selectedHitNormal = candidateHitNormal;
                 selectedHitValid = candidateHitValid;
+                selectedStableId = candidateStableId;
                 selectedSourcePdf = sourcePdf;
                 selectedAge = 0.0;
                 selectedTarget = max(target, 1e-5);
@@ -1540,7 +2597,8 @@ void TraceDiffuseScreen(uint3 dispatchId : SV_DispatchThreadID)
     _GICurrentDiffuseRay[dispatchId.xy] = float4(selectedDirection, selectedDistance);
     _GICurrentDiffuseStats[dispatchId.xy] = float4(
         weightSum, sampleCount, selectedTarget, (float)missMask);
-    _GICurrentDiffuseHit[dispatchId.xy] = float4(selectedHitNormal, selectedHitValid);
+    _GICurrentDiffuseHit[dispatchId.xy] = GIEncodeDiffuseHit(
+        selectedHitNormal, selectedHitValid, selectedStableId);
     if (missMask != 0u)
         _GIDiffuseMissQueue.Append(dispatchId.x + dispatchId.y * _GIDiffuseSize.x);
 }
@@ -1575,8 +2633,9 @@ void TraceDiffuseWorldMisses(uint3 dispatchId : SV_DispatchThreadID)
     float3 selectedRadiance = current.rgb;
     float3 selectedDirection = rayRecord.xyz;
     float selectedDistance = rayRecord.w;
-    float3 selectedHitNormal = hitRecord.xyz;
+    float3 selectedHitNormal = GIDecodeDiffuseHitNormal(hitRecord);
     float selectedHitValid = hitRecord.w;
+    uint2 selectedStableId = GIDecodeDiffuseHitStableId(hitRecord);
     float selectedSourcePdf = GIDiffuseMixturePdf(
         origin, normal, normalize(selectedDirection));
     float selectedAge = 0.0;
@@ -1596,7 +2655,7 @@ void TraceDiffuseWorldMisses(uint3 dispatchId : SV_DispatchThreadID)
                     (_GIFrameIndex * 9781u + ray * 6271u);
         float3 direction;
         float sourcePdf;
-        if (!GIChooseDiffuseDirection(pixel, ray, origin, normal, seed,
+        if (!GIChooseDiffuseDirection(pixel, ray, origin, normal,
                                        direction, sourcePdf))
         {
             sampleCount += 1.0;
@@ -1606,8 +2665,9 @@ void TraceDiffuseWorldMisses(uint3 dispatchId : SV_DispatchThreadID)
         float3 candidateRadiance = 0.0;
         float3 candidateHitNormal;
         float candidateHitValid;
+        uint2 candidateStableId;
         GITraceRadianceDetailed(origin, direction, 0u, candidateRadiance, candidateDistance,
-                                candidateHitNormal, candidateHitValid);
+                                candidateHitNormal, candidateHitValid, candidateStableId);
         candidateRadiance = GIClampDiffuseCandidate(candidateRadiance);
         float target = GIDiffuseTarget(candidateRadiance, normal, direction);
         if (GIReservoirUpdate(weightSum, sampleCount,
@@ -1619,6 +2679,7 @@ void TraceDiffuseWorldMisses(uint3 dispatchId : SV_DispatchThreadID)
             selectedDistance = candidateDistance;
             selectedHitNormal = candidateHitNormal;
             selectedHitValid = candidateHitValid;
+            selectedStableId = candidateStableId;
             selectedSourcePdf = sourcePdf;
             selectedAge = 0.0;
             selectedTarget = max(target, 1e-5);
@@ -1628,7 +2689,8 @@ void TraceDiffuseWorldMisses(uint3 dispatchId : SV_DispatchThreadID)
     _GICurrentDiffuseRay[pixel] = float4(selectedDirection, selectedDistance);
     _GICurrentDiffuseStats[pixel] = float4(
         weightSum, sampleCount, selectedTarget, selectedSourcePdf);
-    _GICurrentDiffuseHit[pixel] = float4(selectedHitNormal, selectedHitValid);
+    _GICurrentDiffuseHit[pixel] = GIEncodeDiffuseHit(
+        selectedHitNormal, selectedHitValid, selectedStableId);
 }
 
 float3 GIClampHistory(Texture2D<float4> currentTexture, uint2 pixel, uint2 size, float3 history)
@@ -1776,8 +2838,9 @@ void TemporalDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     float3 selectedRadiance = hasCurrentSample ? current.rgb : 0.0;
     float3 selectedDirection = hasCurrentSample ? normalize(currentRay.xyz) : currentNormal;
     float selectedDistance = hasCurrentSample ? currentRay.w : _GIMaxTraceDistance;
-    float3 selectedHitNormal = hasCurrentSample ? normalize(currentHit.xyz) : currentNormal;
+    float3 selectedHitNormal = hasCurrentSample ? GIDecodeDiffuseHitNormal(currentHit) : currentNormal;
     float selectedHitValid = hasCurrentSample ? currentHit.w : 0.0;
+    uint2 selectedStableId = hasCurrentSample ? GIDecodeDiffuseHitStableId(currentHit) : 0u;
     float3 currentPosition = GIWorldPosition(uv, current.a);
     float3 currentOriginForPdf = currentPosition + currentNormal *
         max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
@@ -1788,11 +2851,16 @@ void TemporalDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     float selectedTarget = hasCurrentSample ? max(currentStats.z, 1e-5) : 1e-5;
     float weightSum = max(0.0, currentStats.x);
     float sampleCount = max(0.0, currentStats.y);
-    uint2 previousPixel;
-    float2 previousUv;
-    float validity = GITemporalDiffuseMatch(
-        uv, current.a, currentNormal, GIMaterialSignature(uv),
-        previousPixel, previousUv);
+    // TraceDiffuseScreen already performed the expensive two-source, 3x3 world-space
+    // reprojection search to budget disocclusion rays.  Reuse that exact answer here and
+    // in the denoiser instead of repeating 18 geometry-history tests three times/pixel.
+    uint reprojection = _GICurrentDiffuseReprojectionRead.Load(
+        int3(dispatchId.xy, 0));
+    float validity = reprojection != 0xffffffffu ? 1.0 : 0.0;
+    uint2 previousPixel = validity > 0.0
+        ? uint2(reprojection % diffuseSize.x, reprojection / diffuseSize.x) : 0u;
+    float2 previousUv = validity > 0.0
+        ? GIUvFromPixel(previousPixel, diffuseSize) : uv;
     if (validity > 0.0)
     {
         float4 previousRadiance = _GIDiffuseReservoirRadianceRead.Load(int3(previousPixel, 0));
@@ -1821,13 +2889,49 @@ void TemporalDiffuse(uint3 dispatchId : SV_DispatchThreadID)
                                    max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
             bool skyRay = previousHit.w < 0.5 ||
                           previousRay.w >= _GIMaxTraceDistance * 0.999;
+            float3 previousHitNormal = GIDecodeDiffuseHitNormal(previousHit);
+            uint2 previousStableId = GIDecodeDiffuseHitStableId(previousHit);
             float3 hitPoint = previousOrigin + normalize(previousRay.xyz) * previousRay.w;
             float3 shiftedDirection = skyRay
                 ? normalize(previousRay.xyz) : normalize(hitPoint - currentOrigin);
             float shiftedDistance = skyRay
                 ? _GIMaxTraceDistance : length(hitPoint - currentOrigin);
             float secondaryFacing = skyRay ? 1.0 :
-                (dot(normalize(previousHit.xyz), -shiftedDirection) > 0.05 ? 1.0 : 0.0);
+                (dot(previousHitNormal, -shiftedDirection) > 0.05 ? 1.0 : 0.0);
+            // A freshly traced/validated finite path remains valid while the receiver is
+            // effectively stationary. Revalidate it periodically (or immediately after
+            // motion) instead of repeating the same long world march every frame. This is
+            // a bounded visibility cache, not an unchecked history shortcut: endpoint ID,
+            // geometry reprojection and facing tests above still have to match.
+            bool reusedVisibility = !skyRay && previousStats.w < 4.0 &&
+                length(previousOrigin - currentOrigin) <=
+                    max(0.02, _GIClipmapLevels[0].cellSize * 0.25) &&
+                !any(previousStableId == 0u);
+            bool strictVisibility = false;
+            bool deferredVisibility = false;
+            if (!skyRay && !reusedVisibility)
+            {
+                bool scheduledValidation = GIValidationGate(
+                    dispatchId.xy, 0u, diffuseSize,
+                    _GIDiffuseVisibilityBudget, 1u,
+                    0x243f6a88u, 5.0);
+                if (scheduledValidation && GIConsumeDiffuseVisibilityBudget())
+                {
+                    strictVisibility = GIStrictReconnectionVisibility(
+                        currentOrigin, hitPoint, previousStableId, 1.0);
+                }
+                else
+                {
+                    // A hard ray budget is an amortization policy, not evidence that a
+                    // previously validated path became occluded.  Rejecting every path
+                    // which lost the budget lottery injected a dark sample into most
+                    // reservoirs every fourth frame.  Defer that validation while the
+                    // receiver and persistent endpoint identity remain unchanged.
+                    deferredVisibility = !any(previousStableId == 0u);
+                }
+                if (!strictVisibility && !deferredVisibility)
+                    secondaryFacing = 0.0;
+            }
             float shiftedTarget = GIDiffuseTarget(
                 previousRadiance.rgb, currentNormal, shiftedDirection) * secondaryFacing;
             if (shiftedTarget <= 1e-6)
@@ -1852,7 +2956,7 @@ void TemporalDiffuse(uint3 dispatchId : SV_DispatchThreadID)
                     (reusedCount / max(previousStats.y, 1.0));
                 float jacobian = GIReconnectionJacobian(
                     previousRay.xyz, previousRay.w, shiftedDirection, shiftedDistance,
-                    previousHit.xyz, previousHit.w);
+                    previousHitNormal, previousHit.w);
                 float targetRatio = min(
                     shiftedTarget / max(previousStats.z, 1e-6), 4.0);
                 float candidateWeight = reusedWeightSum *
@@ -1867,10 +2971,12 @@ void TemporalDiffuse(uint3 dispatchId : SV_DispatchThreadID)
                     selectedRadiance = previousRadiance.rgb;
                     selectedDirection = shiftedDirection;
                     selectedDistance = shiftedDistance;
-                    selectedHitNormal = previousHit.xyz;
+                    selectedHitNormal = previousHitNormal;
                     selectedHitValid = previousHit.w;
+                    selectedStableId = previousStableId;
                     selectedSourcePdf = max(previousRadiance.a, 1e-6);
-                    selectedAge = min(previousStats.w + 1.0, 255.0);
+                    selectedAge = skyRay ? min(previousStats.w + 1.0, 255.0) :
+                        (strictVisibility ? 0.0 : min(previousStats.w + 1.0, 12.0));
                     selectedTarget = max(shiftedTarget, 1e-5);
                 }
             }
@@ -1883,8 +2989,8 @@ void TemporalDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     _GIDiffuseReservoirRayWrite[dispatchId.xy] = float4(selectedDirection, selectedDistance);
     _GIDiffuseReservoirStatsWrite[dispatchId.xy] = float4(
         weightSum, sampleCount, selectedTarget, selectedAge);
-    _GIDiffuseReservoirHitWrite[dispatchId.xy] = float4(
-        selectedHitNormal, selectedHitValid);
+    _GIDiffuseReservoirHitWrite[dispatchId.xy] = GIEncodeDiffuseHit(
+        selectedHitNormal, selectedHitValid, selectedStableId);
 }
 
 float3 GIDiffuseTonemap(float3 color)
@@ -1907,9 +3013,6 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     if (_GIEnableDiffuse == 0u || GIIsBackground(depth))
     {
         _GICurrentDiffuse[dispatchId.xy] = 0.0;
-        _GICurrentDiffuseRay[dispatchId.xy] = 0.0;
-        _GICurrentDiffuseStats[dispatchId.xy] = 0.0;
-        _GICurrentDiffuseHit[dispatchId.xy] = 0.0;
         _GIDiffuseReservoirRadianceWrite[dispatchId.xy] = 0.0;
         _GIDiffuseReservoirRayWrite[dispatchId.xy] = 0.0;
         _GIDiffuseReservoirStatsWrite[dispatchId.xy] = 0.0;
@@ -1919,6 +3022,7 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
 
     float3 centerNormal = GILoadNormal(uv);
     float3 centerPosition = GIWorldPosition(uv, depth);
+    uint centerMaterial = GIMaterialSignature(uv);
     float originOffset = max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
     float3 centerOrigin = centerPosition + centerNormal * originOffset;
     float4 centerRadianceRecord = _GIDiffuseReservoirRadianceRead.Load(int3(dispatchId.xy, 0));
@@ -1929,8 +3033,9 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     float3 selectedRadiance = centerRadianceRecord.rgb;
     float3 selectedDirection = normalize(centerRayRecord.xyz);
     float selectedDistance = centerRayRecord.w;
-    float3 selectedHitNormal = centerHit.xyz;
+    float3 selectedHitNormal = GIDecodeDiffuseHitNormal(centerHit);
     float selectedHitValid = centerHit.w;
+    uint2 selectedStableId = GIDecodeDiffuseHitStableId(centerHit);
     float selectedSourcePdf = max(centerRadianceRecord.a, 1e-6);
     float selectedAge = centerStats.w;
     float selectedTarget = max(centerStats.z, 1e-6);
@@ -1943,6 +3048,113 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     float weightSum = centerInputCount > 0.0
         ? max(0.0, centerStats.x) / centerInputCount : 0.0;
     float reservoirCount = centerInputCount > 0.0 ? 1.0 : 0.0;
+    // Keep an unmodified center fallback. Spatial candidates are selected using cheap
+    // geometry/radiometric tests first; only the final finite winner pays for strict
+    // world visibility. If that one reconnection fails, restoring both the payload and
+    // W/M avoids treating several unvalidated neighbours as black samples.
+    // The aligned 2x2 lanes are one directional screen probe.  ReSTIR selection alone
+    // still emits one coloured representative and therefore does not reduce RGB variance.
+    // Form a geometry-gated vector estimate from the four persistent temporal lanes.  At
+    // one ray/probe only one lane is refreshed per frame; reading CurrentDiffuse here used
+    // to see the other three lanes as explicit nulls, so the advertised four-direction
+    // reconstruction was in fact still a single red/cyan representative.  The temporal
+    // reservoirs retain the four independently rotated strata without adding world rays.
+    float3 probeEstimateSum = 0.0;
+    float probeEstimateWeight = 0.0;
+    uint probeEstimateCount = 0u;
+    bool compactProbeGrid = _GIDiffuseSize.x * 4u < _GIFullSize.x ||
+                            _GIDiffuseSize.y * 4u < _GIFullSize.y;
+    int2 alignedProbeBase = compactProbeGrid
+        ? (int2)dispatchId.xy
+        : (int2)(dispatchId.xy & uint2(~1u, ~1u));
+    uint laneCount = compactProbeGrid ? 1u : 4u;
+    [unroll]
+    for (uint lane = 0u; lane < 4u; lane++)
+    {
+        if (lane >= laneCount)
+            break;
+        int2 lanePixel = clamp(
+            alignedProbeBase + int2(lane & 1u, (lane >> 1u) & 1u),
+            0, (int2)_GIDiffuseSize - 1);
+        float2 laneUv = GIUvFromPixel((uint2)lanePixel, _GIDiffuseSize);
+        float laneDepth = GILoadDepth(laneUv);
+        if (GIIsBackground(laneDepth) ||
+            GIMaterialSignature(laneUv) != centerMaterial)
+            continue;
+        float3 laneNormal = GILoadNormal(laneUv);
+        float normalAgreement = dot(centerNormal, laneNormal);
+        if (normalAgreement < 0.90)
+            continue;
+        float3 lanePosition = GIWorldPosition(laneUv, laneDepth);
+        float3 receiverOffset = lanePosition - centerPosition;
+        float receiverDistance = length(receiverOffset);
+        float planeError = abs(dot(receiverOffset, centerNormal));
+        float cameraDistance = length(centerPosition - _GICameraPosition);
+        // Bound the far-field footprint. The old slope admitted separate repeated props
+        // into one 2x2 directional probe and made one coloured path cover both objects.
+        float receiverLimit = min(0.50, max(0.12, cameraDistance * 0.0015));
+        if (receiverDistance > receiverLimit ||
+            planeError > max(0.025, receiverDistance * 0.05))
+            continue;
+
+        float4 laneStats = _GIDiffuseReservoirStatsRead.Load(int3(lanePixel, 0));
+        if (laneStats.y <= 0.0)
+            continue;
+        float geometryWeight = pow(saturate(normalAgreement), 16.0) *
+            exp2(-planeError * 24.0);
+        float3 laneEstimate = 0.0;
+        if (laneStats.x > 0.0)
+        {
+            float4 laneRadiance = _GIDiffuseReservoirRadianceRead.Load(
+                int3(lanePixel, 0));
+            float4 laneRay = _GIDiffuseReservoirRayRead.Load(int3(lanePixel, 0));
+            float4 laneHit = _GIDiffuseReservoirHitRead.Load(int3(lanePixel, 0));
+            float3 laneOrigin = lanePosition + laneNormal * originOffset;
+            bool skyPath = laneHit.w < 0.5 ||
+                           laneRay.w >= _GIMaxTraceDistance * 0.999;
+            // A finite lane is a segment from its own receiver. It cannot be shifted like
+            // a sky direction unless both receivers lie inside the same C0-cell-scale
+            // neighbourhood. The path reservoir below already follows this rule; the
+            // displayed vector estimate must follow it too.
+            bool locallyReusableFinitePath = skyPath ||
+                (receiverDistance <= max(0.08, _GIClipmapLevels[0].cellSize) &&
+                 planeError <= max(0.02, _GIClipmapLevels[0].cellSize * 0.15) &&
+                 laneHit.w >= 0.5 &&
+                 !any(GIDecodeDiffuseHitStableId(laneHit) == 0u));
+            if (!locallyReusableFinitePath)
+                continue;
+            float3 hitNormal = GIDecodeDiffuseHitNormal(laneHit);
+            float3 hitPosition = laneOrigin + normalize(laneRay.xyz) * laneRay.w;
+            float3 shiftedDirection = skyPath
+                ? normalize(laneRay.xyz) : normalize(hitPosition - centerOrigin);
+            float shiftedDistance = skyPath
+                ? _GIMaxTraceDistance : length(hitPosition - centerOrigin);
+            float secondaryFacing = skyPath ? 1.0 :
+                (dot(hitNormal, -shiftedDirection) > 0.05 ? 1.0 : 0.0);
+            float shiftedTarget = GIDiffuseTarget(
+                laneRadiance.rgb, centerNormal, shiftedDirection) * secondaryFacing;
+            if (shiftedTarget > 1e-6)
+            {
+                float shiftedWeight = laneStats.x * min(
+                    shiftedTarget / max(laneStats.z, 1e-6), 2.0) *
+                    clamp(GIReconnectionJacobian(
+                        laneRay.xyz, laneRay.w, shiftedDirection, shiftedDistance,
+                        hitNormal, laneHit.w), 0.5, 2.0);
+                laneEstimate = GIDiffuseReservoirEstimate(
+                    laneRadiance.rgb, shiftedDirection, centerNormal,
+                    shiftedTarget, shiftedWeight, laneStats.y);
+                laneEstimate = GIClampDiffuseCandidate(
+                    laneEstimate * (1.0 / PI)) * PI;
+            }
+        }
+        // Dark/null proposals must participate or the reconstruction is biased bright.
+        // Average the display estimator in compressed-radiance space. The persistent
+        // reservoir keeps the unmodified HDR path and remains the source of truth; this
+        // only prevents one rare cyan/emissive lane from painting the entire 2x2 probe.
+        probeEstimateSum += GIDiffuseTonemap(max(0.0, laneEstimate)) * geometryWeight;
+        probeEstimateWeight += geometryWeight;
+        probeEstimateCount++;
+    }
 
     uint spatialSampleCount = min(_GIDiffuseSpatialSamples, 8u);
     float radius = max(1.0, _GIDiffuseSpatialRadius);
@@ -1959,7 +3171,7 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
             break;
         int2 samplePixel;
         float2 sampleOffset;
-        if (sampleIndex < 3u)
+        if (!compactProbeGrid && sampleIndex < 3u)
         {
             // First consume the other three lanes of the aligned 2x2 directional probe.
             // These lanes cover complementary cosine strata without adding a world ray.
@@ -1982,7 +3194,8 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
         }
         float2 sampleUv = GIUvFromPixel((uint2)samplePixel, _GIDiffuseSize);
         float sampleDepth = GILoadDepth(sampleUv);
-        if (GIIsBackground(sampleDepth))
+        if (GIIsBackground(sampleDepth) ||
+            GIMaterialSignature(sampleUv) != centerMaterial)
             continue;
         float3 sampleNormal = GILoadNormal(sampleUv);
         float normalAgreement = dot(centerNormal, sampleNormal);
@@ -1992,13 +3205,15 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
         float3 surfaceOffset = samplePosition - centerPosition;
         float surfaceDistance = length(surfaceOffset);
         float cameraDistance = length(centerPosition - _GICameraPosition);
-        float maximumSurfaceDistance = max(
-            0.20, cameraDistance * 0.003 * max(1.0, length(sampleOffset)));
+        float maximumSurfaceDistance = min(0.75, max(
+            0.16, cameraDistance * 0.0012 * max(1.0, length(sampleOffset))));
         if (surfaceDistance > maximumSurfaceDistance)
             continue;
         float planeError = abs(dot(surfaceOffset, centerNormal));
         if (planeError > max(0.05, surfaceDistance * 0.08))
             continue;
+        float reconstructionWeight = pow(saturate(normalAgreement), 16.0) *
+            exp2(-planeError * 24.0);
 
         float4 candidateRadianceRecord =
             _GIDiffuseReservoirRadianceRead.Load(int3(samplePixel, 0));
@@ -2015,26 +3230,52 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
             // They add no W and cannot be selected, but omitting their M biases the probe
             // toward whichever lane happened to see sky or an emitter.
             reservoirCount += reusedCandidateCount;
+            if (compactProbeGrid)
+            {
+                probeEstimateWeight += reconstructionWeight;
+                probeEstimateCount++;
+            }
             continue;
         }
 
         float3 sampleOrigin = samplePosition + sampleNormal * originOffset;
         bool skyPath = candidateHit.w < 0.5 ||
                        candidateRay.w >= _GIMaxTraceDistance * 0.999;
+        float3 candidateHitNormal = GIDecodeDiffuseHitNormal(candidateHit);
+        uint2 candidateStableId = GIDecodeDiffuseHitStableId(candidateHit);
+        if (!skyPath && any(candidateStableId == 0u))
+            continue;
         float3 hitPosition = sampleOrigin + normalize(candidateRay.xyz) * candidateRay.w;
         float3 shiftedDirection = skyPath
             ? normalize(candidateRay.xyz) : normalize(hitPosition - centerOrigin);
         float shiftedDistance = skyPath
             ? _GIMaxTraceDistance : length(hitPosition - centerOrigin);
+        bool reusableVisibility = !skyPath && candidateHit.w >= 0.5 &&
+            candidateStats.w < 4.0 &&
+            length(sampleOrigin - centerOrigin) <=
+                max(0.08, _GIClipmapLevels[0].cellSize) &&
+            planeError <= max(0.02, _GIClipmapLevels[0].cellSize * 0.15) &&
+            normalAgreement >= 0.90;
         float secondaryFacing = skyPath ? 1.0 :
-            (dot(normalize(candidateHit.xyz), -shiftedDirection) > 0.05 ? 1.0 : 0.0);
+            (dot(candidateHitNormal, -shiftedDirection) > 0.05 ? 1.0 : 0.0);
         float shiftedTarget = GIDiffuseTarget(
             candidateRadianceRecord.rgb, centerNormal, shiftedDirection) * secondaryFacing;
         if (shiftedTarget <= 1e-6)
         {
             reservoirCount += reusedCandidateCount;
+            if (compactProbeGrid)
+            {
+                probeEstimateWeight += reconstructionWeight;
+                probeEstimateCount++;
+            }
             continue;
         }
+        // Wide finite-path reconnection was the remaining expensive spatial visibility
+        // march and a major source of coloured islands.  Temporal reuse already validates
+        // long paths. Spatial reuse is restricted to sky or a tight coplanar receiver
+        // neighbourhood, where the cached segment is locally reusable.
+        if (!skyPath && !reusableVisibility)
+            continue;
         float targetRatio = min(
             shiftedTarget / max(candidateStats.z, 1e-6), 4.0);
         // Geometry compatibility above is an acceptance test, not radiometric
@@ -2042,16 +3283,36 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
         // full M made W/M shrink with every spatial merge and darkened the image whenever
         // Spatial Samples was enabled.
         float candidateMeanWeight = candidateStats.x / max(candidateStats.y, 1.0);
+        float reconnectionJacobian = GIReconnectionJacobian(
+            candidateRay.xyz, candidateRay.w, shiftedDirection, shiftedDistance,
+            candidateHitNormal, candidateHit.w);
         float candidateWeight = candidateMeanWeight * targetRatio *
-            GIReconnectionJacobian(
-                candidateRay.xyz, candidateRay.w, shiftedDirection, shiftedDistance,
-                candidateHit.xyz, candidateHit.w);
+            reconnectionJacobian;
+        if (compactProbeGrid && all(samplePixel != (int2)dispatchId.xy))
+        {
+            // Keep path selection as a persistent ReSTIR reservoir, but reconstruct the
+            // displayed diffuse irradiance as a vector mean of independent neighbouring
+            // reservoirs.  Selecting one representative is unbiased yet produces exactly
+            // the red/cyan speckle the user observed at one SPP; averaging their W/M
+            // estimates removes that variance without tracing additional rays.
+            float shiftedWeightSum = candidateStats.x * min(targetRatio, 2.0) *
+                clamp(reconnectionJacobian, 0.5, 2.0);
+            float3 candidateEstimate = GIDiffuseReservoirEstimate(
+                candidateRadianceRecord.rgb, shiftedDirection, centerNormal,
+                shiftedTarget, shiftedWeightSum, candidateStats.y);
+            candidateEstimate = GIClampDiffuseCandidate(
+                candidateEstimate * (1.0 / PI)) * PI;
+            probeEstimateSum += GIDiffuseTonemap(max(0.0, candidateEstimate)) *
+                reconstructionWeight;
+            probeEstimateWeight += reconstructionWeight;
+            probeEstimateCount++;
+        }
         candidateWeight = GIClampMergedReservoirWeight(
             candidateWeight, reusedCandidateCount,
             weightSum, reservoirCount, 4.0);
-        // SpatialDiffuse already writes eight UAV textures (current + persistent
-        // reservoir payload). D3D11 supports at most eight UAVs for this kernel, so
-        // diagnostic atomics cannot be emitted here as a ninth UAV.
+        // The strict visibility allocator is an RW buffer. Keep SpatialDiffuse below the
+        // D3D11 eight-UAV limit by writing only final colour + persistent payload; the
+        // duplicated current ray/hit/stats records are no longer consumed after this pass.
         if (GIReservoirUpdate(
                 weightSum, reservoirCount, candidateWeight,
                 reusedCandidateCount,
@@ -2060,10 +3321,12 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
             selectedRadiance = candidateRadianceRecord.rgb;
             selectedDirection = shiftedDirection;
             selectedDistance = shiftedDistance;
-            selectedHitNormal = candidateHit.xyz;
+            selectedHitNormal = candidateHitNormal;
             selectedHitValid = candidateHit.w;
+            selectedStableId = candidateStableId;
             selectedSourcePdf = max(candidateRadianceRecord.a, 1e-6);
-            selectedAge = candidateStats.w;
+            selectedAge = skyPath ? candidateStats.w :
+                (reusableVisibility ? min(candidateStats.w + 1.0, 4.0) : 0.0);
             selectedTarget = max(shiftedTarget, 1e-5);
         }
     }
@@ -2072,37 +3335,23 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     // overlapping path counts. Final colour/moments history remains the long accumulator.
     GIReservoirLimit(weightSum, reservoirCount,
                      (float)spatialSampleCount + 1.0);
-    if (selectedHitValid > 0.5)
-    {
-        float3 selectedHitPosition = centerOrigin + selectedDirection * selectedDistance;
-        if (!GIShortDepthVisibility(centerOrigin, selectedHitPosition))
-        {
-            selectedRadiance = centerRadianceRecord.rgb;
-            selectedDirection = normalize(centerRayRecord.xyz);
-            selectedDistance = centerRayRecord.w;
-            selectedHitNormal = centerHit.xyz;
-            selectedHitValid = centerHit.w;
-            selectedSourcePdf = max(centerRadianceRecord.a, 1e-6);
-            selectedAge = centerStats.w;
-            selectedTarget = max(centerStats.z, 1e-6);
-            weightSum = centerInputCount > 0.0
-                ? max(0.0, centerStats.x) / centerInputCount : 0.0;
-            reservoirCount = centerInputCount > 0.0 ? 1.0 : 0.0;
-        }
-    }
-
     float3 estimate = GIDiffuseReservoirEstimate(
         selectedRadiance, selectedDirection, centerNormal,
         selectedTarget, weightSum, reservoirCount);
+    if (probeEstimateCount >= 2u && probeEstimateWeight > 1e-5)
+    {
+        float3 probeEstimate = GIDiffuseInverseTonemap(
+            probeEstimateSum / probeEstimateWeight);
+        float probeConfidence = saturate((float)(probeEstimateCount - 1u) / 3.0);
+        float reconstructionStrength = compactProbeGrid ? 0.90 : 0.80;
+        estimate = lerp(
+            estimate, probeEstimate, probeConfidence * reconstructionStrength);
+    }
     // Bound the final estimator as well as individual paths: reconnection ratios can still
     // amplify a legal candidate. The limit is expressed as radiance; irradiance is PI times
     // that scale for cosine sampling.
     estimate = GIClampDiffuseCandidate(estimate * (1.0 / PI)) * PI;
     _GICurrentDiffuse[dispatchId.xy] = float4(max(0.0, estimate), depth);
-    _GICurrentDiffuseRay[dispatchId.xy] = float4(selectedDirection, selectedDistance);
-    _GICurrentDiffuseStats[dispatchId.xy] = float4(
-        weightSum, reservoirCount, selectedTarget, selectedAge);
-    _GICurrentDiffuseHit[dispatchId.xy] = float4(selectedHitNormal, selectedHitValid);
     // Spatial reuse is the final path reservoir for this pixel. Persist it instead of
     // throwing it away and making the next frame restart from the temporal-only result.
     _GIDiffuseReservoirRadianceWrite[dispatchId.xy] = float4(
@@ -2116,12 +3365,12 @@ void SpatialDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     GIReservoirLimit(persistentWeightSum, persistentCount, 8.0);
     _GIDiffuseReservoirStatsWrite[dispatchId.xy] = float4(
         persistentWeightSum, persistentCount, selectedTarget, selectedAge);
-    _GIDiffuseReservoirHitWrite[dispatchId.xy] = float4(
-        selectedHitNormal, selectedHitValid);
+    _GIDiffuseReservoirHitWrite[dispatchId.xy] = GIEncodeDiffuseHit(
+        selectedHitNormal, selectedHitValid, selectedStableId);
 }
 
 float3 GIClipDiffuseHistory(Texture2D<float4> currentTexture, uint2 pixel,
-                            uint2 size, float3 history)
+                            uint2 size, float3 history, float historyLength)
 {
     float2 centerUv = GIUvFromPixel(pixel, size);
     float3 centerNormal = GILoadNormal(centerUv);
@@ -2148,15 +3397,16 @@ float3 GIClipDiffuseHistory(Texture2D<float4> currentTexture, uint2 pixel,
         secondMoment += mapped * mapped;
         count += 1.0;
     }
-    if (count <= 0.0)
-        return GIDiffuseTonemap(max(0.0, history));
+    float3 mappedHistory = GIDiffuseTonemap(max(0.0, history));
+    if (count <= 0.0 || historyLength >= 4.0)
+        return mappedHistory;
     mean /= count;
     float3 variance = max(0.0, secondMoment / count - mean * mean);
     // Do not force a stable red history into a one-frame cyan neighbourhood (or vice
     // versa). Luminance moments handle exposure changes; this wider RGB envelope lets
     // temporal blending average chroma noise instead of making coloured patches switch.
     float3 extent = max(2.5 * sqrt(variance), 0.025 + mean * 0.12);
-    return clamp(GIDiffuseTonemap(max(0.0, history)),
+    return clamp(mappedHistory,
                  max(0.0, mean - extent), mean + extent);
 }
 
@@ -2170,9 +3420,9 @@ float3 GIBootstrapDiffuse(Texture2D<float4> currentTexture, uint2 pixel,
     float3 secondMoment = 0.0;
     float count = 0.0;
     [unroll]
-    for (int y = -1; y <= 1; y++)
+    for (int y = -2; y <= 2; y++)
     [unroll]
-    for (int x = -1; x <= 1; x++)
+    for (int x = -2; x <= 2; x++)
     {
         uint2 samplePixel = (uint2)clamp(
             (int2)pixel + int2(x, y), 0, (int2)size - 1);
@@ -2273,11 +3523,13 @@ void DenoiseDiffuse(uint3 dispatchId : SV_DispatchThreadID)
 
     float2 uv = GIUvFromPixel(dispatchId.xy, diffuseSize);
     float3 currentNormal = GILoadNormal(uv);
-    uint2 previousPixel;
-    float2 previousUv;
-    float validity = GITemporalDiffuseMatch(
-        uv, current.a, currentNormal, GIMaterialSignature(uv),
-        previousPixel, previousUv);
+    uint reprojection = _GICurrentDiffuseReprojectionRead.Load(
+        int3(dispatchId.xy, 0));
+    float validity = reprojection != 0xffffffffu ? 1.0 : 0.0;
+    uint2 previousPixel = validity > 0.0
+        ? uint2(reprojection % diffuseSize.x, reprojection / diffuseSize.x) : 0u;
+    float2 previousUv = validity > 0.0
+        ? GIUvFromPixel(previousPixel, diffuseSize) : uv;
     float3 result = max(0.0, current.rgb);
     // Disoccluded pixels have no trustworthy temporal accumulator.  Clamp their first
     // one-SPP estimate against only same-material, same-normal neighbours in compressed
@@ -2324,53 +3576,60 @@ void DenoiseDiffuse(uint3 dispatchId : SV_DispatchThreadID)
         if (!GIIsBackground(previous.a))
         {
             float4 previousMoments = _GIDiffuseMomentsRead.Load(int3(previousPixel, 0));
+            float oldLength = clamp(previousMoments.z, 0.0, 64.0);
             // Min/max clipping to a single noisy frame erased almost all of a 0.98
             // history blend and produced persistent dark rows.  Clip in compressed
-            // radiance space against a geometry-compatible variance interval instead.
+            // radiance space only while history is being established. Once geometry-
+            // validated history has four frames, a noisy one-SPP neighbourhood is not a
+            // valid rejection envelope and must not overwrite its RGB accumulator.
             float3 mappedPrevious = GIClipDiffuseHistory(
                 _GICurrentDiffuseRead, dispatchId.xy, diffuseSize,
-                max(0.0, previous.rgb));
+                max(0.0, previous.rgb), oldLength);
             float previousLuminance = GILuminance(max(0.0, previous.rgb));
             float logDifference = abs(log2(
                 (currentLuminance + 0.02) / (previousLuminance + 0.02)));
-            bool staleEnergySpike = previousLuminance > currentLuminance * 4.0 + 0.25;
             // React only to multi-stop changes.  Ordinary Monte-Carlo variation must not
             // collapse the configured history weight every frame.
             // A newly selected path (age=0) is precisely where rare emissive hits are
             // noisiest. Keep stronger final history for it; only let a persistent path
             // trigger reactive lighting change behaviour after several matching frames.
-            float oldLength = clamp(previousMoments.z, 0.0, 64.0);
             float historyConfidence = saturate(oldLength * 0.125);
-            float reactive = saturate((logDifference - 1.5) * 0.40) *
-                             max(saturate(reservoirAge * 0.25), historyConfidence);
             float oldVariance = max(0.0, previousMoments.y -
                 previousMoments.x * previousMoments.x);
             float noise = saturate(sqrt(oldVariance) /
                 max(previousMoments.x + 0.05, 0.05));
+            // A one-SPP dark/null result is common Monte-Carlo evidence, not proof that a
+            // red or cyan bounce disappeared. The old asymmetric stale-energy test reset
+            // history on every miss and froze coloured blotches in place. React quickly
+            // to a convincing energy increase; let decreases decay through the bounded
+            // accumulator until a separate fast-history signal is available.
+            bool energyIncrease = currentLuminance > previousLuminance * 4.0 + 0.25;
+            float reactive = energyIncrease
+                ? saturate((logDifference - 2.0) * 0.30) * historyConfidence *
+                  lerp(1.0, 0.35, noise)
+                : 0.0;
             float configuredHistory = saturate(_GIDiffuseHistoryWeight);
             // High-variance one-SPP pixels need a longer accumulator, while stable pixels
             // retain the artist-facing response configured by Diffuse History Weight.
+            // NRD keeps a separate short "fast history" so noisy long history does not
+            // impose a one-second lighting lag. We retain one buffer, but enforce the same
+            // response bound: high variance may extend the 0.88 default to ~16 frames,
+            // never to the former ~33-frame 0.97 accumulator.
             float historyCap = configuredHistory > 0.0
-                ? lerp(configuredHistory, max(configuredHistory, 0.97), noise)
+                ? lerp(configuredHistory, max(configuredHistory, 0.94), noise)
                 : 0.0;
             float historyWeight = min(historyCap, oldLength / (oldLength + 1.0)) *
                                   validity * lerp(1.0, 0.35, reactive);
-            if (oldLength < 4.0 && logDifference > 1.0)
-                historyWeight = min(historyWeight, 0.5);
-            if (staleEnergySpike)
-                historyWeight = 0.0;
             float3 mappedCurrent = GIDiffuseTonemap(result);
             result = GIDiffuseInverseTonemap(
                 lerp(mappedCurrent, mappedPrevious, historyWeight));
 
             float momentHistory = min(0.97, oldLength / (oldLength + 1.0)) *
                                   validity * lerp(1.0, 0.20, reactive);
-            if (staleEnergySpike)
-                momentHistory = 0.0;
             firstMoment = lerp(currentLuminance, previousMoments.x, momentHistory);
             secondMoment = lerp(currentLuminance * currentLuminance,
                                 previousMoments.y, momentHistory);
-            historyLength = reactive > 0.5 || staleEnergySpike
+            historyLength = reactive > 0.75
                 ? 1.0 : min(oldLength + 1.0, 64.0);
             variance = max(0.0, secondMoment - firstMoment * firstMoment);
         }
@@ -2418,8 +3677,14 @@ void FilterDiffuse(uint3 dispatchId : SV_DispatchThreadID)
     float4 centerMoments = _GIDiffuseMomentsRead.Load(int3(dispatchId.xy, 0));
     float centerSigma = sqrt(max(centerMoments.w,
         centerMoments.y - centerMoments.x * centerMoments.x));
+    float centerNoise = saturate(centerSigma /
+        max(centerMoments.x + 0.05, 0.05));
+    // Two separable cross iterations (step 1 and 2) provide a 13-point diamond support
+    // while requiring ten taps total.  The old two 3x3 iterations required eighteen taps
+    // and repeatedly fetched full-resolution depth/normal/material for diagonal samples;
+    // those diagonals are already reached by the second cross iteration.
     [unroll]
-    for (uint sampleIndex = 0u; sampleIndex < 9u; sampleIndex++)
+    for (uint sampleIndex = 0u; sampleIndex < 5u; sampleIndex++)
     {
         int2 samplePixel = clamp(
             (int2)dispatchId.xy + GIDiffuseFilterOffset(sampleIndex) *
@@ -2437,18 +3702,29 @@ void FilterDiffuse(uint3 dispatchId : SV_DispatchThreadID)
             continue;
         float3 samplePosition = GIWorldPosition(sampleUv, sampleValue.a);
         float3 positionDelta = samplePosition - centerPosition;
+        float surfaceDistance = length(positionDelta);
         float planeError = abs(dot(positionDelta, centerNormal));
-        if (planeError > max(0.04, length(positionDelta) * 0.06))
+        float cameraDistance = length(centerPosition - _GICameraPosition);
+        float filterFootprint = max(1.0, (float)_GIDiffuseAtrousStep);
+        float surfaceLimit = max(0.16, cameraDistance * 0.0030 * filterFootprint);
+        if (surfaceDistance > surfaceLimit ||
+            planeError > max(0.04, surfaceDistance * 0.06))
             continue;
-        float kernelWeight = sampleIndex == 0u ? 6.0 :
+        // Do not protect a noisy centre sample from its valid neighbours. Geometry,
+        // material and plane tests preserve actual edges; variance controls how strongly
+        // the filter is allowed to average radiometric disagreement.
+        float centerKernelWeight = lerp(6.0, 2.0, centerNoise);
+        float kernelWeight = sampleIndex == 0u ? centerKernelWeight :
                              (sampleIndex <= 4u ? 2.0 : 1.0);
         float sampleLuminance = GILuminance(max(0.0, sampleValue.rgb));
         float logLuminanceDelta = abs(log2(
             (sampleLuminance + 0.05) / (centerLuminance + 0.05)));
         float sampleVariance = _GIDiffuseMomentsRead.Load(int3(samplePixel, 0)).w;
         float sigma = max(0.025, centerSigma + sqrt(max(0.0, sampleVariance)));
+        float relativeSigma = saturate(
+            sigma / max(centerLuminance + 0.05, 0.05));
         float luminanceWeight = exp2(-logLuminanceDelta *
-            lerp(1.25, 0.35, saturate(sigma / max(centerLuminance + 0.05, 0.05))));
+            lerp(1.25, 0.12, relativeSigma));
         float weight = kernelWeight * pow(normalAgreement, 32.0) *
                        exp2(-planeError * 16.0) * luminanceWeight;
         sum += max(0.0, sampleValue.rgb) * weight;
@@ -2478,9 +3754,23 @@ void TraceSpecular(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_
     {
         _GICurrentSpecular[dispatchId.xy] = float4(0.0, 0.0, 0.0, depth);
         _GICurrentSpecularRay[dispatchId.xy] = 0.0;
+        _GICurrentSpecularHit[dispatchId.xy] = 0.0;
+        _GICurrentSpecularStats[dispatchId.xy] = 0.0;
+        _GICurrentSpecularId[dispatchId.xy] = 0u;
     }
     GroupMemoryBarrierWithGroupSync();
     if (!inBounds || gSpecularTileActive == 0u || !eligible)
+        return;
+
+    // Preserve full-rate geometric detail for near mirrors.  Rough lobes are already
+    // represented by a persistent temporal reservoir and low-resolution spatial reuse;
+    // tracing both checkerboard phases every frame repeats almost identical million-ray
+    // work at 4K.  Alternating parity retains the 0.375 sample grid and refreshes every
+    // receiver within two frames, unlike lowering the resolution to 0.25 (which caused
+    // the former screen-space split line and permanently discarded spatial samples).
+    bool checkerboardRough = roughness > 0.20;
+    uint checkerboardPhase = (dispatchId.x ^ dispatchId.y) & 1u;
+    if (checkerboardRough && checkerboardPhase != (_GIFrameIndex & 1u))
         return;
 
     float3 normal = GILoadNormal(uv);
@@ -2489,17 +3779,476 @@ void TraceSpecular(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_
     uint seed = dispatchId.x + dispatchId.y * _GISpecularSize.x + _GIFrameIndex * 12289u;
     float3 direction = GIGgxDirection(normal, viewDirection, roughness, GIRandom2(seed));
     uint preferredLevel = (uint)clamp(floor(roughness * 5.0), 0.0, 5.0);
-    float hitDistance = _GIMaxTraceDistance;
-    float3 radiance = 0.0;
-    float3 hitNormal;
-    float hitValid;
     float3 origin = position + normal * max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
     // Specular correctness is world-space only. HZB/scene colour remains a diffuse
     // candidate accelerator and is deliberately not an SSR source for reflections.
-    GITraceSpecularWorld(origin, direction, preferredLevel, roughness,
-                         radiance, hitDistance, hitNormal, hitValid);
-    _GICurrentSpecular[dispatchId.xy] = float4(radiance, depth);
-    _GICurrentSpecularRay[dispatchId.xy] = float4(direction, hitDistance);
+    GIPathPayload payload;
+    GITraceSpecularWorld(
+        origin, direction, preferredLevel, roughness, dispatchId.xy, payload);
+    float sourcePdf = GIGgxDirectionPdf(normal, viewDirection, direction, roughness);
+    bool pathValid = (payload.pathFlags & GI_PATH_VALID) != 0u;
+    float targetPdf = pathValid ? max(1e-6,
+        GILuminance(max(0.0, payload.radiance)) *
+        GIGgxReuseWeight(normal, viewDirection, direction, roughness)) : 0.0;
+    float candidateWeight = pathValid ? targetPdf / sourcePdf : 0.0;
+    payload.solidAnglePdf = sourcePdf;
+    payload.proposalPdf = sourcePdf;
+    payload.targetPdf = targetPdf;
+    payload.weightSum = candidateWeight;
+    payload.proposalCount = 1.0;
+    _GICurrentSpecular[dispatchId.xy] = float4(payload.radiance, depth);
+    _GICurrentSpecularRay[dispatchId.xy] = float4(
+        payload.incomingDirection, payload.hitDistance);
+    _GICurrentSpecularHit[dispatchId.xy] = float4(
+        payload.shadingNormal, (float)payload.pathFlags);
+    _GICurrentSpecularStats[dispatchId.xy] = float4(sourcePdf, targetPdf, candidateWeight, 1.0);
+    _GICurrentSpecularId[dispatchId.xy] = uint2(payload.objectId, payload.surfaceId);
+}
+
+// Keep the coarse Clipmap proposal and exact triangle refinement in separate kernels.
+// Unity's D3D frontend aborts when both large traversal graphs are inlined into one
+// TraceSpecular program.  This pass is budget-gated and only replaces a proposal after
+// the unified TLAS/BLAS finds an authoritative nearest triangle.
+[numthreads(8, 8, 1)]
+void RefineSpecular(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= _GISpecularSize) || _GIEnableSpecular == 0u)
+        return;
+    float2 uv = GIUvFromPixel(dispatchId.xy, _GISpecularSize);
+    float depth = GILoadDepth(uv);
+    if (GIIsBackground(depth))
+        return;
+    float roughness = saturate(
+        1.0 - _GIGBuffer2.Load(int3(GIFullPixelFromUv(uv), 0)).a);
+    if (roughness < _GIMinSpecularRoughness ||
+        roughness > min(_GIMaxSpecularRoughness, 0.35))
+        return;
+    if (!GIValidationGate(dispatchId.xy, 0u, _GISpecularSize,
+                          _GITriangleRefinementBudget, 1u,
+                          0x7f4a7c15u, 6.0) ||
+        !GIConsumeTriangleRefinementBudget())
+        return;
+
+    float4 rayRecord = _GICurrentSpecularRay[dispatchId.xy];
+    float rayLengthSquared = dot(rayRecord.xyz, rayRecord.xyz);
+    if (rayLengthSquared <= 1e-6)
+        return;
+    float3 direction = rayRecord.xyz * rsqrt(rayLengthSquared);
+    float3 normal = GILoadNormal(uv);
+    float3 position = GIWorldPosition(uv, depth);
+    float3 origin = position + normal * max(
+        0.01, _GIClipmapLevels[0].cellSize * 0.1);
+    GIPathPayload payload;
+    if (!GITraceBvhOnlySpecular(origin, direction, payload))
+        return;
+
+    float3 viewDirection = normalize(_GICameraPosition - position);
+    float sourcePdf = GIGgxDirectionPdf(
+        normal, viewDirection, direction, roughness);
+    float targetPdf = max(1e-6,
+        GILuminance(max(0.0, payload.radiance)) *
+        GIGgxReuseWeight(normal, viewDirection, direction, roughness));
+    float candidateWeight = targetPdf / max(sourcePdf, 1e-6);
+    _GICurrentSpecular[dispatchId.xy] = float4(payload.radiance, depth);
+    _GICurrentSpecularRay[dispatchId.xy] = float4(
+        direction, payload.hitDistance);
+    _GICurrentSpecularHit[dispatchId.xy] = float4(
+        payload.shadingNormal, (float)payload.pathFlags);
+    _GICurrentSpecularStats[dispatchId.xy] = float4(
+        sourcePdf, targetPdf, candidateWeight, 1.0);
+    _GICurrentSpecularId[dispatchId.xy] = uint2(
+        payload.objectId, payload.surfaceId);
+}
+
+bool GIConsumeSpecularVisibilityBudget()
+{
+    if (_GISpecularVisibilityBudget == 0u)
+        return false;
+    // Once a dispatch has exhausted its hard budget, avoid making every remaining
+    // low-resolution pixel contend on the same global atomic.  The atomic is still the
+    // authoritative reservation for the small race window before exhaustion.
+    if (_GITraceCounters[13] >= _GISpecularVisibilityBudget)
+        return false;
+    uint allocation;
+    InterlockedAdd(_GITraceCounters[13], 1u, allocation);
+    return allocation < _GISpecularVisibilityBudget;
+}
+
+bool GIConsumeDiffuseVisibilityBudget()
+{
+    if (_GIDiffuseVisibilityBudget == 0u)
+        return false;
+    if (_GITraceCounters[15] >= _GIDiffuseVisibilityBudget)
+        return false;
+    uint allocation;
+    InterlockedAdd(_GITraceCounters[15], 1u, allocation);
+    return allocation < _GIDiffuseVisibilityBudget;
+}
+
+bool GIStrictReconnectionVisibility(float3 origin, float3 targetPosition,
+                                    uint2 targetStableId, float roughness)
+{
+    float3 segment = targetPosition - origin;
+    float distanceValue = length(segment);
+    if (distanceValue <= 0.03 || any(targetStableId == 0u))
+        return false;
+    float3 direction = segment / distanceValue;
+    float bvhHitT;
+    float3 bvhHitNormal;
+    uint bvhMaterial, bvhMaterialSlot, bvhInstance, bvhTriangle;
+    float2 bvhBarycentrics;
+    uint2 bvhStableId;
+    float bvhTolerance = max(_GIClipmapLevels[0].cellSize * 0.35, distanceValue * 0.0075);
+    if (GITraceSceneBvh(
+            origin, direction, 0.02, distanceValue + bvhTolerance, 0u,
+            bvhHitT, bvhHitNormal, bvhMaterial, bvhMaterialSlot,
+            bvhBarycentrics, bvhInstance, bvhTriangle, bvhStableId))
+        return bvhStableId.x == targetStableId.x &&
+               (((targetStableId.y & 0x80000000u) != 0u) ||
+                bvhStableId.y == targetStableId.y) &&
+               abs(bvhHitT - distanceValue) <= bvhTolerance;
+    float hitT;
+    uint packedSurface;
+    uint hitIdentity;
+    uint hitLayer;
+    uint hitLevel;
+    int3 hitWorldCell;
+    int hitPhysicalBrick;
+    uint hitLocalCell;
+    uint traceSteps;
+    bool hit = GITraceUnifiedClipmaps(
+        _GIClipmapLevels,
+        _GIStaticPageTable, _GIStaticOccupancy, _GIStaticSurface, _GIStaticSurfaceIdentity,
+        _GIStaticDistance,
+        _GIDynamicPageTable, _GIDynamicOccupancy, _GIDynamicSurface, _GIDynamicSurfaceIdentity,
+        _GIDynamicDistance,
+        origin, direction, distanceValue + _GIClipmapLevels[0].cellSize * 1.5,
+        0u, 0u, hitT, packedSurface, hitIdentity, hitLayer, hitLevel, hitWorldCell,
+        hitPhysicalBrick, hitLocalCell, traceSteps);
+    if (!hit)
+        return false;
+    uint address = (uint)hitPhysicalBrick * GI_SURFACE_WORDS_PER_BRICK + hitLocalCell;
+    uint2 hitStableId = hitLayer == 0u ? _GIStaticSurfaceStableId[address]
+                                      : _GIDynamicSurfaceStableId[address];
+    if (any(hitStableId != targetStableId))
+        return false;
+    float tolerance = max(_GIClipmapLevels[hitLevel].cellSize * 2.5, distanceValue * 0.02);
+    if (roughness <= 0.35 && hitLevel <= 1u && GIConsumeTriangleRefinementBudget())
+    {
+        float refinedT;
+        float3 refinedNormal;
+        uint refinedMaterial;
+        uint refinedMaterialSlot;
+        float2 refinedBarycentrics;
+        uint refinedInstanceIndex;
+        uint refinedTriangleIndex;
+        uint2 refinedStableId;
+        if (!GIRefineClipmapHit(origin, direction, hitT, hitLayer, hitLevel, hitWorldCell,
+                                refinedT, refinedNormal, refinedMaterial,
+                                refinedMaterialSlot, refinedBarycentrics,
+                                refinedInstanceIndex, refinedTriangleIndex,
+                                refinedStableId) ||
+            any(refinedStableId != targetStableId))
+            return false;
+        hitT = refinedT;
+        tolerance = max(_GIClipmapLevels[hitLevel].cellSize * 0.5, distanceValue * 0.01);
+    }
+    return abs(hitT - distanceValue) <= tolerance;
+}
+
+float GISpecularReservoirTarget(float3 radiance, float3 normal, float3 viewDirection,
+                                float3 direction, float roughness)
+{
+    return max(1e-6, GILuminance(max(0.0, radiance)) *
+        GIGgxReuseWeight(normal, viewDirection, direction, roughness));
+}
+
+[numthreads(8, 8, 1)]
+void TemporalSpecularReservoir(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= _GISpecularSize))
+        return;
+    float2 uv = GIUvFromPixel(dispatchId.xy, _GISpecularSize);
+    float4 currentRadiance = _GICurrentSpecularRead.Load(int3(dispatchId.xy, 0));
+    float4 currentRay = _GICurrentSpecularRayRead.Load(int3(dispatchId.xy, 0));
+    float4 currentHit = _GICurrentSpecularHitRead.Load(int3(dispatchId.xy, 0));
+    float4 currentStats = _GICurrentSpecularStatsRead.Load(int3(dispatchId.xy, 0));
+    uint2 currentId = _GICurrentSpecularIdRead.Load(int3(dispatchId.xy, 0));
+    float depth = currentRadiance.a;
+    float roughness = saturate(1.0 - _GIGBuffer2.Load(int3(GIFullPixelFromUv(uv), 0)).a);
+    bool eligible = _GIEnableSpecular != 0u && !GIIsBackground(depth) &&
+                    roughness >= _GIMinSpecularRoughness && roughness <= _GIMaxSpecularRoughness;
+    if (!eligible)
+    {
+        _GISpecularReservoirRadianceWrite[dispatchId.xy] = 0.0;
+        _GISpecularReservoirRayWrite[dispatchId.xy] = 0.0;
+        _GISpecularReservoirHitWrite[dispatchId.xy] = 0.0;
+        _GISpecularReservoirStatsWrite[dispatchId.xy] = 0.0;
+        _GISpecularReservoirIdWrite[dispatchId.xy] = 0u;
+        return;
+    }
+
+    float3 normal = GILoadNormal(uv);
+    float3 position = GIWorldPosition(uv, depth);
+    float3 origin = position + normal * max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
+    float3 viewDirection = normalize(_GICameraPosition - position);
+    // Checkerboard-skipped pixels retain receiver depth but currentStats.w == 0. They
+    // are not black/sky proposals and must not increase M or replace valid history.
+    bool hasFreshProposal = currentStats.w > 0.0;
+    float3 selectedRadiance = hasFreshProposal ? max(0.0, currentRadiance.rgb) : 0.0;
+    float4 selectedRay = hasFreshProposal ? currentRay : 0.0;
+    float4 selectedHit = hasFreshProposal ? currentHit : 0.0;
+    uint2 selectedId = hasFreshProposal ? currentId : 0u;
+    float selectedSourcePdf = hasFreshProposal ? max(currentStats.x, 1e-6) : 0.0;
+    float selectedTarget = hasFreshProposal ? max(currentStats.y, 1e-6) : 0.0;
+    float weightSum = hasFreshProposal ? max(0.0, currentStats.z) : 0.0;
+    float proposalCount = hasFreshProposal ? max(1.0, currentStats.w) : 0.0;
+    float age = 0.0;
+
+    float2 previousUv;
+    uint2 ignoredPixel;
+    float validity = GITemporalDiffuseMatch(
+        uv, depth, normal, GIMaterialSignature(uv), ignoredPixel, previousUv);
+    if (_GIHistoryValid != 0u && validity > 0.0)
+    {
+        uint2 previousPixel = min((uint2)(previousUv * float2(_GISpecularSize)),
+                                  _GISpecularSize - 1u);
+        float4 previousRadiance = _GISpecularReservoirRadianceRead.Load(int3(previousPixel, 0));
+        float4 previousRay = _GISpecularReservoirRayRead.Load(int3(previousPixel, 0));
+        float4 previousHit = _GISpecularReservoirHitRead.Load(int3(previousPixel, 0));
+        float4 previousStats = _GISpecularReservoirStatsRead.Load(int3(previousPixel, 0));
+        uint2 previousId = _GISpecularReservoirIdRead.Load(int3(previousPixel, 0));
+        if (previousStats.y > 0.0 && previousRay.w > 0.0)
+        {
+            float4 previousGeometry = _GIGeometryHistoryRead.SampleLevel(
+                sampler_PointClamp, previousUv, 0);
+            float3 previousOrigin = ComputeWorldSpacePosition(
+                previousUv, previousGeometry.z, _GIPreviousInverseViewProjection);
+            previousOrigin += GIUnpackHistoryNormal(previousGeometry.xy) *
+                              max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
+            uint previousFlags = (uint)round(previousHit.w);
+            bool finite = (previousFlags & GI_PATH_FINITE_HIT) != 0u &&
+                          previousRay.w < _GIMaxTraceDistance * 0.999;
+            float3 hitPosition = previousOrigin + normalize(previousRay.xyz) * previousRay.w;
+            float3 shiftedDirection = finite ? normalize(hitPosition - origin)
+                                             : normalize(previousRay.xyz);
+            float shiftedDistance = finite ? length(hitPosition - origin) : _GIMaxTraceDistance;
+            bool reusedVisibility = finite &&
+                (previousFlags & GI_PATH_VISIBILITY_VALID) != 0u &&
+                previousStats.w < 4.0 &&
+                length(previousOrigin - origin) <=
+                    max(0.02, _GIClipmapLevels[0].cellSize * 0.25) &&
+                !any(previousId == 0u);
+            bool strictVisibility = false;
+            if (finite && !reusedVisibility)
+                strictVisibility = GIValidationGate(
+                        dispatchId.xy, 0u, _GISpecularSize,
+                        _GISpecularVisibilityBudget, 1u,
+                        0x13198a2eu, 5.0) &&
+                    GIConsumeSpecularVisibilityBudget() &&
+                    GIStrictReconnectionVisibility(origin, hitPosition, previousId, roughness);
+            bool visible = !finite || reusedVisibility || strictVisibility;
+            float shiftedTarget = visible ? GISpecularReservoirTarget(
+                previousRadiance.rgb, normal, viewDirection, shiftedDirection, roughness) : 0.0;
+            float reusedCount = min(previousStats.y, lerp(8.0, 20.0, roughness));
+            if (shiftedTarget > 1e-6)
+            {
+                float normalizedWeight = previousStats.x *
+                    (reusedCount / max(previousStats.y, 1.0));
+                float candidateWeight = normalizedWeight * min(
+                    shiftedTarget / max(previousStats.z, 1e-6), 4.0) * validity;
+                candidateWeight = GIClampMergedReservoirWeight(
+                    candidateWeight, reusedCount, weightSum, proposalCount, 6.0);
+                uint seed = dispatchId.x + dispatchId.y * _GISpecularSize.x +
+                            _GIFrameIndex * 0x9e3779b9u;
+                if (GIReservoirUpdate(weightSum, proposalCount, candidateWeight,
+                                      reusedCount, GIRandom2(seed).x))
+                {
+                    selectedRadiance = previousRadiance.rgb;
+                    selectedRay = float4(shiftedDirection, shiftedDistance);
+                    selectedHit = previousHit;
+                    selectedHit.w = (float)(previousFlags | GI_PATH_VISIBILITY_VALID);
+                    selectedId = previousId;
+                    selectedSourcePdf = max(previousRadiance.a, 1e-6);
+                    selectedTarget = shiftedTarget;
+                    age = finite
+                        ? (strictVisibility ? 0.0 : min(previousStats.w + 1.0, 4.0))
+                        : min(previousStats.w + 1.0, roughness <= 0.2 ? 8.0 : 20.0);
+                }
+            }
+            else
+                proposalCount += reusedCount;
+        }
+    }
+    GIReservoirLimit(weightSum, proposalCount, roughness <= 0.2 ? 12.0 : 24.0);
+    _GISpecularReservoirRadianceWrite[dispatchId.xy] = float4(selectedRadiance, selectedSourcePdf);
+    _GISpecularReservoirRayWrite[dispatchId.xy] = selectedRay;
+    _GISpecularReservoirHitWrite[dispatchId.xy] = selectedHit;
+    _GISpecularReservoirStatsWrite[dispatchId.xy] = float4(
+        weightSum, proposalCount, selectedTarget, age);
+    _GISpecularReservoirIdWrite[dispatchId.xy] = selectedId;
+}
+
+[numthreads(8, 8, 1)]
+void SpatialSpecularReservoir(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= _GISpecularSize))
+        return;
+    float2 uv = GIUvFromPixel(dispatchId.xy, _GISpecularSize);
+    float depth = GILoadDepth(uv);
+    float roughness = saturate(1.0 - _GIGBuffer2.Load(int3(GIFullPixelFromUv(uv), 0)).a);
+    if (_GIEnableSpecular == 0u || GIIsBackground(depth) ||
+        roughness < _GIMinSpecularRoughness || roughness > _GIMaxSpecularRoughness)
+    {
+        _GISpecularReservoirSpatialRadiance[dispatchId.xy] = 0.0;
+        _GISpecularReservoirSpatialRay[dispatchId.xy] = 0.0;
+        _GISpecularReservoirSpatialHit[dispatchId.xy] = 0.0;
+        _GISpecularReservoirSpatialStats[dispatchId.xy] = 0.0;
+        _GISpecularReservoirSpatialId[dispatchId.xy] = 0u;
+        return;
+    }
+    float3 normal = GILoadNormal(uv);
+    float3 position = GIWorldPosition(uv, depth);
+    uint centerMaterial = GIMaterialSignature(uv);
+    float3 origin = position + normal * max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
+    float3 viewDirection = normalize(_GICameraPosition - position);
+    float4 selectedRadiance = _GISpecularReservoirRadianceRead.Load(int3(dispatchId.xy, 0));
+    float4 selectedRay = _GISpecularReservoirRayRead.Load(int3(dispatchId.xy, 0));
+    float4 selectedHit = _GISpecularReservoirHitRead.Load(int3(dispatchId.xy, 0));
+    float4 selectedStats = _GISpecularReservoirStatsRead.Load(int3(dispatchId.xy, 0));
+    uint2 selectedId = _GISpecularReservoirIdRead.Load(int3(dispatchId.xy, 0));
+    float selectedVisibilityAge = selectedStats.w;
+    float weightSum = max(0.0, selectedStats.x);
+    float proposalCount = max(0.0, selectedStats.y);
+    float selectedTarget = max(selectedStats.z, 1e-6);
+    float4 centerRadiance = selectedRadiance;
+    float4 centerRay = selectedRay;
+    float4 centerHit = selectedHit;
+    float4 centerStats = selectedStats;
+    uint2 centerId = selectedId;
+    float centerVisibilityAge = selectedVisibilityAge;
+    float centerWeightSum = weightSum;
+    float centerProposalCount = proposalCount;
+    float centerTarget = selectedTarget;
+    bool selectedSpatialNeighbour = false;
+    bool selectedSpatialNeedsStrictVisibility = false;
+    float3 selectedSpatialHitPosition = 0.0;
+    uint sampleCount = min(_GISpecularSpatialSamples, roughness <= 0.2 ? 2u : 4u);
+    [loop]
+    for (uint sampleIndex = 0u; sampleIndex < sampleCount; sampleIndex++)
+    {
+        uint seed = dispatchId.x + dispatchId.y * _GISpecularSize.x +
+                    _GIFrameIndex * 8191u + sampleIndex * 131u;
+        float2 randomValue = GIRandom2(seed);
+        float angle = TWO_PI * randomValue.x;
+        float radius = lerp(1.0, 5.0, roughness * roughness) * sqrt(randomValue.y);
+        int2 samplePixel = clamp((int2)dispatchId.xy +
+            (int2)round(float2(cos(angle), sin(angle)) * radius),
+            0, (int2)_GISpecularSize - 1);
+        if (all(samplePixel == (int2)dispatchId.xy))
+            continue;
+        float2 sampleUv = GIUvFromPixel((uint2)samplePixel, _GISpecularSize);
+        float sampleDepth = GILoadDepth(sampleUv);
+        float3 sampleNormal = GILoadNormal(sampleUv);
+        if (GIIsBackground(sampleDepth) ||
+            GIMaterialSignature(sampleUv) != centerMaterial ||
+            dot(normal, sampleNormal) < lerp(0.98, 0.8, roughness))
+            continue;
+        float3 samplePosition = GIWorldPosition(sampleUv, sampleDepth);
+        float3 receiverOffset = samplePosition - position;
+        float receiverDistance = length(receiverOffset);
+        float planeError = abs(dot(receiverOffset, normal));
+        float cameraDistance = length(position - _GICameraPosition);
+        float screenOffset = max(
+            1.0, length((float2)(samplePixel - (int2)dispatchId.xy)));
+        float receiverLimit = min(0.75, max(
+            0.10, cameraDistance * 0.0012 * screenOffset));
+        if (receiverDistance > receiverLimit ||
+            planeError > max(0.025, receiverDistance * 0.05))
+            continue;
+        float4 candidateRadiance = _GISpecularReservoirRadianceRead.Load(int3(samplePixel, 0));
+        float4 candidateRay = _GISpecularReservoirRayRead.Load(int3(samplePixel, 0));
+        float4 candidateHit = _GISpecularReservoirHitRead.Load(int3(samplePixel, 0));
+        float4 candidateStats = _GISpecularReservoirStatsRead.Load(int3(samplePixel, 0));
+        uint2 candidateId = _GISpecularReservoirIdRead.Load(int3(samplePixel, 0));
+        if (candidateStats.y <= 0.0 || candidateRay.w <= 0.0)
+            continue;
+        float3 sampleOrigin = samplePosition + sampleNormal *
+                              max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
+        uint flags = (uint)round(candidateHit.w);
+        bool finite = (flags & GI_PATH_FINITE_HIT) != 0u &&
+                      candidateRay.w < _GIMaxTraceDistance * 0.999;
+        if (finite && any(candidateId == 0u))
+            continue;
+        float3 hitPosition = sampleOrigin + normalize(candidateRay.xyz) * candidateRay.w;
+        float3 shiftedDirection = finite ? normalize(hitPosition - origin)
+                                         : normalize(candidateRay.xyz);
+        float shiftedDistance = finite ? length(hitPosition - origin) : _GIMaxTraceDistance;
+        bool reusableVisibility = finite &&
+            (flags & GI_PATH_VISIBILITY_VALID) != 0u &&
+            candidateStats.w < 4.0 &&
+            length(sampleOrigin - origin) <=
+                max(0.02, _GIClipmapLevels[0].cellSize * 0.25);
+        float shiftedTarget = GISpecularReservoirTarget(
+            candidateRadiance.rgb, normal, viewDirection, shiftedDirection, roughness);
+        float reusedCount = min(candidateStats.y, 8.0);
+        float normalizedWeight = candidateStats.x * (reusedCount / max(candidateStats.y, 1.0));
+        float candidateWeight = normalizedWeight * min(
+            shiftedTarget / max(candidateStats.z, 1e-6), 4.0);
+        candidateWeight = GIClampMergedReservoirWeight(
+            candidateWeight, reusedCount, weightSum, proposalCount, 4.0);
+        if (GIReservoirUpdate(weightSum, proposalCount, candidateWeight, reusedCount,
+                              GIRandom2(seed ^ 0xa511e9b3u).y))
+        {
+            selectedRadiance = candidateRadiance;
+            selectedRay = float4(shiftedDirection, shiftedDistance);
+            selectedHit = candidateHit;
+            selectedStats = candidateStats;
+            selectedId = candidateId;
+            selectedTarget = shiftedTarget;
+            selectedVisibilityAge = finite
+                ? (reusableVisibility ? min(candidateStats.w + 1.0, 4.0) : 0.0)
+                : candidateStats.w;
+            selectedSpatialNeighbour = true;
+            selectedSpatialNeedsStrictVisibility = finite && !reusableVisibility;
+            selectedSpatialHitPosition = hitPosition;
+        }
+    }
+    if (selectedSpatialNeighbour && selectedSpatialNeedsStrictVisibility)
+    {
+        bool winnerVisible = GIValidationGate(
+                dispatchId.xy, 0u, _GISpecularSize,
+                _GISpecularVisibilityBudget, 1u,
+                0x9e3779b9u, 7.0) &&
+            GIConsumeSpecularVisibilityBudget() &&
+            GIStrictReconnectionVisibility(
+                origin, selectedSpatialHitPosition, selectedId, roughness);
+        if (winnerVisible)
+        {
+            uint selectedFlags = (uint)round(selectedHit.w);
+            selectedHit.w = (float)(selectedFlags | GI_PATH_VISIBILITY_VALID);
+            selectedVisibilityAge = 0.0;
+        }
+        else
+        {
+            selectedRadiance = centerRadiance;
+            selectedRay = centerRay;
+            selectedHit = centerHit;
+            selectedStats = centerStats;
+            selectedId = centerId;
+            selectedVisibilityAge = centerVisibilityAge;
+            selectedTarget = centerTarget;
+            weightSum = centerWeightSum;
+            proposalCount = centerProposalCount;
+        }
+    }
+    GIReservoirLimit(weightSum, proposalCount, roughness <= 0.2 ? 16.0 : 32.0);
+    _GISpecularReservoirSpatialRadiance[dispatchId.xy] = selectedRadiance;
+    _GISpecularReservoirSpatialRay[dispatchId.xy] = selectedRay;
+    _GISpecularReservoirSpatialHit[dispatchId.xy] = selectedHit;
+    _GISpecularReservoirSpatialStats[dispatchId.xy] = float4(
+        weightSum, proposalCount, selectedTarget, selectedVisibilityAge);
+    _GISpecularReservoirSpatialId[dispatchId.xy] = selectedId;
 }
 
 float3 GISpecularF0(uint2 fullPixel, out float roughness)
@@ -2575,7 +4324,7 @@ void ResolveSpecular(uint3 dispatchId : SV_DispatchThreadID)
     for (int x = 0; x <= 1; x++)
     {
         int2 samplePixel = clamp(basePixel + int2(x, y), 0, (int2)_GISpecularSize - 1);
-        float4 rayRecord = _GICurrentSpecularRayRead.Load(int3(samplePixel, 0));
+        float4 rayRecord = _GISpecularReservoirSpatialRay.Load(samplePixel);
         if (rayRecord.a <= 0.0)
             continue;
         float2 sampleUv = GIUvFromPixel((uint2)samplePixel, _GISpecularSize);
@@ -2587,7 +4336,13 @@ void ResolveSpecular(uint3 dispatchId : SV_DispatchThreadID)
         bool skyRay = rayRecord.a >= _GIMaxTraceDistance * 0.999;
         float3 reusedDirection = skyRay ? normalize(rayRecord.xyz) : normalize(hitPoint - position);
         float weight = GIGgxReuseWeight(normal, viewDirection, reusedDirection, roughness);
-        float3 sampleLighting = _GICurrentSpecularRead.Load(int3(samplePixel, 0)).rgb;
+        float4 reservoirRadiance = _GISpecularReservoirSpatialRadiance.Load(samplePixel);
+        float4 reservoirStats = _GISpecularReservoirSpatialStats.Load(samplePixel);
+        float reservoirNormalization = reservoirStats.y > 0.0 && reservoirStats.z > 1e-6
+            ? reservoirStats.x * max(reservoirRadiance.a, 1e-6) /
+              max(reservoirStats.y * reservoirStats.z, 1e-6)
+            : 0.0;
+        float3 sampleLighting = reservoirRadiance.rgb * min(reservoirNormalization, 4.0);
         lightingSum += sampleLighting * weight;
         weightSum += weight;
         if (weight > bestWeight)
@@ -2599,16 +4354,12 @@ void ResolveSpecular(uint3 dispatchId : SV_DispatchThreadID)
     }
 
     float noV = saturate(dot(normal, viewDirection));
-    // A full-resolution mirror pixel may map to a low-resolution 2x2 footprint
-    // containing only background/roughness-rejected trace samples.  This is an
-    // upsampling coverage failure, not zero incoming radiance.  It was most visible
-    // at smoothness=1 (roughness=0), where diffuse is absent and the black result was
-    // mistaken for an inverted smoothness range.  Use the same probe-free TOD fallback
-    // as a world miss until the next trace supplies a valid footprint.
-    float3 fallbackDirection = reflect(-viewDirection, normal);
+    // A missing low-resolution footprint means "no estimate", not a world-space sky
+    // miss. Injecting TOD glossy sky here created permanent coloured islands at
+    // silhouettes/checkerboard gaps, which history then treated as real lighting.
     float3 ratioLighting = weightSum > 1e-4
         ? lightingSum / weightSum
-        : GIEvaluateTODGlossySky(fallbackDirection, roughness);
+        : 0.0;
     float3 specular = ratioLighting * GIEnvironmentBrdf(f0, roughness, noV);
     _GIResolvedSpecular[dispatchId.xy] = float4(max(0.0, specular), depth);
     _GIResolvedSpecularRay[dispatchId.xy] = bestRay;
@@ -2695,11 +4446,18 @@ void TemporalSpecular(uint3 dispatchId : SV_DispatchThreadID)
     float3 history = virtualValid && virtualDifference < surfaceDifference
         ? virtualHistory : surfaceHistory;
     history = GIClampHistory(_GIResolvedSpecularRead, dispatchId.xy, _GIFullSize, history);
+    // Spatial reservoir reuse already combines independent low-resolution paths.  Reuse
+    // the deterministic five-tap mean computed above as the rough-lobe reconstruction;
+    // this replaces a separate full-4K pass with four random neighbours per pixel.  Smooth
+    // mirrors retain the unfiltered current sample and therefore keep geometric detail.
+    float roughSpatialWeight = saturate(roughness * roughness * 0.65);
+    float3 currentFiltered = lerp(current.rgb, currentMean, roughSpatialWeight);
     // Virtual reuse has an independent secondary-surface test.  Surface history is
     // still valid for sky/world paths, but a failed virtual test must never retain the
     // unrelated virtual sample selected above.
     float weight = saturate(_GISpecularHistoryWeight) * validity;
-    _GISpecularHistoryWrite[dispatchId.xy] = float4(lerp(current.rgb, history, weight), current.a);
+    _GISpecularHistoryWrite[dispatchId.xy] = float4(
+        lerp(currentFiltered, history, weight), current.a);
 }
 
 float3 GISpecularTonemap(float3 color)
@@ -2783,6 +4541,8 @@ float3 GIBilateralSample(Texture2D<float4> textureValue, float2 uv, float depth)
     float weightSum = 0.0;
     uint centerMaterial = GIMaterialSignature(uv);
     float3 centerNormal = GILoadNormal(uv);
+    float3 centerPosition = GIWorldPosition(uv, depth);
+    float cameraDistance = length(centerPosition - _GICameraPosition);
     float3 fallback = 0.0;
     float fallbackScore = 1e20;
     bool hasFallback = false;
@@ -2804,11 +4564,20 @@ float3 GIBilateralSample(Texture2D<float4> textureValue, float2 uv, float depth)
             continue;
         float3 sampleNormal = GILoadNormal(sampleUv);
         float normalAgreement = saturate(dot(centerNormal, sampleNormal));
+        float3 samplePosition = GIWorldPosition(sampleUv, sampleValue.a);
+        float3 receiverOffset = samplePosition - centerPosition;
+        float receiverDistance = length(receiverOffset);
+        float planeError = abs(dot(receiverOffset, centerNormal));
         // Device depth is monotonic.  A relative difference is sufficient for this
         // resolve and avoids relying on URP camera constants that are not guaranteed
         // to be visible to a standalone compute shader.
         float depthDelta = abs(sampleValue.a - depth) / max(abs(depth), 1e-4);
         float2 delta = abs(position - float2(pixel));
+        float receiverLimit = max(
+            0.12, cameraDistance * 0.0025 * max(1.0, length(delta)));
+        if (receiverDistance > receiverLimit ||
+            planeError > max(0.025, receiverDistance * 0.06))
+            continue;
         float fallbackCandidateScore = depthDelta * 48.0 +
                                        (1.0 - normalAgreement) * 4.0 +
                                        dot(delta, delta) * 0.01;
@@ -2825,12 +4594,17 @@ float3 GIBilateralSample(Texture2D<float4> textureValue, float2 uv, float depth)
         float normalWeight = pow(normalAgreement, 32.0);
         float weight = depthWeight * max(spatialWeight, 1e-4) *
                        normalWeight;
-        sum += sampleValue.rgb * weight;
+        // HDR-linear interpolation lets one rare emissive/cache sample dominate a full
+        // 4x4 output footprint. Interpolate the display reconstruction in the same
+        // reversible compressed-radiance domain as temporal diffuse history.
+        sum += GIDiffuseTonemap(max(0.0, sampleValue.rgb)) * weight;
         weightSum += weight;
     }
     // If all four weighted samples fail the strict normal test, retain the nearest
     // material-compatible sample rather than pulling radiance across an edge.
-    return weightSum > 1e-6 ? sum / weightSum : (hasFallback ? fallback : 0.0);
+    return weightSum > 1e-6
+        ? GIDiffuseInverseTonemap(sum / weightSum)
+        : (hasFallback ? fallback : 0.0);
 }
 
 [numthreads(8, 8, 1)]

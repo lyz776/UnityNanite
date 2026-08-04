@@ -231,7 +231,11 @@ namespace RealtimeGI
                 materialBindingCount = (uint)bindingCount,
                 flags = (uint)flags,
                 adapterType = adapterType,
-                revision = (uint)Mathf.Max(0, revision)
+                revision = (uint)Mathf.Max(0, revision),
+                // Persistent reservoirs must not reconnect a triangle at its old world
+                // position after a dynamic instance moves. This occupies the former ABI
+                // padding word, so the GPU stride remains unchanged.
+                transformSignature = unchecked((uint)currentTransform.GetHashCode())
             });
         }
 

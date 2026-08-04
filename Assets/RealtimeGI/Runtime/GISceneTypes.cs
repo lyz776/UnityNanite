@@ -34,19 +34,64 @@ namespace RealtimeGI
         AnalyticCapsule = 4
     }
 
+    public enum GIMaterialFamily : uint
+    {
+        Auto = 0,
+        UrpLit = 1,
+        ExplicitStylizedProxy = 2
+    }
+
+    public enum GIMaterialMaskChannel : uint
+    {
+        Red = 0,
+        Green = 1,
+        Blue = 2,
+        Alpha = 3,
+        Constant = 4
+    }
+
+    public enum GIAlphaSource : uint
+    {
+        BaseMapAlpha = 0,
+        MaskRed = 1,
+        MaskGreen = 2,
+        MaskBlue = 3,
+        MaskAlpha = 4,
+        ConstantOpacity = 5
+    }
+
+    [Flags]
+    public enum GIMaterialFlags : uint
+    {
+        None = 0,
+        DoubleSided = 1u << 0,
+        Emissive = 1u << 1,
+        AlphaTested = 1u << 2,
+        HasBaseMap = 1u << 3,
+        HasEmissionMap = 1u << 4,
+        HasNormalMap = 1u << 5,
+        HasMaskMap = 1u << 6,
+        ExplicitProxy = 1u << 7
+    }
+
     /// <summary>
     /// Version shared by C# producers and future compute consumers. Increment whenever a GPU
     /// structure changes; never silently reinterpret an old stride.
     /// </summary>
     public static class GISceneAbi
     {
-        public const uint Version = 3;
+        public const uint Version = 4;
         public const int InstanceStride = 176;
         public const int GeometryStride = 48;
-        public const int MaterialStride = 96;
+        public const int MaterialStride = 176;
         public const int MaterialBindingStride = 16;
         public const int GeometryStreamStride = 32;
         public const int EmissiveAliasStride = 32;
+        public const int BvhNodeStride = 32;
+        public const int BvhPrimitiveStride = 16;
+        public const int BvhRangeStride = 16;
+        public const uint GeometryStreamNaniteProxy = 1u << 0;
+        public const uint GeometryStreamNaniteResidentPages = 1u << 1;
 
         static bool validated;
 
@@ -59,6 +104,9 @@ namespace RealtimeGI
             ValidateStride<GIGpuMaterialData>(MaterialStride, nameof(GIGpuMaterialData));
             ValidateStride<GIGpuMaterialBindingData>(MaterialBindingStride, nameof(GIGpuMaterialBindingData));
             ValidateStride<GIGpuGeometryStreamData>(GeometryStreamStride, nameof(GIGpuGeometryStreamData));
+            ValidateStride<GIGpuBvhNode>(BvhNodeStride, nameof(GIGpuBvhNode));
+            ValidateStride<GIGpuBvhPrimitive>(BvhPrimitiveStride, nameof(GIGpuBvhPrimitive));
+            ValidateStride<GIGpuBvhRange>(BvhRangeStride, nameof(GIGpuBvhRange));
             ValidateStride<GIGpuEmissiveAliasData>(EmissiveAliasStride, nameof(GIGpuEmissiveAliasData));
             validated = true;
         }
@@ -85,7 +133,7 @@ namespace RealtimeGI
         public uint flags;
         public uint adapterType;
         public uint revision;
-        public uint padding;
+        public uint transformSignature;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -111,10 +159,22 @@ namespace RealtimeGI
         public Vector4 surface;
         public Vector4 baseMapST;
         public Vector4 emissionMapST;
+        public Vector4 normalMapST;
+        public Vector4 maskMapST;
+        // xy=metallic scale/bias, zw=roughness scale/bias.
+        public Vector4 maskRemap0;
+        // xy=opacity scale/bias, z=normal scale, w=reserved.
+        public Vector4 maskRemap1;
         public uint materialId;
         public uint flags;
         public uint revision;
-        public uint textureIndex;
+        public uint geometryRevision;
+        // 0..2 metallic channel, 3..5 roughness, 6..8 opacity,
+        // 9..12 alpha source, 16..23 material family.
+        public uint channels;
+        public uint padding0;
+        public uint padding1;
+        public uint padding2;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -137,6 +197,37 @@ namespace RealtimeGI
         public uint flags;
         public uint padding0;
         public uint padding1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GIGpuBvhNode
+    {
+        public Vector3 boundsMin;
+        // Internal: left child (right is left+1). Leaf: first primitive reference.
+        public uint leftFirst;
+        public Vector3 boundsMax;
+        // Zero denotes an internal node.
+        public uint primitiveCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GIGpuBvhPrimitive
+    {
+        // Triangle index for ordinary Mesh, global Page ID for Nanite.
+        public uint primitiveKey;
+        public uint firstTriangle;
+        public uint triangleCount;
+        // bit 0: Nanite resident Page leaf; bit 1: TLAS instance leaf.
+        public uint flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GIGpuBvhRange
+    {
+        public uint rootNode;
+        public uint nodeCount;
+        public uint primitiveOffset;
+        public uint primitiveCount;
     }
 
     /// <summary>
