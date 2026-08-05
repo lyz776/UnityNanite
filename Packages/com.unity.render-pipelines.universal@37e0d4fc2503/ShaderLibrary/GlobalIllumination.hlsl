@@ -424,12 +424,12 @@ half3 CalculateIrradianceFromReflectionProbes(half3 reflectVector, float3 positi
 
 half3 GlossyEnvironmentReflection(half3 reflectVector, float3 positionWS, half perceptualRoughness, half occlusion, float2 normalizedScreenSpaceUV)
 {
-    // RealtimeGI injects the traced term separately. Outside that pass, TOD is
-    // the only environment fallback; reflection probes and Unity skybox IBL are
-    // intentionally not sampled.
-    if (_RealtimeGIDeferredInjection > 0.5)
-        return 0.0h;
-    return (half3)GIEvaluateTODGlossySky(reflectVector, perceptualRoughness) * occlusion;
+    // RealtimeGI injects the traced term separately.  Keep the analytic TOD sky
+    // during history warm-up and cross-fade it as the traced solution takes over.
+    // Reflection probes and Unity skybox IBL remain intentionally excluded.
+    half takeover = saturate((half)_RealtimeGIDeferredInjection);
+    return (half3)GIEvaluateTODGlossySky(reflectVector, perceptualRoughness) *
+        occlusion * (1.0h - takeover);
 }
 
 #if !USE_CLUSTER_LIGHT_LOOP
@@ -441,9 +441,9 @@ half3 GlossyEnvironmentReflection(half3 reflectVector, float3 positionWS, half p
 
 half3 GlossyEnvironmentReflection(half3 reflectVector, half perceptualRoughness, half occlusion)
 {
-    if (_RealtimeGIDeferredInjection > 0.5)
-        return 0.0h;
-    return (half3)GIEvaluateTODGlossySky(reflectVector, perceptualRoughness) * occlusion;
+    half takeover = saturate((half)_RealtimeGIDeferredInjection);
+    return (half3)GIEvaluateTODGlossySky(reflectVector, perceptualRoughness) *
+        occlusion * (1.0h - takeover);
 }
 
 half3 SubtractDirectMainLightFromLightmap(Light mainLight, half3 normalWS, half3 bakedGI)

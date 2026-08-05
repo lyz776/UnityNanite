@@ -43,7 +43,7 @@ MonoBehaviour:
     diffuseDebugStage: 0
     enableTraceCounters: 0
     traceCounterReadbackInterval: 10
-    pipelineVersion: 23
+    pipelineVersion: 25
     screenLightingShader: {fileID: 7200000, guid: 8ecfe36bca684db9be134731e21828c9, type: 3}
     compositeShader: {fileID: 4800000, guid: 97a6c21fe47943a0a46becfd0f7a4230, type: 3}
 --- !u!114 &-1619528804519490273

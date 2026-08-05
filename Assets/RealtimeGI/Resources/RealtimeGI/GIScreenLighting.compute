@@ -62,6 +62,7 @@ Texture2D<float4> _GIResolvedSpecularRayRead;
 Texture2D<float4> _GIDiffuseHistoryRead;
 Texture2D<float4> _GIDiffuseMomentsRead;
 Texture2D<float4> _GISpecularHistoryRead;
+Texture2D<float4> _GISpecularMomentsRead;
 Texture2D<float4> _GIGeometryHistoryRead;
 Texture2D<float4> _GIDiffuseFiltered;
 Texture2D<float4> _GISpecularFiltered;
@@ -88,6 +89,7 @@ RWTexture2D<float4> _GIDiffuseHistoryWrite;
 RWTexture2D<float4> _GIDiffuseMomentsWrite;
 RWTexture2D<float4> _GIDiffuseDenoised;
 RWTexture2D<float4> _GISpecularHistoryWrite;
+RWTexture2D<float4> _GISpecularMomentsWrite;
 RWTexture2D<float4> _GISpecularSpatial;
 RWTexture2D<float4> _GICurrentSpecularHit;
 RWTexture2D<float4> _GICurrentSpecularStats;
@@ -215,6 +217,7 @@ uint _GIEmissiveAliasCount;
 uint _GILocalLightCount;
 uint _GIMaxLightsPerBrick;
 uint _GIHistoryValid;
+uint _GIUseMotionVectors;
 uint _GISceneColorHistoryValid;
 uint _GIEnableSceneColorHistory;
 uint _GIEnableDiffuse;
@@ -2693,29 +2696,17 @@ void TraceDiffuseWorldMisses(uint3 dispatchId : SV_DispatchThreadID)
         selectedHitNormal, selectedHitValid, selectedStableId);
 }
 
-float3 GIClampHistory(Texture2D<float4> currentTexture, uint2 pixel, uint2 size, float3 history)
+float2 GIContinuousPreviousUv(float2 uv, float currentDepth, float2 geometryUv)
 {
-    float3 minimumValue = 1e20;
-    float3 maximumValue = -1e20;
-    [unroll]
-    for (int y = -1; y <= 1; y++)
-    [unroll]
-    for (int x = -1; x <= 1; x++)
-    {
-        uint2 samplePixel = (uint2)clamp((int2)pixel + int2(x, y), 0, (int2)size - 1);
-        float3 value = currentTexture.Load(int3(samplePixel, 0)).rgb;
-        minimumValue = min(minimumValue, value);
-        maximumValue = max(maximumValue, value);
-    }
-    return clamp(history, minimumValue, maximumValue);
-}
-
-float GITemporalValidity(float2 uv, float currentDepth, float3 currentNormal,
-                         uint currentMaterial, out float2 previousUv)
-{
-    uint2 previousPixel;
-    return GITemporalDiffuseMatch(
-        uv, currentDepth, currentNormal, currentMaterial, previousPixel, previousUv);
+    float3 currentPosition = GIWorldPosition(uv, currentDepth);
+    float2 matrixUv = ComputeNormalizedDeviceCoordinates(
+        currentPosition, _GIPreviousViewProjection);
+    float2 motion = _GIMotionTexture.Load(int3(GIFullPixelFromUv(uv), 0));
+    float2 motionUv = uv - motion;
+    float matrixDistance = dot(matrixUv - geometryUv, matrixUv - geometryUv);
+    float motionDistance = dot(motionUv - geometryUv, motionUv - geometryUv);
+    return (_GIUseMotionVectors != 0u && motionDistance < matrixDistance)
+        ? motionUv : matrixUv;
 }
 
 float GITemporalDiffuseMatch(float2 uv, float currentDepth, float3 currentNormal,
@@ -2749,7 +2740,9 @@ float GITemporalDiffuseMatch(float2 uv, float currentDepth, float3 currentNormal
     int2 bestPixel = -1;
 
     [unroll]
-    for (uint reprojection = 0u; reprojection < 2u; reprojection++)
+    for (uint reprojection = 0u;
+         reprojection < (_GIUseMotionVectors != 0u ? 2u : 1u);
+         reprojection++)
     {
         float2 predictedUv = predictedUvs[reprojection];
         bool projectionValid = reprojection == 0u ? previousClip.w > 0.0 : true;
@@ -3985,6 +3978,7 @@ void TemporalSpecularReservoir(uint3 dispatchId : SV_DispatchThreadID)
         _GISpecularReservoirHitWrite[dispatchId.xy] = 0.0;
         _GISpecularReservoirStatsWrite[dispatchId.xy] = 0.0;
         _GISpecularReservoirIdWrite[dispatchId.xy] = 0u;
+        _GISpecularMomentsWrite[dispatchId.xy] = 0.0;
         return;
     }
 
@@ -4004,14 +3998,22 @@ void TemporalSpecularReservoir(uint3 dispatchId : SV_DispatchThreadID)
     float weightSum = hasFreshProposal ? max(0.0, currentStats.z) : 0.0;
     float proposalCount = hasFreshProposal ? max(1.0, currentStats.w) : 0.0;
     float age = 0.0;
+    float4 previousMoments = 0.0;
+    bool hasPreviousMoments = false;
 
-    float2 previousUv;
+    float2 previousGeometryUv;
     uint2 ignoredPixel;
     float validity = GITemporalDiffuseMatch(
-        uv, depth, normal, GIMaterialSignature(uv), ignoredPixel, previousUv);
+        uv, depth, normal, GIMaterialSignature(uv), ignoredPixel,
+        previousGeometryUv);
     if (_GIHistoryValid != 0u && validity > 0.0)
     {
-        uint2 previousPixel = min((uint2)(previousUv * float2(_GISpecularSize)),
+        float2 previousSpecularUv = GIContinuousPreviousUv(
+            uv, depth, previousGeometryUv);
+        validity *= all(previousSpecularUv > 0.0) &&
+                    all(previousSpecularUv < 1.0) ? 1.0 : 0.0;
+        uint2 previousPixel = min((uint2)(saturate(previousSpecularUv) *
+                                          float2(_GISpecularSize)),
                                   _GISpecularSize - 1u);
         float4 previousRadiance = _GISpecularReservoirRadianceRead.Load(int3(previousPixel, 0));
         float4 previousRay = _GISpecularReservoirRayRead.Load(int3(previousPixel, 0));
@@ -4020,10 +4022,13 @@ void TemporalSpecularReservoir(uint3 dispatchId : SV_DispatchThreadID)
         uint2 previousId = _GISpecularReservoirIdRead.Load(int3(previousPixel, 0));
         if (previousStats.y > 0.0 && previousRay.w > 0.0)
         {
+            previousMoments = _GISpecularMomentsRead.Load(int3(previousPixel, 0));
+            hasPreviousMoments = previousMoments.z > 0.0 && validity > 0.0;
             float4 previousGeometry = _GIGeometryHistoryRead.SampleLevel(
-                sampler_PointClamp, previousUv, 0);
+                sampler_PointClamp, previousGeometryUv, 0);
             float3 previousOrigin = ComputeWorldSpacePosition(
-                previousUv, previousGeometry.z, _GIPreviousInverseViewProjection);
+                previousGeometryUv, previousGeometry.z,
+                _GIPreviousInverseViewProjection);
             previousOrigin += GIUnpackHistoryNormal(previousGeometry.xy) *
                               max(0.01, _GIClipmapLevels[0].cellSize * 0.1);
             uint previousFlags = (uint)round(previousHit.w);
@@ -4087,6 +4092,39 @@ void TemporalSpecularReservoir(uint3 dispatchId : SV_DispatchThreadID)
     _GISpecularReservoirStatsWrite[dispatchId.xy] = float4(
         weightSum, proposalCount, selectedTarget, age);
     _GISpecularReservoirIdWrite[dispatchId.xy] = selectedId;
+
+    // Track independent fresh observations at trace resolution. Checkerboard holes carry
+    // moments without increasing the sample count; otherwise alternating null proposals
+    // would report artificial zero variance and keep dense metallic sparkles forever.
+    float4 nextMoments = 0.0;
+    if (hasPreviousMoments)
+    {
+        nextMoments = previousMoments;
+        if (hasFreshProposal)
+        {
+            float observation = GILuminance(max(0.0, currentRadiance.rgb));
+            float variance = max(0.0,
+                previousMoments.y - previousMoments.x * previousMoments.x);
+            float sigma = sqrt(variance);
+            float radius = max(0.10,
+                previousMoments.x * 0.75 + sigma * 4.0);
+            observation = clamp(observation,
+                max(0.0, previousMoments.x - radius),
+                previousMoments.x + radius);
+            float historyLength = min(previousMoments.z + 1.0, 32.0);
+            float alpha = 1.0 / historyLength;
+            nextMoments.x = lerp(previousMoments.x, observation, alpha);
+            nextMoments.y = lerp(previousMoments.y,
+                                 observation * observation, alpha);
+            nextMoments.z = historyLength;
+        }
+    }
+    else if (hasFreshProposal)
+    {
+        float observation = GILuminance(max(0.0, currentRadiance.rgb));
+        nextMoments = float4(observation, observation * observation, 1.0, 0.0);
+    }
+    _GISpecularMomentsWrite[dispatchId.xy] = nextMoments;
 }
 
 [numthreads(8, 8, 1)]
@@ -4313,6 +4351,8 @@ void ResolveSpecular(uint3 dispatchId : SV_DispatchThreadID)
     float3 viewDirection = normalize(_GICameraPosition - position);
     float2 tracePosition = uv * float2(_GISpecularSize) - 0.5;
     int2 basePixel = (int2)floor(tracePosition);
+    float2 bilinearFraction = frac(tracePosition);
+    uint centerMaterial = GIMaterialSignature(uv);
     float3 lightingSum = 0.0;
     float weightSum = 0.0;
     float bestWeight = -1.0;
@@ -4331,11 +4371,37 @@ void ResolveSpecular(uint3 dispatchId : SV_DispatchThreadID)
         float sampleDepth = GILoadDepth(sampleUv);
         if (GIIsBackground(sampleDepth))
             continue;
-        float3 sampleOrigin = GIWorldPosition(sampleUv, sampleDepth) + GILoadNormal(sampleUv) * 0.05;
+        if (GIMaterialSignature(sampleUv) != centerMaterial)
+            continue;
+        float3 sampleNormal = GILoadNormal(sampleUv);
+        if (dot(normal, sampleNormal) < lerp(0.985, 0.78, roughness))
+            continue;
+        uint2 sampleFullPixel = GIFullPixelFromUv(sampleUv);
+        float sampleRoughness = saturate(
+            1.0 - _GIGBuffer2.Load(int3(sampleFullPixel, 0)).a);
+        if (abs(sampleRoughness - roughness) > max(0.04, roughness * 0.25))
+            continue;
+        float3 samplePosition = GIWorldPosition(sampleUv, sampleDepth);
+        float3 receiverOffset = samplePosition - position;
+        float receiverDistance = length(receiverOffset);
+        float planeError = abs(dot(receiverOffset, normal));
+        float cameraDistance = length(position - _GICameraPosition);
+        float receiverLimit = min(0.75, max(0.10,
+            cameraDistance * 0.0015 *
+            max(1.0, length((float2)samplePixel - tracePosition))));
+        if (receiverDistance > receiverLimit ||
+            planeError > max(0.025, receiverDistance * 0.05))
+            continue;
+        float3 sampleOrigin = samplePosition + sampleNormal * 0.05;
         float3 hitPoint = sampleOrigin + rayRecord.xyz * rayRecord.a;
         bool skyRay = rayRecord.a >= _GIMaxTraceDistance * 0.999;
         float3 reusedDirection = skyRay ? normalize(rayRecord.xyz) : normalize(hitPoint - position);
-        float weight = GIGgxReuseWeight(normal, viewDirection, reusedDirection, roughness);
+        float bilinearWeight = (x != 0 ? bilinearFraction.x : 1.0 - bilinearFraction.x) *
+                               (y != 0 ? bilinearFraction.y : 1.0 - bilinearFraction.y);
+        float weight = GIGgxReuseWeight(
+            normal, viewDirection, reusedDirection, roughness) * bilinearWeight;
+        if (weight <= 1e-6)
+            continue;
         float4 reservoirRadiance = _GISpecularReservoirSpatialRadiance.Load(samplePixel);
         float4 reservoirStats = _GISpecularReservoirSpatialStats.Load(samplePixel);
         float reservoirNormalization = reservoirStats.y > 0.0 && reservoirStats.z > 1e-6
@@ -4365,101 +4431,6 @@ void ResolveSpecular(uint3 dispatchId : SV_DispatchThreadID)
     _GIResolvedSpecularRay[dispatchId.xy] = bestRay;
 }
 
-[numthreads(8, 8, 1)]
-void TemporalSpecular(uint3 dispatchId : SV_DispatchThreadID)
-{
-    if (any(dispatchId.xy >= _GIFullSize))
-        return;
-    float2 uv = GIUvFromPixel(dispatchId.xy, _GIFullSize);
-    float4 current = _GIResolvedSpecularRead.Load(int3(dispatchId.xy, 0));
-    float roughness = saturate(1.0 - _GIGBuffer2.Load(int3(dispatchId.xy, 0)).a);
-    bool eligible = _GIEnableSpecular != 0u &&
-                    roughness >= _GIMinSpecularRoughness && roughness <= _GIMaxSpecularRoughness;
-    if (!eligible || GIIsBackground(current.a))
-    {
-        _GISpecularHistoryWrite[dispatchId.xy] = 0.0;
-        return;
-    }
-    float2 surfacePreviousUv;
-    float validity = GITemporalValidity(
-        uv, current.a, GILoadNormal(uv), GIMaterialSignature(uv), surfacePreviousUv);
-    float3 surfaceHistory = _GISpecularHistoryRead.SampleLevel(
-        sampler_LinearClamp, surfacePreviousUv, 0).rgb;
-
-    float4 rayRecord = _GIResolvedSpecularRayRead.Load(int3(dispatchId.xy, 0));
-    float3 position = GIWorldPosition(uv, current.a);
-    float3 hitPoint = position + rayRecord.xyz * rayRecord.a;
-
-    // Reprojecting a glossy ray to its virtual hit point is only safe when that point
-    // was the same visible surface in the previous frame.  The old code merely tested
-    // UV bounds, so a moving camera could read an unrelated red/blue object from the
-    // specular history and then spatially spread it across the receiver.  Reuse the
-    // diffuse geometry history's material/normal/position validation for the secondary
-    // surface before accepting virtual history.
-    float2 virtualUv = 0.0;
-    float virtualValidity = 0.0;
-    // Virtual-hit reprojection performs a second geometry-history search. It is valuable
-    // for coherent mirror paths, while rough lobes are more stable and cheaper when they
-    // reuse the primary receiver history (the intended AKGI split).
-    bool finiteRay = roughness <= 0.35 && rayRecord.a > 0.0 &&
-                     rayRecord.a < _GIMaxTraceDistance * 0.999;
-    if (finiteRay)
-    {
-        float2 currentHitUv = ComputeNormalizedDeviceCoordinates(hitPoint, _GIViewProjection);
-        if (all(currentHitUv > 0.0) && all(currentHitUv < 1.0))
-        {
-            float hitDepth = GILoadDepth(currentHitUv);
-            if (!GIIsBackground(hitDepth))
-            {
-                float3 reconstructedHit = GIWorldPosition(currentHitUv, hitDepth);
-                float hitError = length(reconstructedHit - hitPoint);
-                if (hitError <= max(0.15, rayRecord.a * 0.08))
-                {
-                    uint2 ignoredPreviousPixel;
-                    virtualValidity = GITemporalDiffuseMatch(
-                        currentHitUv, hitDepth, GILoadNormal(currentHitUv),
-                        GIMaterialSignature(currentHitUv), ignoredPreviousPixel, virtualUv);
-                }
-            }
-        }
-    }
-    bool virtualValid = virtualValidity > 0.0;
-    float3 virtualHistory = virtualValid
-        ? _GISpecularHistoryRead.SampleLevel(sampler_LinearClamp, virtualUv, 0).rgb
-        : surfaceHistory;
-
-    int2 centerPixel = (int2)dispatchId.xy;
-    int2 maximumPixel = (int2)_GIFullSize - 1;
-    float3 currentMean = current.rgb;
-    currentMean += _GIResolvedSpecularRead.Load(int3(
-        clamp(centerPixel + int2( 1, 0), 0, maximumPixel), 0)).rgb;
-    currentMean += _GIResolvedSpecularRead.Load(int3(
-        clamp(centerPixel + int2(-1, 0), 0, maximumPixel), 0)).rgb;
-    currentMean += _GIResolvedSpecularRead.Load(int3(
-        clamp(centerPixel + int2(0,  1), 0, maximumPixel), 0)).rgb;
-    currentMean += _GIResolvedSpecularRead.Load(int3(
-        clamp(centerPixel + int2(0, -1), 0, maximumPixel), 0)).rgb;
-    currentMean *= 0.2;
-    const float3 luminanceWeights = float3(0.2126, 0.7152, 0.0722);
-    float surfaceDifference = abs(dot(surfaceHistory, luminanceWeights) - dot(currentMean, luminanceWeights));
-    float virtualDifference = abs(dot(virtualHistory, luminanceWeights) - dot(currentMean, luminanceWeights));
-    float3 history = virtualValid && virtualDifference < surfaceDifference
-        ? virtualHistory : surfaceHistory;
-    history = GIClampHistory(_GIResolvedSpecularRead, dispatchId.xy, _GIFullSize, history);
-    // Spatial reservoir reuse already combines independent low-resolution paths.  Reuse
-    // the deterministic five-tap mean computed above as the rough-lobe reconstruction;
-    // this replaces a separate full-4K pass with four random neighbours per pixel.  Smooth
-    // mirrors retain the unfiltered current sample and therefore keep geometric detail.
-    float roughSpatialWeight = saturate(roughness * roughness * 0.65);
-    float3 currentFiltered = lerp(current.rgb, currentMean, roughSpatialWeight);
-    // Virtual reuse has an independent secondary-surface test.  Surface history is
-    // still valid for sky/world paths, but a failed virtual test must never retain the
-    // unrelated virtual sample selected above.
-    float weight = saturate(_GISpecularHistoryWeight) * validity;
-    _GISpecularHistoryWrite[dispatchId.xy] = float4(
-        lerp(currentFiltered, history, weight), current.a);
-}
-
 float3 GISpecularTonemap(float3 color)
 {
     return color / (1.0 + dot(color, float3(0.2126, 0.7152, 0.0722)));
@@ -4468,6 +4439,212 @@ float3 GISpecularTonemap(float3 color)
 float3 GISpecularInverseTonemap(float3 color)
 {
     return color / max(1.0 - dot(color, float3(0.2126, 0.7152, 0.0722)), 1e-3);
+}
+
+int2 GISpecularTemporalOffset(uint index)
+{
+    if (index == 1u) return int2( 1, 0);
+    if (index == 2u) return int2(-1, 0);
+    if (index == 3u) return int2(0,  1);
+    if (index == 4u) return int2(0, -1);
+    return 0;
+}
+
+float GISpecularHistoryMatch(float2 uv, float depth, float3 normal,
+                             out float2 previousUv, out float3 history)
+{
+    previousUv = uv;
+    history = 0.0;
+    if (_GIHistoryValid == 0u)
+        return 0.0;
+
+    float3 currentPosition = GIWorldPosition(uv, depth);
+    float2 motion = _GIMotionTexture.Load(int3(GIFullPixelFromUv(uv), 0));
+    float2 candidates[2];
+    candidates[0] = ComputeNormalizedDeviceCoordinates(
+        currentPosition, _GIPreviousViewProjection);
+    candidates[1] = uv - motion;
+    float bestScore = 1e20;
+    [unroll]
+    for (uint candidateIndex = 0u;
+         candidateIndex < (_GIUseMotionVectors != 0u ? 2u : 1u);
+         candidateIndex++)
+    {
+        float2 candidateUv = candidates[candidateIndex];
+        if (any(candidateUv <= 0.0) || any(candidateUv >= 1.0))
+            continue;
+        // Specular history is RGBA16F: alpha is the previous authoritative device
+        // depth. Point sampling keeps depth and radiance on the same receiver at edges.
+        float4 candidateHistory = _GISpecularHistoryRead.SampleLevel(
+            sampler_PointClamp, candidateUv, 0);
+        if (GIIsBackground(candidateHistory.a))
+            continue;
+        float3 previousPosition = ComputeWorldSpacePosition(
+            candidateUv, candidateHistory.a, _GIPreviousInverseViewProjection);
+        float3 positionDelta = previousPosition - currentPosition;
+        float distanceSquared = dot(positionDelta, positionDelta);
+        float planeError = abs(dot(positionDelta, normal));
+        float cameraDistance = length(currentPosition - _GICameraPosition);
+        float positionLimit = clamp(cameraDistance * 0.0015, 0.025, 0.30);
+        float planeLimit = clamp(cameraDistance * 0.0005, 0.012, 0.10);
+        if (distanceSquared > positionLimit * positionLimit ||
+            planeError > planeLimit)
+            continue;
+        float score = distanceSquared + planeError * 2.0;
+        if (score < bestScore)
+        {
+            bestScore = score;
+            previousUv = candidateUv;
+            history = max(0.0, candidateHistory.rgb);
+        }
+    }
+    return bestScore < 1e19 ? 1.0 : 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void TemporalSpecular(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= _GIFullSize))
+        return;
+    float2 uv = GIUvFromPixel(dispatchId.xy, _GIFullSize);
+    // ResolvedSpecular is B10G11R11 and has no alpha channel. The former code treated
+    // current.a as device depth (always 1 on this format), so every world-position test
+    // and history reprojection was invalid. Always fetch authoritative scene depth.
+    float depth = GILoadDepth(uv);
+    float4 current = _GIResolvedSpecularRead.Load(int3(dispatchId.xy, 0));
+    float4 rayRecord = _GIResolvedSpecularRayRead.Load(int3(dispatchId.xy, 0));
+    float roughness = saturate(1.0 - _GIGBuffer2.Load(int3(dispatchId.xy, 0)).a);
+    bool eligible = _GIEnableSpecular != 0u && !GIIsBackground(depth) &&
+                    roughness >= _GIMinSpecularRoughness &&
+                    roughness <= _GIMaxSpecularRoughness;
+    if (!eligible)
+    {
+        _GISpecularHistoryWrite[dispatchId.xy] = 0.0;
+        return;
+    }
+
+    float3 normal = GILoadNormal(uv);
+    float3 position = GIWorldPosition(uv, depth);
+    float2 previousUv;
+    float3 history;
+    float validity = GISpecularHistoryMatch(
+        uv, depth, normal, previousUv, history);
+    uint material = GIMaterialSignature(uv);
+
+    uint2 momentPixel = min((uint2)(uv * float2(_GISpecularSize)),
+                            _GISpecularSize - 1u);
+    float4 moments = _GISpecularMomentsRead.Load(int3(momentPixel, 0));
+    float historyLength = validity > 0.0 ? max(1.0, moments.z) : 0.0;
+    bool hasCurrentEstimate = rayRecord.a > 0.0 &&
+        all(isfinite(current.rgb)) && all(current.rgb >= 0.0);
+
+    // A checkerboard/null footprint is missing data, not a black observation. Preserve a
+    // validated history verbatim instead of alternating it with zero on high-metal pixels.
+    if (!hasCurrentEstimate)
+    {
+        _GISpecularHistoryWrite[dispatchId.xy] =
+            historyLength > 0.0 ? float4(history, depth) : 0.0;
+        return;
+    }
+
+    int2 centerPixel = (int2)dispatchId.xy;
+    int2 maximumPixel = (int2)_GIFullSize - 1;
+    float3 compressedSum = 0.0;
+    float weightSum = 0.0;
+    float luminanceSum = 0.0;
+    float luminanceSquaredSum = 0.0;
+    [unroll]
+    for (uint sampleIndex = 0u; sampleIndex < 5u; sampleIndex++)
+    {
+        int2 samplePixel = clamp(
+            centerPixel + GISpecularTemporalOffset(sampleIndex),
+            0, maximumPixel);
+        float4 sampleRay = _GIResolvedSpecularRayRead.Load(int3(samplePixel, 0));
+        if (sampleRay.a <= 0.0)
+            continue;
+        float2 sampleUv = GIUvFromPixel((uint2)samplePixel, _GIFullSize);
+        float sampleDepth = GILoadDepth(sampleUv);
+        if (GIIsBackground(sampleDepth) ||
+            GIMaterialSignature(sampleUv) != material)
+            continue;
+        float3 sampleNormal = GILoadNormal(sampleUv);
+        float normalAgreement = dot(normal, sampleNormal);
+        if (normalAgreement < lerp(0.985, 0.82, roughness))
+            continue;
+        float sampleRoughness = saturate(
+            1.0 - _GIGBuffer2.Load(int3(samplePixel, 0)).a);
+        if (abs(sampleRoughness - roughness) > max(0.035, roughness * 0.20))
+            continue;
+        float3 samplePosition = GIWorldPosition(sampleUv, sampleDepth);
+        float3 positionDelta = samplePosition - position;
+        float surfaceDistance = length(positionDelta);
+        float planeError = abs(dot(positionDelta, normal));
+        float cameraDistance = length(position - _GICameraPosition);
+        float surfaceLimit = min(0.50, max(0.08, cameraDistance * 0.0015));
+        if (surfaceDistance > surfaceLimit ||
+            planeError > max(0.02, surfaceDistance * 0.05))
+            continue;
+        float3 sampleValue = max(0.0,
+            _GIResolvedSpecularRead.Load(int3(samplePixel, 0)).rgb);
+        float kernelWeight = sampleIndex == 0u ? 2.0 : 1.0;
+        float weight = kernelWeight * pow(saturate(normalAgreement), 24.0);
+        float luminance = GILuminance(sampleValue);
+        compressedSum += GISpecularTonemap(sampleValue) * weight;
+        luminanceSum += luminance * weight;
+        luminanceSquaredSum += luminance * luminance * weight;
+        weightSum += weight;
+    }
+
+    float3 currentMean = weightSum > 1e-5
+        ? GISpecularInverseTonemap(compressedSum / weightSum)
+        : max(0.0, current.rgb);
+    float localMean = weightSum > 1e-5
+        ? luminanceSum / weightSum : GILuminance(max(0.0, current.rgb));
+    float localVariance = weightSum > 1e-5
+        ? max(0.0, luminanceSquaredSum / weightSum - localMean * localMean)
+        : 0.0;
+    float localSigma = sqrt(localVariance);
+    float momentVariance = max(0.0, moments.y - moments.x * moments.x);
+    float momentNoise = saturate(sqrt(momentVariance) /
+        max(moments.x + 0.05, 0.05));
+
+    float ignoredRoughness;
+    float3 f0 = GISpecularF0(dispatchId.xy, ignoredRoughness);
+    float metallicConfidence = saturate(
+        (max(f0.r, max(f0.g, f0.b)) - 0.04) / 0.70);
+    float spatialWeight = saturate(max(momentNoise,
+        localSigma / max(localMean + 0.05, 0.05)) *
+        (roughness * roughness * 0.75 + metallicConfidence * 0.18));
+    float3 currentFiltered = GISpecularInverseTonemap(lerp(
+        GISpecularTonemap(max(0.0, current.rgb)),
+        GISpecularTonemap(currentMean), spatialWeight));
+
+    if (historyLength > 0.0)
+    {
+        float currentLuminance = GILuminance(currentFiltered);
+        float historyLuminance = GILuminance(history);
+        float noise = max(momentNoise,
+            localSigma / max(currentLuminance + 0.05, 0.05));
+        float clampRadius = max(0.05,
+            currentLuminance * (0.25 + noise * 1.50) + localSigma * 2.0);
+        // Mature history is not forced back into one noisy frame's min/max envelope.
+        if (historyLength >= 4.0)
+            clampRadius *= 2.0;
+        float clampedLuminance = clamp(historyLuminance,
+            max(0.0, currentLuminance - clampRadius),
+            currentLuminance + clampRadius);
+        if (historyLuminance > 1e-5)
+            history *= clampedLuminance / historyLuminance;
+    }
+
+    float temporalWeight = historyLength > 0.0
+        ? min(saturate(_GISpecularHistoryWeight),
+              historyLength / (historyLength + 1.0)) * validity
+        : 0.0;
+    float3 result = GISpecularInverseTonemap(lerp(
+        GISpecularTonemap(currentFiltered),
+        GISpecularTonemap(max(0.0, history)), temporalWeight));
+    _GISpecularHistoryWrite[dispatchId.xy] = float4(max(0.0, result), depth);
 }
 
 [numthreads(8, 8, 1)]

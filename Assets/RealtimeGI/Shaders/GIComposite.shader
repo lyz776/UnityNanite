@@ -29,6 +29,7 @@ Shader "Hidden/RealtimeGI/Composite"
             TEXTURE2D_X(_GIGBuffer0);
             TEXTURE2D_X(_GIGBuffer1);
             half _GISpecularIntensity;
+            half _GIInjectionBlend;
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/GBufferCommon.hlsl"
 
@@ -51,7 +52,8 @@ Shader "Hidden/RealtimeGI/Composite"
                     ? 1.0h : 0.0h;
                 half3 injectedSpecular = indirectSpecular * gBuffer1.a *
                     max(_GISpecularIntensity, 0.0h) * receivesSpecular;
-                return half4(max(0.0h, indirectDiffuse + injectedSpecular), 0.0h);
+                half takeover = saturate(_GIInjectionBlend);
+                return half4(max(0.0h, indirectDiffuse + injectedSpecular) * takeover, 0.0h);
             }
             ENDHLSL
         }
