@@ -35,10 +35,10 @@ MonoBehaviour:
     specularIntensity: 3
     minSpecularRoughness: 0
     maxSpecularRoughness: 0.8
-    specularSpatialSamples: 4
+    specularSpatialSamples: 8
     specularVisibilityRayBudget: 32768
     triangleRefinementRayBudget: 8192
-    triangleRefinementCandidates: 8
+    triangleRefinementCandidates: 16
     debugHitMaterialColor: 0
     diffuseDebugStage: 0
     enableTraceCounters: 0
