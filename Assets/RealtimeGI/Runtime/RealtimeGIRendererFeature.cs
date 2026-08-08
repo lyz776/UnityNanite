@@ -81,7 +81,6 @@ namespace RealtimeGI
         Material compositeMaterial;
         GIInjectionStatePass prepareInjectionPass;
         GIInjectionStatePass resetInjectionPass;
-        GIKeywordStatePass disableNativeReflectionsPass;
         GIKeywordStatePass restoreNativeReflectionsPass;
         ClipmapUpdatePass clipmapUpdatePass;
         ScreenLightingPass pass;
@@ -358,6 +357,27 @@ namespace RealtimeGI
                 UnityEditor.EditorUtility.SetDirty(this);
 #endif
             }
+            if (settings.pipelineVersion < 24)
+            {
+                // Specular history now uses the real depth texture, persistent low-rate
+                // luminance moments and geometry-gated reconstruction. Version old assets
+                // so captures made with the alpha-less RGB depth path are not compared as
+                // equivalent.
+                settings.pipelineVersion = 24;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
+            if (settings.pipelineVersion < 25)
+            {
+                // Final specular history now carries authoritative device depth in alpha.
+                // This replaces quarter-resolution diffuse-geometry validation on 4K
+                // metallic receivers and changes the persistent texture ABI.
+                settings.pipelineVersion = 25;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
             if (settings.screenLightingShader == null)
                 settings.screenLightingShader = Resources.Load<ComputeShader>("RealtimeGI/GIScreenLighting");
             if (settings.compositeShader == null)
@@ -366,26 +386,6 @@ namespace RealtimeGI
             compositeMaterial = settings.compositeShader != null
                 ? CoreUtils.CreateEngineMaterial(settings.compositeShader)
                 : null;
-            prepareInjectionPass = new GIInjectionStatePass(
-                "RealtimeGI/Prepare Deferred Injection", 1f)
-            {
-                renderPassEvent = RenderPassEvent.BeforeRenderingGbuffer
-            };
-            resetInjectionPass = new GIInjectionStatePass(
-                "RealtimeGI/Reset Deferred Injection", 0f)
-            {
-                renderPassEvent = RenderPassEvent.AfterRenderingDeferredLights
-            };
-            disableNativeReflectionsPass = new GIKeywordStatePass(
-                "RealtimeGI/Disable Native Environment Reflections", true)
-            {
-                renderPassEvent = RenderPassEvent.BeforeRenderingGbuffer
-            };
-            restoreNativeReflectionsPass = new GIKeywordStatePass(
-                "RealtimeGI/Restore Native Environment Reflections", false)
-            {
-                renderPassEvent = RenderPassEvent.AfterRendering
-            };
             clipmapUpdatePass = new ClipmapUpdatePass
             {
                 renderPassEvent = RenderPassEvent.BeforeRenderingGbuffer
@@ -395,6 +395,24 @@ namespace RealtimeGI
             {
                 renderPassEvent = RenderPassEvent.BeforeRenderingDeferredLights,
                 requiresIntermediateTexture = true
+            };
+            prepareInjectionPass = new GIInjectionStatePass(
+                "RealtimeGI/Prepare Deferred Injection", pass)
+            {
+                renderPassEvent = RenderPassEvent.BeforeRenderingGbuffer
+            };
+            resetInjectionPass = new GIInjectionStatePass(
+                "RealtimeGI/Reset Deferred Injection", 0f)
+            {
+                renderPassEvent = RenderPassEvent.AfterRenderingDeferredLights
+            };
+            // Global _ENVIRONMENTREFLECTIONS_OFF is binary and therefore cannot
+            // participate in the warm-up cross-fade.  The customized URP glossy
+            // path already excludes probes/skybox and supplies only the TOD fallback.
+            restoreNativeReflectionsPass = new GIKeywordStatePass(
+                "RealtimeGI/Restore Native Environment Reflections", false)
+            {
+                renderPassEvent = RenderPassEvent.AfterRendering
             };
             sceneColorHistoryPass = new SceneColorHistoryPass(pass)
             {
@@ -412,7 +430,6 @@ namespace RealtimeGI
             pass = null;
             prepareInjectionPass = null;
             resetInjectionPass = null;
-            disableNativeReflectionsPass = null;
             restoreNativeReflectionsPass = null;
             clipmapUpdatePass = null;
             sceneColorHistoryPass = null;
@@ -425,8 +442,8 @@ namespace RealtimeGI
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
             if ((!settings.enableDiffuse && !settings.enableSpecular) || pass == null || prepareInjectionPass == null ||
-                resetInjectionPass == null || disableNativeReflectionsPass == null ||
-                restoreNativeReflectionsPass == null || clipmapUpdatePass == null || sceneColorHistoryPass == null ||
+                resetInjectionPass == null || restoreNativeReflectionsPass == null ||
+                clipmapUpdatePass == null || sceneColorHistoryPass == null ||
                 settings.screenLightingShader == null ||
                 compositeMaterial == null ||
                 !SystemInfo.supportsComputeShaders)
@@ -438,14 +455,13 @@ namespace RealtimeGI
             GIClipmapSystem clipmaps = GIClipmapSystem.Active;
             if (clipmaps == null || clipmaps.Scene == null)
                 return;
-            if (!clipmaps.PrepareClipmaps())
+            if (!clipmaps.PrepareClipmaps(renderingData.cameraData.camera))
                 return;
             if (!clipmaps.TryGetGpuView(out GIClipmapGpuView clipmapView) ||
                 !clipmaps.Scene.TryGetGpuView(out GISceneGpuView sceneView))
                 return;
             clipmapUpdatePass.Setup(clipmaps);
             renderer.EnqueuePass(clipmapUpdatePass);
-            renderer.EnqueuePass(disableNativeReflectionsPass);
             renderer.EnqueuePass(prepareInjectionPass);
             pass.Setup(settings, compositeMaterial, clipmapView, sceneView);
             renderer.EnqueuePass(pass);
@@ -511,6 +527,7 @@ namespace RealtimeGI
 
             readonly string graphPassName;
             readonly float value;
+            readonly ScreenLightingPass owner;
 
             public GIInjectionStatePass(string passName, float value)
             {
@@ -518,10 +535,17 @@ namespace RealtimeGI
                 this.value = value;
             }
 
+            public GIInjectionStatePass(string passName, ScreenLightingPass owner)
+            {
+                graphPassName = passName;
+                this.owner = owner;
+            }
+
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
             {
                 using var builder = renderGraph.AddUnsafePass<PassData>(graphPassName, out PassData data);
-                data.value = value;
+                Camera camera = frameData.Get<UniversalCameraData>().camera;
+                data.value = owner != null ? owner.GetInjectionBlend(camera) : value;
                 builder.AllowPassCulling(false);
                 builder.AllowGlobalStateModification(true);
                 builder.SetRenderFunc(static (PassData passData, UnsafeGraphContext context) =>
@@ -593,6 +617,7 @@ namespace RealtimeGI
             public readonly RTHandle[] reservoirStats = new RTHandle[2];
             public readonly RTHandle[] reservoirHit = new RTHandle[2];
             public readonly RTHandle[] specular = new RTHandle[2];
+            public readonly RTHandle[] specularMoments = new RTHandle[2];
             public readonly RTHandle[] specularReservoirRadiance = new RTHandle[2];
             public readonly RTHandle[] specularReservoirRay = new RTHandle[2];
             public readonly RTHandle[] specularReservoirHit = new RTHandle[2];
@@ -617,6 +642,23 @@ namespace RealtimeGI
             public Vector3 previousPosition;
             public Quaternion previousRotation;
             public Matrix4x4 previousViewProjection;
+            public int lastFrameUsed = -1;
+            public int injectionAge;
+
+            // Preserve native diffuse + analytic TOD glossy for a few frames, then
+            // hand over continuously.  This hides cache/reservoir allocation latency
+            // without pretending that an empty traced history is a valid black sample.
+            public float InjectionBlend
+            {
+                get
+                {
+                    const int holdFrames = 4;
+                    const int transitionFrames = 24;
+                    float t = Mathf.Clamp01(
+                        (injectionAge - holdFrames) / (float)transitionFrames);
+                    return t * t * (3f - 2f * t);
+                }
+            }
 
             public void Ensure(int fullWidth, int fullHeight, int nextDiffuseWidth, int nextDiffuseHeight,
                 int nextSpecularWidth, int nextSpecularHeight,
@@ -627,6 +669,7 @@ namespace RealtimeGI
                     specularWidth == nextSpecularWidth && specularHeight == nextSpecularHeight &&
                     diffuse[0] != null && diffuseMoments[0] != null &&
                     reservoirHit[0] != null && specular[0] != null &&
+                    specularMoments[0] != null &&
                     specularReservoirId[0] != null &&
                     hzb != null && sceneColor != null)
                     return;
@@ -656,9 +699,15 @@ namespace RealtimeGI
                         diffuseWidth, diffuseHeight, $"GI Diffuse Reservoir Hit Normal {cameraName} {i}");
                     specular[i] = RTHandles.Alloc(
                         fullWidth, fullHeight, 1, DepthBits.None,
-                        GraphicsFormat.B10G11R11_UFloatPack32, FilterMode.Bilinear,
+                        GraphicsFormat.R16G16B16A16_SFloat, FilterMode.Bilinear,
                         TextureWrapMode.Clamp, TextureDimension.Tex2D, true,
                         name: $"GI Specular History {cameraName} {i}");
+                    // Moments live at trace resolution, not 4K resolve resolution. RGBA16F
+                    // stores mean, second moment and history length for under 20 MiB at
+                    // the default 0.375 scale (both ping-pong surfaces combined).
+                    specularMoments[i] = Allocate(
+                        specularWidth, specularHeight,
+                        $"GI Specular Luminance Moments {cameraName} {i}");
                     specularReservoirRadiance[i] = Allocate(
                         specularWidth, specularHeight, $"GI Specular Reservoir Radiance {cameraName} {i}");
                     specularReservoirRay[i] = Allocate(
@@ -686,6 +735,7 @@ namespace RealtimeGI
                 index = 0;
                 valid = false;
                 sceneColorValid = false;
+                injectionAge = 0;
             }
 
             static RTHandle Allocate(int width, int height, string name) => RTHandles.Alloc(
@@ -698,9 +748,14 @@ namespace RealtimeGI
                 FilterMode.Point, TextureWrapMode.Clamp, TextureDimension.Tex2D,
                 true, name: name);
 
-            public bool IsCameraCut(Camera camera)
+            public bool IsCameraCut(Camera camera, bool sceneView)
             {
                 if (!valid)
+                    return true;
+                // Scene cameras may stop rendering while another editor window has focus.
+                // Reusing their old buffers on the next repaint is indistinguishable from
+                // a cut because editor motion vectors are not guaranteed across that gap.
+                if (sceneView && lastFrameUsed >= 0 && Time.frameCount - lastFrameUsed > 1)
                     return true;
                 return Vector3.Distance(previousPosition, camera.transform.position) > 5f ||
                        Quaternion.Angle(previousRotation, camera.transform.rotation) > 35f;
@@ -713,7 +768,9 @@ namespace RealtimeGI
                 previousViewProjection = viewProjection;
                 lightingRevision = nextLightingRevision;
                 valid = true;
+                lastFrameUsed = Time.frameCount;
                 frameIndex++;
+                injectionAge++;
                 index ^= 1;
             }
 
@@ -729,6 +786,7 @@ namespace RealtimeGI
                     reservoirStats[i]?.Release();
                     reservoirHit[i]?.Release();
                     specular[i]?.Release();
+                    specularMoments[i]?.Release();
                     specularReservoirRadiance[i]?.Release();
                     specularReservoirRay[i]?.Release();
                     specularReservoirHit[i]?.Release();
@@ -742,6 +800,7 @@ namespace RealtimeGI
                     reservoirStats[i] = null;
                     reservoirHit[i] = null;
                     specular[i] = null;
+                    specularMoments[i] = null;
                     specularReservoirRadiance[i] = null;
                     specularReservoirRay[i] = null;
                     specularReservoirHit[i] = null;
@@ -755,6 +814,8 @@ namespace RealtimeGI
                 valid = false;
                 sceneColorValid = false;
                 lightingRevision = -1;
+                lastFrameUsed = -1;
+                injectionAge = 0;
             }
 
             public void Dispose() => DisposeTextures();
@@ -807,6 +868,16 @@ namespace RealtimeGI
 
             public bool TryGetHistory(int cameraId, out CameraHistory history) =>
                 histories.TryGetValue(cameraId, out history);
+
+            public float GetInjectionBlend(Camera camera)
+            {
+                if (camera == null ||
+                    !histories.TryGetValue(camera.GetInstanceID(), out CameraHistory history) ||
+                    !history.valid || history.IsCameraCut(
+                        camera, camera.cameraType == CameraType.SceneView))
+                    return 0f;
+                return history.InjectionBlend;
+            }
 
             public void Setup(Settings nextSettings, Material nextCompositeMaterial,
                 GIClipmapGpuView nextClipmapView, GISceneGpuView nextSceneView)
@@ -966,6 +1037,8 @@ namespace RealtimeGI
                 public TextureHandle resolvedSpecularRay;
                 public TextureHandle specularRead;
                 public TextureHandle specularWrite;
+                public TextureHandle specularMomentsRead;
+                public TextureHandle specularMomentsWrite;
                 public TextureHandle specularSpatial;
                 public TextureHandle reservoirRadianceRead;
                 public TextureHandle reservoirRadianceWrite;
@@ -1062,6 +1135,7 @@ namespace RealtimeGI
                 public int localLightCount;
                 public int lightsPerBrick;
                 public int historyValid;
+                public int useMotionVectors;
                 public int sceneColorHistoryValid;
                 public bool enableSceneColorHistory;
                 public int frameIndex;
@@ -1119,6 +1193,7 @@ namespace RealtimeGI
                 public TextureHandle gBuffer0;
                 public TextureHandle gBuffer1;
                 public float specularIntensity;
+                public float injectionBlend;
             }
 
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -1154,7 +1229,11 @@ namespace RealtimeGI
                 // Slow TOD changes continuously refresh the cache. They must not reset the
                 // screen history every frame: with one diffuse ray that turns temporally
                 // stable irradiance into visible per-voxel noise.
-                bool historyValid = history.valid && !history.IsCameraCut(camera);
+                bool isSceneView = camera.cameraType == CameraType.SceneView;
+                bool historyValid = history.valid && !history.IsCameraCut(camera, isSceneView);
+                if (!historyValid)
+                    history.injectionAge = 0;
+                float injectionBlend = history.InjectionBlend;
                 int readIndex = history.index;
                 int writeIndex = readIndex ^ 1;
 
@@ -1270,6 +1349,10 @@ namespace RealtimeGI
                 TextureHandle geometryWrite = renderGraph.ImportTexture(history.geometry[writeIndex]);
                 TextureHandle specularRead = renderGraph.ImportTexture(history.specular[readIndex]);
                 TextureHandle specularWrite = renderGraph.ImportTexture(history.specular[writeIndex]);
+                TextureHandle specularMomentsRead = renderGraph.ImportTexture(
+                    history.specularMoments[readIndex]);
+                TextureHandle specularMomentsWrite = renderGraph.ImportTexture(
+                    history.specularMoments[writeIndex]);
                 TextureHandle specularReservoirRadianceRead = renderGraph.ImportTexture(
                     history.specularReservoirRadiance[readIndex]);
                 TextureHandle specularReservoirRadianceWrite = renderGraph.ImportTexture(
@@ -1369,6 +1452,8 @@ namespace RealtimeGI
                     data.resolvedSpecularRay = resolvedSpecularRay;
                     data.specularRead = specularRead;
                     data.specularWrite = specularWrite;
+                    data.specularMomentsRead = specularMomentsRead;
+                    data.specularMomentsWrite = specularMomentsWrite;
                     data.specularSpatial = specularSpatial;
                     data.reservoirRadianceRead = reservoirRadianceRead;
                     data.reservoirRadianceWrite = reservoirRadianceWrite;
@@ -1471,6 +1556,10 @@ namespace RealtimeGI
                     data.localLightCount = clipmapView.localLightCount;
                     data.lightsPerBrick = clipmapView.lightsPerBrick;
                     data.historyValid = historyValid ? 1 : 0;
+                    // Scene view motion vectors are editor dependent and frequently carry
+                    // stale/zero values. Static matrix reprojection remains authoritative
+                    // there; Game cameras retain both matrix and object-motion candidates.
+                    data.useMotionVectors = isSceneView ? 0 : 1;
                     data.sceneColorHistoryValid = history.sceneColorValid ? 1 : 0;
                     data.enableSceneColorHistory = settings.enableSceneColorHistory;
                     data.frameIndex = (int)history.frameIndex;
@@ -1544,6 +1633,8 @@ namespace RealtimeGI
                     builder.UseTexture(data.resolvedSpecularRay, AccessFlags.ReadWrite);
                     builder.UseTexture(data.specularRead, AccessFlags.Read);
                     builder.UseTexture(data.specularWrite, AccessFlags.ReadWrite);
+                    builder.UseTexture(data.specularMomentsRead, AccessFlags.Read);
+                    builder.UseTexture(data.specularMomentsWrite, AccessFlags.ReadWrite);
                     builder.UseTexture(data.reservoirRadianceRead, AccessFlags.Read);
                     builder.UseTexture(data.reservoirRadianceWrite, AccessFlags.ReadWrite);
                     builder.UseTexture(data.reservoirRayRead, AccessFlags.Read);
@@ -1627,6 +1718,7 @@ namespace RealtimeGI
                     injectionData.gBuffer1 = resources.gBuffer[1];
                     injectionData.specularIntensity = settings.enableSpecular
                         ? settings.specularIntensity : 0f;
+                    injectionData.injectionBlend = injectionBlend;
                     builder.UseTexture(injectionData.irradiance, AccessFlags.Read);
                     builder.UseTexture(injectionData.specular, AccessFlags.Read);
                     builder.UseTexture(injectionData.gBuffer0, AccessFlags.Read);
@@ -1643,6 +1735,8 @@ namespace RealtimeGI
                         context.cmd.SetGlobalTexture(ShaderIds.GBuffer1, data.gBuffer1);
                         context.cmd.SetGlobalFloat(
                             ShaderIds.SpecularIntensity, data.specularIntensity);
+                        context.cmd.SetGlobalFloat(
+                            ShaderIds.InjectionBlend, data.injectionBlend);
                         context.cmd.DrawProcedural(Matrix4x4.identity, data.material, 0,
                             MeshTopology.Triangles, 3, 1);
                     });
@@ -1707,6 +1801,8 @@ namespace RealtimeGI
                 cmd.SetComputeIntParam(shader, ShaderIds.LocalLightCount, data.localLightCount);
                 cmd.SetComputeIntParam(shader, ShaderIds.MaxLightsPerBrick, data.lightsPerBrick);
                 cmd.SetComputeIntParam(shader, ShaderIds.HistoryValid, data.historyValid);
+                cmd.SetComputeIntParam(shader, ShaderIds.UseMotionVectors,
+                    data.useMotionVectors);
                 cmd.SetComputeIntParam(shader, ShaderIds.SceneColorHistoryValid,
                     data.sceneColorHistoryValid);
                 cmd.SetComputeIntParam(shader, ShaderIds.EnableSceneColorHistory,
@@ -2002,6 +2098,10 @@ namespace RealtimeGI
                 cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
                     ShaderIds.SpecularReservoirIdWrite, data.specularReservoirIdWrite);
                 cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularMomentsRead, data.specularMomentsRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
+                    ShaderIds.SpecularMomentsWrite, data.specularMomentsWrite);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularReservoirKernel,
                     ShaderIds.GeometryHistoryRead, data.geometryRead);
                 cmd.DispatchCompute(shader, data.temporalSpecularReservoirKernel,
                     DivRoundUp(data.specularWidth, 8), DivRoundUp(data.specularHeight, 8), 1);
@@ -2057,6 +2157,8 @@ namespace RealtimeGI
                     ShaderIds.ResolvedSpecularRayRead, data.resolvedSpecularRay);
                 cmd.SetComputeTextureParam(shader, data.temporalSpecularKernel,
                     ShaderIds.SpecularHistoryRead, data.specularRead);
+                cmd.SetComputeTextureParam(shader, data.temporalSpecularKernel,
+                    ShaderIds.SpecularMomentsRead, data.specularMomentsWrite);
                 cmd.SetComputeTextureParam(shader, data.temporalSpecularKernel,
                     ShaderIds.GeometryHistoryRead, data.geometryRead);
                 cmd.SetComputeTextureParam(shader, data.temporalSpecularKernel,
@@ -2257,6 +2359,10 @@ namespace RealtimeGI
                 Shader.PropertyToID("_GIDiffuseReservoirHitWrite");
             public static readonly int SpecularHistoryRead = Shader.PropertyToID("_GISpecularHistoryRead");
             public static readonly int SpecularHistoryWrite = Shader.PropertyToID("_GISpecularHistoryWrite");
+            public static readonly int SpecularMomentsRead =
+                Shader.PropertyToID("_GISpecularMomentsRead");
+            public static readonly int SpecularMomentsWrite =
+                Shader.PropertyToID("_GISpecularMomentsWrite");
             public static readonly int GeometryHistoryRead = Shader.PropertyToID("_GIGeometryHistoryRead");
             public static readonly int GeometryHistoryWrite = Shader.PropertyToID("_GIGeometryHistoryWrite");
             public static readonly int DiffuseFiltered = Shader.PropertyToID("_GIDiffuseFiltered");
@@ -2362,6 +2468,8 @@ namespace RealtimeGI
             public static readonly int MaterialCount = Shader.PropertyToID("_GIMaterialCount");
             public static readonly int MaterialTextureSliceCount = Shader.PropertyToID("_GITextureSliceCount");
             public static readonly int HistoryValid = Shader.PropertyToID("_GIHistoryValid");
+            public static readonly int UseMotionVectors =
+                Shader.PropertyToID("_GIUseMotionVectors");
             public static readonly int SceneColorHistoryValid =
                 Shader.PropertyToID("_GISceneColorHistoryValid");
             public static readonly int EnableSceneColorHistory =
@@ -2389,6 +2497,7 @@ namespace RealtimeGI
             public static readonly int DiffuseMissDispatchArgs =
                 Shader.PropertyToID("_GIDiffuseMissDispatchArgs");
             public static readonly int DeferredInjectionActive = Shader.PropertyToID("_RealtimeGIDeferredInjection");
+            public static readonly int InjectionBlend = Shader.PropertyToID("_GIInjectionBlend");
         }
     }
 }

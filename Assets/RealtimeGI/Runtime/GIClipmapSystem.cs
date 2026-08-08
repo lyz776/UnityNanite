@@ -381,7 +381,7 @@ namespace RealtimeGI
             scene = GetComponent<RealtimeGIScene>();
         }
 
-        public bool PrepareClipmaps()
+        public bool PrepareClipmaps(Camera renderCamera = null)
         {
             if (!isActiveAndEnabled || !SystemInfo.supportsComputeShaders ||
                 SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null)
@@ -402,7 +402,7 @@ namespace RealtimeGI
                 return false;
             materialTextureCache.Update(scene, materialTextureResolution);
 
-            Vector3 focusPosition = ResolveFocusPosition();
+            Vector3 focusPosition = ResolveFocusPosition(renderCamera);
             BuildLocalLightList(focusPosition);
             bool originsChanged = UpdateLevelOrigins(focusPosition);
             // The GPU derives required pages and per-page invalidation hashes directly from
@@ -889,12 +889,20 @@ namespace RealtimeGI
             }
         }
 
-        Vector3 ResolveFocusPosition()
+        Vector3 ResolveFocusPosition(Camera renderCamera = null)
         {
             if (focus != null)
                 return focus.position;
+            // In edit mode there may be no MainCamera, or it may be parked far away while
+            // the Scene view is used for inspection. Build the shared world cache around
+            // the camera which requested this render. Play mode deliberately remains
+            // centred on the game camera so opening Scene view cannot thrash production GI.
+            if (!Application.isPlaying && renderCamera != null)
+                return renderCamera.transform.position;
             Camera camera = Camera.main;
-            return camera != null ? camera.transform.position : transform.position;
+            if (camera != null)
+                return camera.transform.position;
+            return renderCamera != null ? renderCamera.transform.position : transform.position;
         }
 
         void BuildLocalLightList(Vector3 focusPosition)

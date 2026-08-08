@@ -422,10 +422,18 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
         mainVisibility = blocked ? 0.0 : 1.0;
     }
 
+    // Validity's high word is a compact content identity, not merely the material
+    // revision.  A physical cell can be occupied by another object/triangle after a
+    // page is retained or recycled.  Matching material revisions alone made that new
+    // surface blend the old cell's coloured radiance and produced bright islands after
+    // leaving an area and returning.
+    uint historyIdentity = GIHash(
+        materialRevision ^ sourceIdentity * 0x9e3779b9u ^
+        packedSurface * 0x85ebca6bu) & 0xffffu;
     uint previousValidity = _GITargetLayer == 0u
         ? _GIStaticValidity[targetCellAddress] : _GIDynamicValidity[targetCellAddress];
-    uint previousRevision = previousValidity >> 16u;
-    uint previousConfidence = previousRevision == (materialRevision & 0xffffu)
+    uint previousIdentity = previousValidity >> 16u;
+    uint previousConfidence = previousIdentity == historyIdentity
         ? (previousValidity & 0xffu) : 0u;
     // A one/few-ray cache update must not let the newest coloured bounce replace most of
     // the cell in one frame.  The old serialized default (0.35) made a single red/cyan hit
@@ -543,12 +551,12 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
             GIPackRgb9E5(clamp(nextRadiance, 0.0, _GIRadianceClamp));
     }
     // The middle byte stores temporally accumulated sky visibility. Confidence only gates
-    // readability and the high word remains the material revision.
+    // readability and the high word identifies the exact cell contents.
     uint nextConfidence = 255u;
     uint packedSkyVisibility = (uint)round(saturate(skyVisibility) * 255.0);
     _GITargetValidityScratch[scratchCellAddress] = nextConfidence |
                                                    (packedSkyVisibility << 8u) |
-                                                   ((materialRevision & 0xffffu) << 16u);
+                                                   (historyIdentity << 16u);
 }
 
 [numthreads(8, 8, 8)]

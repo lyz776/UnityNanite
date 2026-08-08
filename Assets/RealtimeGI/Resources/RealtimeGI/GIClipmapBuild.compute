@@ -301,7 +301,12 @@ void MarkRequiredPages(uint3 dispatchId : SV_DispatchThreadID)
         {
             uint address = GIPageAddress(levelIndex, int3(x, y, z));
             InterlockedOr(_GIRequiredPageMask[address], 1u);
-            InterlockedXor(_GIRequiredPageHash[address], contentHash);
+            // Required-page fingerprints must be order independent, but XOR is not a
+            // multiset hash: two equal contributions cancel to zero and can make a page
+            // look unchanged after streaming/re-entry.  Addition keeps duplicate
+            // contributors visible (the per-instance hash already contains objectId),
+            // while remaining deterministic under GPU dispatch reordering.
+            InterlockedAdd(_GIRequiredPageHash[address], contentHash);
         }
     }
 }
@@ -332,6 +337,12 @@ void ReprojectResidentPages(uint3 dispatchId : SV_DispatchThreadID)
             _GIFreePageList[freeSlot] = physicalBrick;
         _GIBrickData[physicalBrick].level = 0xffffffffu;
         _GIPhysicalPageHash[physicalBrick] = 0u;
+        // A physical slot has no geometry lifetime once its logical owner is released.
+        // Clear the persistent dirty state so a later owner starts from its own epoch.
+        // Radiance generation is intentionally not written in this kernel: doing so would
+        // exceed D3D11's eight-UAV contract, and the monotonically increasing work
+        // generation already guarantees that a new owner is queued exactly once.
+        _GIDirtyGeneration[physicalBrick] = 0u;
         return;
     }
     InterlockedAdd(_GIAllocatorState[GI_ALLOC_ACTIVE_COUNT], 1u);
