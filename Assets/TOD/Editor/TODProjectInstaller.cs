@@ -28,12 +28,14 @@ namespace UnityNanite.TOD.Editor
             EditorApplication.delayCall += () =>
             {
                 TODProfile profile = AssetDatabase.LoadAssetAtPath<TODProfile>(DefaultProfilePath);
-                if (profile == null || profile.generatedPresetVersion >= 12)
+                if (profile == null)
                     return;
 
                 EnsureCloudTextureImport(DefaultCloudShapePath);
                 EnsureCloudTextureImport(DefaultCloudUnevenPath);
                 EnsureCloudTextureImport(DefaultCloudLightningPath);
+                if (profile.generatedPresetVersion >= 13)
+                    return;
                 UpgradeGeneratedDefaultProfile(profile);
                 AssetDatabase.SaveAssets();
             };
@@ -110,14 +112,17 @@ namespace UnityNanite.TOD.Editor
             if (importer == null)
                 return;
 
+            bool cpuReadable = path != DefaultCloudLightningPath;
             bool changed = importer.sRGBTexture ||
                 importer.wrapMode != TextureWrapMode.Repeat ||
                 importer.filterMode != FilterMode.Bilinear ||
-                !importer.mipmapEnabled;
+                !importer.mipmapEnabled ||
+                importer.isReadable != cpuReadable;
             importer.sRGBTexture = false;
             importer.wrapMode = TextureWrapMode.Repeat;
             importer.filterMode = FilterMode.Bilinear;
             importer.mipmapEnabled = true;
+            importer.isReadable = cpuReadable;
             if (changed)
                 importer.SaveAndReimport();
         }
@@ -142,9 +147,32 @@ namespace UnityNanite.TOD.Editor
 
         private static void UpgradeGeneratedDefaultProfile(TODProfile profile)
         {
-            const int currentVersion = 12;
+            const int currentVersion = 13;
             if (profile.generatedPresetVersion >= currentVersion)
                 return;
+
+            // Version 13 makes layer-two coverage independent, fixes the
+            // impractically rare/invisible lightning defaults and enables the
+            // two CPU-readable cloud textures used for lens-flare occlusion.
+            if (profile.generatedPresetVersion == 12)
+            {
+                TODCloudSecondaryLayerSettings layer2 = profile.clouds.layer2 ??
+                    (profile.clouds.layer2 = new TODCloudSecondaryLayerSettings());
+                float legacyCoverage = Mathf.Clamp01(
+                    profile.clouds.coverage.Evaluate(12f) +
+                    layer2.coverageOffset.Evaluate(12f));
+                layer2.coverage = new TODFloatParameter(legacyCoverage);
+
+                TODCloudLightningSettings lightning = profile.clouds.lightning ??
+                    (profile.clouds.lightning = new TODCloudLightningSettings());
+                if (lightning.intensity.Evaluate(12f) <= 0.001f)
+                    lightning.intensity = new TODFloatParameter(4f);
+                if (lightning.frequency.Evaluate(12f) <= 0.01f)
+                    lightning.frequency = new TODFloatParameter(2f);
+                profile.generatedPresetVersion = currentVersion;
+                EditorUtility.SetDirty(profile);
+                return;
+            }
 
             // Version 12 adds the second high-cloud plane and the optional
             // cloud-internal lightning controls while preserving tuned v11 data.
@@ -174,6 +202,11 @@ namespace UnityNanite.TOD.Editor
                 profile.clouds.rimWidth = new TODFloatParameter(0.025f);
                 profile.clouds.scale = new TODFloatParameter(1f);
                 profile.clouds.detailScale = new TODFloatParameter(12f);
+                profile.clouds.layer2 = new TODCloudSecondaryLayerSettings();
+                profile.clouds.lightning = new TODCloudLightningSettings
+                {
+                    glowTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultCloudLightningPath)
+                };
                 profile.generatedPresetVersion = currentVersion;
                 EditorUtility.SetDirty(profile);
                 return;

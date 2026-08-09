@@ -6,7 +6,7 @@ namespace Nanite.Editor
 {
     public static class NaniteCullingValidationMenu
     {
-        [MenuItem("Nanite/Validate BVH Culling (Selected NaniteMesh)")]
+        [MenuItem("Nanite/Diagnostics/Validate BVH Culling (Selected NaniteMesh)")]
         static void ValidateSelectedNaniteMesh()
         {
             var mesh = Selection.activeObject as NaniteMesh;
@@ -39,7 +39,7 @@ namespace Nanite.Editor
             }
         }
 
-        [MenuItem("Nanite/Validate BVH Culling (Selected NaniteMesh)", true)]
+        [MenuItem("Nanite/Diagnostics/Validate BVH Culling (Selected NaniteMesh)", true)]
         static bool ValidateSelectedNaniteMeshValidate() => Selection.activeObject is NaniteMesh;
     }
 }

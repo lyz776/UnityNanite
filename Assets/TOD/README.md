@@ -100,14 +100,18 @@ Lens Flare 使用太阳和月亮挂点上的 Unity URP `LensFlareComponentSRP`�
 透明层被重复雾化。
 
 云阴影 Pass 插入在 `AfterRenderingOpaques`，使用相机深度重建世界坐标，再沿太阳方向
-投影到高空云层采样程序化云形。安装器会同时确保
+投影到高空云层采样作者云形贴图。它只在像素仍能收到 URP 主光直射时生效，已经处于
+主光阴影的区域不会二次变暗；水平面与 X/Z 朝向陡峭表面使用稳定的主导面投影。安装器会同时确保
 `TODCloudShadowRendererFeature` 和 `TODFogRendererFeature` 存在于项目的 URP
 Renderer Data。
+
+独立时间测试面板位于 `Window/Unity Nanite/TOD Time Control`，也可从 TOD Controller
+Inspector 或完整 TOD 编辑器顶部打开。该面板的时间跳转不进入 Undo 栈。
 
 ## 当前边界
 
 贴地体积雾当前只有数据接口，不是已经完成的 Froxel 体积散射系统；启用其 Profile
-开关不会伪装出一个错误的平面雾效果。当前云仍是适合风格化远景的单层 2D 高空云，不是
+开关不会伪装出一个错误的平面雾效果。当前云仍是适合风格化远景的双层 2D 高空云，不是
 体积云 Ray March；它包含沿主光方向的低频自遮挡近似，但不包含完整体积阴影、天气图
 或局部云体。
 

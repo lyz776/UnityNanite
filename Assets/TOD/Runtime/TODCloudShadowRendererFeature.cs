@@ -8,6 +8,13 @@ namespace UnityNanite.TOD
 {
     public sealed class TODCloudShadowRendererFeature : ScriptableRendererFeature
     {
+        private static readonly int CloudsEnabledId = Shader.PropertyToID("_TODCloudsEnabled");
+        private static readonly int ShadowsEnabledId = Shader.PropertyToID("_TODCloudShadowsEnabled");
+        private static readonly int CoverageId = Shader.PropertyToID("_TODCloudCoverage");
+        private static readonly int Layer2EnabledId = Shader.PropertyToID("_TODCloudLayer2Enabled");
+        private static readonly int Layer2CoverageId = Shader.PropertyToID("_TODCloudLayer2Coverage");
+        private static readonly int DayAmountId = Shader.PropertyToID("_TODDayOrNight");
+
         [SerializeField] private RenderPassEvent injectionPoint = RenderPassEvent.AfterRenderingOpaques;
         [SerializeField] private bool sceneView = true;
 
@@ -33,6 +40,15 @@ namespace UnityNanite.TOD
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
             if (material == null || pass == null)
+                return;
+
+            bool layer1Visible = Shader.GetGlobalFloat(CoverageId) > 0.0001f;
+            bool layer2Visible = Shader.GetGlobalFloat(Layer2EnabledId) > 0.5f &&
+                Shader.GetGlobalFloat(Layer2CoverageId) > 0.0001f;
+            if (Shader.GetGlobalFloat(CloudsEnabledId) < 0.5f ||
+                Shader.GetGlobalFloat(ShadowsEnabledId) < 0.5f ||
+                Shader.GetGlobalFloat(DayAmountId) <= 0.0001f ||
+                (!layer1Visible && !layer2Visible))
                 return;
 
             CameraType cameraType = renderingData.cameraData.cameraType;

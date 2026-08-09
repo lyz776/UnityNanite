@@ -79,9 +79,14 @@ namespace UnityNanite.TOD.Editor
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("打开 TOD 编辑器", GUILayout.Height(25f)))
                 TODWindow.Open((TODController)target);
+            if (GUILayout.Button("独立时间面板", GUILayout.Height(25f)))
+                TODTimePanel.Open((TODController)target);
             if (GUILayout.Button("立即应用", GUILayout.Height(25f)))
                 ((TODController)target).Apply(true);
             EditorGUILayout.EndHorizontal();
+
+            if (GUILayout.Button("测试一次闪电", GUILayout.Height(23f)))
+                ((TODController)target).TriggerLightning();
 
             EditorGUILayout.Space(4f);
             EditorGUILayout.PropertyField(mainLight, new GUIContent("主方向光"));

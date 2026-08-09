@@ -96,7 +96,7 @@ namespace Nanite.Editor
             public readonly HashSet<int> coarseGroups = new HashSet<int>();
         }
 
-        [MenuItem("Nanite/Audit Hierarchy Distance + Topology (Selected NaniteMesh)")]
+        [MenuItem("Nanite/Diagnostics/Audit Hierarchy Distance + Topology (Selected NaniteMesh)")]
         static void AuditSelected()
         {
             NaniteMesh mesh = Selection.activeObject as NaniteMesh;
@@ -106,32 +106,6 @@ namespace Nanite.Editor
                 return;
             }
             Debug.Log(AuditMesh(mesh));
-        }
-
-        [MenuItem("Nanite/Audit Hierarchy Distance + Topology (toyota_ft1_mesh)")]
-        static void AuditToyota()
-        {
-            NaniteMesh mesh = AssetDatabase.LoadAssetAtPath<NaniteMesh>("Assets/toyota_ft1_mesh.asset");
-            if (mesh == null)
-            {
-                Debug.LogError("[Nanite][HierarchyDistanceAudit] Assets/toyota_ft1_mesh.asset was not found.");
-                return;
-            }
-            Debug.Log(AuditMesh(mesh));
-        }
-
-        public static void AuditToyotaBatch()
-        {
-            try
-            {
-                AuditToyota();
-                EditorApplication.Exit(0);
-            }
-            catch (Exception exception)
-            {
-                Debug.LogException(exception);
-                EditorApplication.Exit(1);
-            }
         }
 
         public static string AuditMesh(NaniteMesh mesh)

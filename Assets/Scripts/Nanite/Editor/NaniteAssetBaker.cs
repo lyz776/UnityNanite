@@ -197,7 +197,17 @@ namespace Nanite.Editor
             Debug.LogWarning("[Nanite] 收到取消请求，将在安全检查点停止…");
         }
 
-        public static void Bake(Mesh mesh)
+        public static void Bake(Mesh mesh) => Bake(mesh, null, null, null);
+
+        /// <summary>
+        /// Bakes a mesh into an explicit Nanite asset location. The default overload keeps
+        /// the legacy adjacent-to-source layout for scripts and the Project context command.
+        /// </summary>
+        public static void Bake(
+            Mesh mesh,
+            string naniteAssetPath,
+            string streamingRelativePath,
+            Material[] sourceMaterials)
         {
             if (IsBakeRunning)
             {
@@ -316,7 +326,11 @@ namespace Nanite.Editor
                 }
 
                 string basePath = meshAssetPath.Replace(Path.GetExtension(meshAssetPath), "");
-                string meshPath = basePath + "_mesh.asset";
+                string meshPath = string.IsNullOrWhiteSpace(naniteAssetPath)
+                    ? basePath + "_mesh.asset"
+                    : NormalizeAssetPath(naniteAssetPath);
+                if (!meshPath.EndsWith(".asset", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Nanite asset path must use the .asset extension.");
                 var previousGeneratedAssets = CollectReferencedPageAssetPaths(meshPath);
                 int totalNaniteVerts = 0;
                 long totalLegacyRawBytes = 0;
@@ -489,8 +503,10 @@ namespace Nanite.Editor
                     byte[] pageBlob = builtPages[pageIdx].blob;
                     Buffer.BlockCopy(pageBlob, 0, bulkPayload, bulkOffsets[pageIdx], pageBlob.Length);
                 }
-                string streamingRelativePath = BuildStreamingRelativePath(mesh, meshAssetPath);
-                string bulkBinaryPath = "Assets/StreamingAssets/" + streamingRelativePath;
+                string resolvedStreamingRelativePath = string.IsNullOrWhiteSpace(streamingRelativePath)
+                    ? BuildStreamingRelativePath(mesh, meshAssetPath)
+                    : NormalizeStreamingRelativePath(streamingRelativePath);
+                string bulkBinaryPath = "Assets/StreamingAssets/" + resolvedStreamingRelativePath;
                 WriteBinaryAsset(bulkBinaryPath, bulkPayload);
                 usedGeneratedAssets.Add(bulkBinaryPath);
 
@@ -505,7 +521,7 @@ namespace Nanite.Editor
                         builtPage.stats,
                         bulkOffsets[pageIdx],
                         builtPage.blob.Length,
-                        streamingRelativePath);
+                        resolvedStreamingRelativePath);
                     if (!builtPage.page.StripLegacyGeometryPayload(out string stripError))
                         throw new InvalidDataException($"Page {pageIdx} legacy geometry strip failed: {stripError}");
 
@@ -519,7 +535,9 @@ namespace Nanite.Editor
 
                 var naniteMesh = ScriptableObject.CreateInstance<NaniteMesh>();
                 naniteMesh.sourceMesh = mesh;
-                naniteMesh.sourceMaterials = ResolveSourceMaterials(mesh, meshAssetPath);
+                naniteMesh.sourceMaterials = sourceMaterials != null && sourceMaterials.Length > 0
+                    ? sourceMaterials
+                    : ResolveSourceMaterials(mesh, meshAssetPath);
                 naniteMesh.sourceTriangleCount = sourceTriangleCount;
                 naniteMesh.subMeshCount = subMeshCount;
                 naniteMesh.maxMipLevel = maxMipLevel;
@@ -586,7 +604,7 @@ namespace Nanite.Editor
                     $"  量化最大误差: position={maxPositionQuantizationError:G4}, uv={maxUvQuantizationError:G4}, " +
                     $"normal={maxNormalQuantizationError:G4}°, tangent={maxTangentQuantizationError:G4}°\n" +
                     $"  阶段耗时(ms): DAG={dagMs}, Part={partMs}, Page={pageMs}, Save={saveMs}, Total={totalTimer.ElapsedMilliseconds}\n" +
-                    $"  资源: {basePath}_mesh.asset");
+                    $"  资源: {meshPath}");
             }
             finally
             {
@@ -1302,7 +1320,7 @@ namespace Nanite.Editor
             return true;
         }
 
-        [MenuItem("Nanite/Repair Baked FBX Bindings")]
+        [MenuItem("Nanite/Diagnostics/Repair Baked FBX Bindings")]
         public static void RepairAllSourceBindingsBatch()
         {
             string[] guids = AssetDatabase.FindAssets("t:NaniteMesh");
@@ -1402,6 +1420,25 @@ namespace Nanite.Editor
                     continue;
                 AssetDatabase.DeleteAsset(path);
             }
+        }
+
+        static string NormalizeAssetPath(string assetPath)
+        {
+            string normalized = assetPath.Replace('\\', '/').Trim();
+            if (!normalized.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(normalized, "Assets", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("Nanite asset path must be inside Assets.");
+            }
+            return normalized;
+        }
+
+        static string NormalizeStreamingRelativePath(string relativePath)
+        {
+            string normalized = relativePath.Replace('\\', '/').Trim().TrimStart('/');
+            if (string.IsNullOrEmpty(normalized) || normalized.Contains("../"))
+                throw new InvalidDataException("Streaming path must be relative to Assets/StreamingAssets.");
+            return normalized;
         }
 
         static void WriteBinaryAsset(string assetPath, byte[] bytes)

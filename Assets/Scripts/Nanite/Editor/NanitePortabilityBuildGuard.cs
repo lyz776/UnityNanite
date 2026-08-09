@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using UnityEditor;
 using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
@@ -95,54 +94,6 @@ namespace Nanite.Editor
                 Debug.Log("[Nanite][Portability] DX12 API, shader backend, kernel and UAV contracts are valid.");
             else
                 Debug.LogError("[Nanite][Portability] Contract failed:\n" + error);
-        }
-
-        [MenuItem("Tools/Nanite/Build DX12 Portability Smoke Player")]
-        public static void BuildSmokePlayer()
-        {
-            string error = Audit(false);
-            if (!string.IsNullOrEmpty(error))
-                throw new BuildFailedException("Nanite DX12 portability contract failed:\n" + error);
-
-            string[] scenes = EditorBuildSettings.scenes
-                .Where(scene => scene != null && scene.enabled && !string.IsNullOrEmpty(scene.path))
-                .Select(scene => scene.path)
-                .ToArray();
-            if (scenes.Length == 0)
-                throw new BuildFailedException("Nanite portability smoke build has no enabled scene.");
-
-            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
-            string outputPath = Path.Combine(
-                projectRoot,
-                "Builds/NanitePortabilitySmoke/UnityNanitePortabilitySmoke.exe");
-            Directory.CreateDirectory(Path.GetDirectoryName(outputPath));
-            bool previousFrameTimingStats = PlayerSettings.enableFrameTimingStats;
-            BuildReport report;
-            try
-            {
-                // FrameTimingManager is the unattended Player's coarse GPU/CPU
-                // evidence when pass-level Recorder GPU blocks require an attached
-                // GPU Profiler. Restore the project preference after baking it into
-                // this diagnostic Player.
-                PlayerSettings.enableFrameTimingStats = true;
-                report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
-                {
-                    scenes = scenes,
-                    locationPathName = outputPath,
-                    target = BuildTarget.StandaloneWindows64,
-                    options = BuildOptions.Development | BuildOptions.StrictMode
-                });
-            }
-            finally
-            {
-                PlayerSettings.enableFrameTimingStats = previousFrameTimingStats;
-            }
-            if (report.summary.result != BuildResult.Succeeded)
-                throw new BuildFailedException(
-                    $"Nanite portability smoke build failed: {report.summary.result}; " +
-                    $"errors={report.summary.totalErrors}.");
-
-            Debug.Log($"[Nanite][Portability] Smoke Player ready: {outputPath}");
         }
 
         static string Audit(bool includeEditorDevice)

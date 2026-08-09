@@ -27,6 +27,10 @@ namespace UnityNanite.TOD
         [SerializeField] private Material skyboxMaterial;
 
         private int lastAppliedFrame = -1;
+        private double nextLightningTime = -1.0;
+        private double lightningStartTime = -1.0;
+        private int lightningSequence;
+        private bool manualLightning;
 
         public TODProfile Profile
         {
@@ -102,6 +106,14 @@ namespace UnityNanite.TOD
             advanceTime = !advanceTime;
         }
 
+        public void TriggerLightning()
+        {
+            manualLightning = true;
+            lightningStartTime = Time.realtimeSinceStartupAsDouble;
+            lightningSequence++;
+            Apply(true);
+        }
+
         public void Apply(bool force)
         {
             if (profile == null)
@@ -112,6 +124,8 @@ namespace UnityNanite.TOD
             lastAppliedFrame = Time.frameCount;
 
             float hour = TODProfile.WrapHour(currentTime);
+            float cloudTime = (float)Time.realtimeSinceStartupAsDouble;
+            Shader.SetGlobalFloat("_TODCloudTime", cloudTime);
             if (assignSkybox && skyboxMaterial != null && RenderSettings.skybox != skyboxMaterial)
                 RenderSettings.skybox = skyboxMaterial;
 
@@ -127,7 +141,7 @@ namespace UnityNanite.TOD
 
             UpdateCelestialTransform(sunVisual, sunDirection, profile.gizmoRadius);
             UpdateCelestialTransform(moonVisual, moonDirection, profile.gizmoRadius);
-            ApplyLensFlares(profile, hour);
+            ApplyLensFlares(profile, hour, sunDirection, moonDirection, cloudTime);
 
             if (mainLight != null)
             {
@@ -146,6 +160,7 @@ namespace UnityNanite.TOD
             Shader.SetGlobalVector("_TODSkyCenterWorldPos", transform.position);
 
             ApplySkyGlobals(profile, hour);
+            ApplyLightningRuntime(profile, hour);
             ApplyFogGlobals(profile, hour);
             ApplyEnvironment(profile, hour);
         }
@@ -268,8 +283,8 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODCloudLayer2Enabled", layer2.enabled ? 1f : 0f);
             Shader.SetGlobalFloat("_TODCloudLayer2Opacity", Mathf.Clamp01(layer2.opacity.Evaluate(hour)));
             Shader.SetGlobalFloat(
-                "_TODCloudLayer2CoverageOffset",
-                Mathf.Clamp(layer2.coverageOffset.Evaluate(hour), -1f, 1f));
+                "_TODCloudLayer2Coverage",
+                Mathf.Clamp01(layer2.coverage.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudLayer2Altitude", Mathf.Max(0.1f, layer2.altitude.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudLayer2Scale", Mathf.Max(0.01f, layer2.scale.Evaluate(hour)));
             Shader.SetGlobalVector("_TODCloudLayer2Speed", new Vector4(
@@ -425,22 +440,228 @@ namespace UnityNanite.TOD
                 terrainHeightTexture != null ? 1f : 0f));
         }
 
-        private void ApplyLensFlares(TODProfile value, float hour)
+        private void ApplyLensFlares(
+            TODProfile value,
+            float hour,
+            Vector3 sunDirection,
+            Vector3 moonDirection,
+            float cloudTime)
         {
+            float sunCloudTransmission = EvaluateCloudTransmission(
+                value.clouds, sunDirection, hour, cloudTime);
+            float moonCloudTransmission = EvaluateCloudTransmission(
+                value.clouds, moonDirection, hour, cloudTime);
             ApplyLensFlare(
                 sunLensFlare,
                 value.lensFlare,
-                value.lensFlare.sunIntensity.Evaluate(hour),
+                value.lensFlare.sunIntensity.Evaluate(hour) * sunCloudTransmission,
                 value.lensFlare.sunScale.Evaluate(hour),
                 value.sun.color.Evaluate(hour),
                 hour);
             ApplyLensFlare(
                 moonLensFlare,
                 value.lensFlare,
-                value.lensFlare.moonIntensity.Evaluate(hour),
+                value.lensFlare.moonIntensity.Evaluate(hour) * moonCloudTransmission,
                 value.lensFlare.moonScale.Evaluate(hour),
                 value.moon.color.Evaluate(hour),
                 hour);
+        }
+
+        private void ApplyLightningRuntime(TODProfile value, float hour)
+        {
+            TODCloudLightningSettings lightning = value.clouds.lightning;
+            if (lightning == null)
+                return;
+
+            double now = Time.realtimeSinceStartupAsDouble;
+            float duration = Mathf.Max(0.02f, lightning.duration.Evaluate(hour));
+            float frequency = Mathf.Max(0.001f, lightning.frequency.Evaluate(hour));
+            bool scheduled = lightning.enabled;
+
+            if (scheduled && nextLightningTime < 0.0)
+                nextLightningTime = now + Mathf.Min(1f, 6f / frequency);
+
+            if (scheduled && now >= nextLightningTime)
+            {
+                lightningStartTime = now;
+                lightningSequence++;
+                float variation = 0.72f + 0.56f * Hash01(lightningSequence * 19.17f);
+                nextLightningTime = now + 60.0 / frequency * variation;
+            }
+
+            float elapsed = lightningStartTime < 0.0
+                ? float.PositiveInfinity
+                : (float)(now - lightningStartTime);
+            bool flashing = elapsed >= 0f && elapsed < duration;
+            float pulse = 0f;
+            if (flashing)
+            {
+                float envelope = 1f - SmoothStep(0f, duration, elapsed);
+                float multiPulse = Mathf.Lerp(
+                    0.38f,
+                    1f,
+                    Mathf.Abs(Mathf.Sin(elapsed * 48f + lightningSequence * 1.73f)));
+                pulse = envelope * multiPulse;
+            }
+            else if (manualLightning)
+            {
+                manualLightning = false;
+            }
+
+            bool active = scheduled || manualLightning || flashing;
+            Shader.SetGlobalFloat("_TODCloudLightningEnabled", active ? 1f : 0f);
+            Shader.SetGlobalFloat("_TODCloudLightningPulse", pulse);
+            Shader.SetGlobalFloat("_TODCloudLightningSeed", lightningSequence);
+            float intensity = Mathf.Max(0f, lightning.intensity.Evaluate(hour));
+            if (manualLightning || flashing && !scheduled)
+                intensity = Mathf.Max(4f, intensity);
+            Shader.SetGlobalFloat("_TODCloudLightningIntensity", intensity);
+
+            if (!scheduled && !manualLightning && !flashing)
+                nextLightningTime = -1.0;
+        }
+
+        private static float EvaluateCloudTransmission(
+            TODCloudSettings clouds,
+            Vector3 direction,
+            float hour,
+            float cloudTime)
+        {
+            if (clouds == null || !clouds.enabled || direction.y <= 0.025f)
+                return 1f;
+
+            float opacity = Mathf.Clamp01(clouds.opacity.Evaluate(hour));
+            if (opacity <= 0f)
+                return 1f;
+
+            float coverage = Mathf.Clamp01(clouds.coverage.Evaluate(hour));
+            float cloud1 = EvaluateCloudLayer(
+                clouds,
+                direction,
+                clouds.altitude.Evaluate(hour),
+                clouds.scale.Evaluate(hour),
+                new Vector2(clouds.speedX.Evaluate(hour), clouds.speedY.Evaluate(hour)),
+                coverage,
+                hour,
+                cloudTime,
+                false);
+
+            TODCloudSecondaryLayerSettings layer2 = clouds.layer2;
+            float cloud2 = 0f;
+            if (layer2 != null && layer2.enabled)
+            {
+                cloud2 = EvaluateCloudLayer(
+                    clouds,
+                    direction,
+                    layer2.altitude.Evaluate(hour),
+                    layer2.scale.Evaluate(hour),
+                    new Vector2(layer2.speedX.Evaluate(hour), layer2.speedY.Evaluate(hour)),
+                    Mathf.Clamp01(layer2.coverage.Evaluate(hour)),
+                    hour,
+                    cloudTime,
+                    true) * Mathf.Clamp01(layer2.opacity.Evaluate(hour));
+            }
+
+            float mask = 1f - (1f - cloud1) * (1f - cloud2);
+            float latitude = Mathf.Clamp01(direction.y);
+            float latitudePosition = clouds.latitudePosition.Evaluate(hour);
+            float latitudeWidth = Mathf.Max(0.001f, clouds.latitudeWidth.Evaluate(hour));
+            float distribution = Mathf.Lerp(
+                Mathf.Max(0f, clouds.horizonDensity.Evaluate(hour)),
+                Mathf.Max(0f, clouds.zenithDensity.Evaluate(hour)),
+                SmoothStep(
+                    latitudePosition - latitudeWidth,
+                    latitudePosition + latitudeWidth,
+                    latitude));
+            float horizonProjectionWidth = Mathf.Max(
+                0.003f,
+                clouds.horizonFade.Evaluate(hour) * 0.05f);
+            float horizonVisibility = SmoothStep(
+                horizonProjectionWidth * 1.2f,
+                horizonProjectionWidth * 2.8f,
+                Mathf.Max(0f, direction.y));
+            mask *= horizonVisibility * distribution *
+                Mathf.Max(0f, clouds.densityMultiplier.Evaluate(hour));
+            return Mathf.Pow(Mathf.Clamp01(1f - Mathf.Clamp01(mask) * opacity), 4f);
+        }
+
+        private static float EvaluateCloudLayer(
+            TODCloudSettings clouds,
+            Vector3 direction,
+            float altitude,
+            float scale,
+            Vector2 speed,
+            float coverage,
+            float hour,
+            float cloudTime,
+            bool rotate)
+        {
+            if (coverage <= 0.0001f || clouds.shapeTexture == null || clouds.unevenTexture == null)
+                return 0f;
+            if (!clouds.shapeTexture.isReadable || !clouds.unevenTexture.isReadable)
+                return coverage * coverage;
+
+            float horizonProjectionWidth = Mathf.Max(
+                0.003f,
+                clouds.horizonFade.Evaluate(hour) * 0.05f);
+            float positiveHeight = Mathf.Max(0f, direction.y);
+            float rayHeight = Mathf.Max(
+                positiveHeight,
+                horizonProjectionWidth);
+            Vector2 planeDirection = new Vector2(direction.x, direction.z);
+            if (rotate)
+                planeDirection = new Vector2(
+                    planeDirection.x * 0.819152f - planeDirection.y * 0.573576f,
+                    planeDirection.x * 0.573576f + planeDirection.y * 0.819152f);
+            Vector2 uv = planeDirection * (Mathf.Max(0.1f, altitude) / rayHeight) *
+                (Mathf.Max(0.01f, scale) * 0.018f) + speed * cloudTime;
+            if (rotate)
+                uv += new Vector2(13.71f, -8.43f);
+
+            try
+            {
+                Color warp = SampleRepeat(clouds.unevenTexture, uv * 0.55f);
+                Vector2 shapedUv = uv + new Vector2(warp.r - 0.5f, warp.g - 0.5f) *
+                    (Mathf.Max(0f, clouds.distortion.Evaluate(hour)) * 0.035f);
+                float broad = SampleRepeat(clouds.shapeTexture, shapedUv).r;
+                float detailScale = Mathf.Max(0.1f, clouds.detailScale.Evaluate(hour));
+                float detail = SampleRepeat(
+                    clouds.shapeTexture,
+                    shapedUv * detailScale + Vector2.one * 0.371f).r;
+                float uneven = SampleRepeat(clouds.unevenTexture, uv * 2f).r;
+                broad = Mathf.Clamp01(broad + (Mathf.Pow(Mathf.Clamp01(uneven), 4f) - 0.5f) * 0.18f);
+                float erosion = Mathf.Clamp01(clouds.erosion.Evaluate(hour));
+                float density = broad - (1f - Mathf.Lerp(0.5f, detail, erosion)) * erosion * 0.42f;
+                float edge = Mathf.Max(0.012f, clouds.softness.Evaluate(hour) * 0.38f);
+                return SmoothStep(CoverageThreshold(coverage) - edge,
+                    CoverageThreshold(coverage) + edge, density);
+            }
+            catch (UnityException)
+            {
+                // 自定义贴图若未开启 Read/Write，只退回保守估计，不中断 TOD。
+                return coverage * coverage;
+            }
+        }
+
+        private static Color SampleRepeat(Texture2D texture, Vector2 uv)
+        {
+            return texture.GetPixelBilinear(Mathf.Repeat(uv.x, 1f), Mathf.Repeat(uv.y, 1f));
+        }
+
+        private static float CoverageThreshold(float coverage)
+        {
+            return Mathf.Lerp(1.01f, 0.28f, Mathf.Pow(Mathf.Clamp01(coverage), 0.65f));
+        }
+
+        private static float SmoothStep(float from, float to, float value)
+        {
+            float t = Mathf.Clamp01((value - from) / Mathf.Max(0.0001f, to - from));
+            return t * t * (3f - 2f * t);
+        }
+
+        private static float Hash01(float value)
+        {
+            return Mathf.Repeat(Mathf.Sin(value * 12.9898f) * 43758.5453f, 1f);
         }
 
         private static void ApplyLensFlare(

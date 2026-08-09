@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 31c35a5653c34aa78673086e7c2e6032, type: 3}
   m_Name: RealtimeGIRendererFeature
   m_EditorClassIdentifier: RealtimeGI::RealtimeGI.RealtimeGIRendererFeature
-  m_Active: 1
+  m_Active: 0
   settings:
     enableInSceneView: 1
     enableDiffuse: 1
@@ -32,7 +32,7 @@ MonoBehaviour:
     enableSpecular: 1
     specularResolutionScale: 0.375
     specularHistoryWeight: 0.713
-    specularIntensity: 3
+    specularIntensity: 1
     minSpecularRoughness: 0
     maxSpecularRoughness: 0.8
     specularSpatialSamples: 8
@@ -160,9 +160,6 @@ MonoBehaviour:
     logStats: 0
     enableVBufferPreview: 0
     vbufferPreviewMaxPackets: 1
-    enableDebugVisualization: 0
-    debugVisualizationMode: 0
-    debugVisualizationEvent: 1000
     enableFormalVisibilityBuffer: 1
     enableCompactFormalVBuffer: 0
     enableMaterialTileCulling: 1

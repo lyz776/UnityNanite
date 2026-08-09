@@ -7,7 +7,7 @@ namespace Nanite.Editor
 {
     public static class NaniteGpuCullingValidationMenu
     {
-        [MenuItem("Nanite/Validate GPU Culling (Selected NaniteMesh)")]
+        [MenuItem("Nanite/Diagnostics/Validate GPU Culling (Selected NaniteMesh)")]
         static void ValidateGpuCulling()
         {
             var mesh = Selection.activeObject as NaniteMesh;
@@ -89,7 +89,7 @@ namespace Nanite.Editor
                 Debug.LogError("[Nanite] GPU 剔除验证失败\n" + report);
         }
 
-        [MenuItem("Nanite/Validate GPU Culling (Selected NaniteMesh)", true)]
+        [MenuItem("Nanite/Diagnostics/Validate GPU Culling (Selected NaniteMesh)", true)]
         static bool ValidateGpuCullingValidate() => Selection.activeObject is NaniteMesh;
     }
 }

@@ -1,0 +1,143 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &9007390350735768941
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1703609101311351869}
+  - component: {fileID: 8061344157781796047}
+  - component: {fileID: 5488220343440889375}
+  - component: {fileID: 89755805379222489}
+  m_Layer: 0
+  m_Name: Shaderball2
+  m_TagString: static base
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 2147483647
+  m_IsActive: 1
+--- !u!4 &1703609101311351869
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9007390350735768941}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!33 &8061344157781796047
+MeshFilter:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9007390350735768941}
+  m_Mesh: {fileID: 6467769613007148272, guid: 5b4c8e0d8025d0549b15bb45683974e1, type: 3}
+--- !u!23 &5488220343440889375
+MeshRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9007390350735768941}
+  m_Enabled: 0
+  m_CastShadows: 1
+  m_ReceiveShadows: 1
+  m_DynamicOccludee: 1
+  m_StaticShadowCaster: 0
+  m_MotionVectors: 1
+  m_LightProbeUsage: 1
+  m_ReflectionProbeUsage: 1
+  m_RayTracingMode: 2
+  m_RayTraceProcedural: 0
+  m_RayTracingAccelStructBuildFlagsOverride: 0
+  m_RayTracingAccelStructBuildFlags: 1
+  m_SmallMeshCulling: 1
+  m_ForceMeshLod: -1
+  m_MeshLodSelectionBias: 0
+  m_RenderingLayerMask: 1
+  m_RendererPriority: 0
+  m_Materials:
+  - {fileID: 2100000, guid: b1f4df8cac1dcf44ca8bee25b3558dcd, type: 2}
+  - {fileID: 2100000, guid: a69ccaaa7fd70f9428fc3e601f212793, type: 2}
+  - {fileID: 2100000, guid: 5e65dc05e99391c4ca141f5388cbfe7a, type: 2}
+  m_StaticBatchInfo:
+    firstSubMesh: 0
+    subMeshCount: 0
+  m_StaticBatchRoot: {fileID: 0}
+  m_ProbeAnchor: {fileID: 0}
+  m_LightProbeVolumeOverride: {fileID: 0}
+  m_ScaleInLightmap: 1
+  m_ReceiveGI: 1
+  m_PreserveUVs: 0
+  m_IgnoreNormalsForChartDetection: 0
+  m_ImportantGI: 0
+  m_StitchLightmapSeams: 1
+  m_SelectedEditorRenderState: 3
+  m_MinimumChartSize: 4
+  m_AutoUVMaxDistance: 0.5
+  m_AutoUVMaxAngle: 89
+  m_LightmapParameters: {fileID: 0}
+  m_GlobalIlluminationMeshLod: 0
+  m_SortingLayerID: 0
+  m_SortingLayer: 0
+  m_SortingOrder: 0
+  m_MaskInteraction: 0
+  m_AdditionalVertexStreams: {fileID: 0}
+--- !u!114 &89755805379222489
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9007390350735768941}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4925ac9329a24d8458b0335b5f596f8b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Nanite::Nanite.NaniteRuntimeProxy
+  autoLoadFromResources: 0
+  resourcesPath: 
+  useGpuCulling: 0
+  gpuCullingShader: {fileID: 0}
+  externalCullingDriven: 0
+  uploadSelectionToGpu: 1
+  naniteMesh: {fileID: 11400000, guid: e910e235a5ead7244870da1f95de429a, type: 2}
+  targetCamera: {fileID: 0}
+  lodErrorPixels: 1
+  useBvh: 1
+  renderingMode: 0
+  rasterFallbackMesh: {fileID: 6467769613007148272, guid: 5b4c8e0d8025d0549b15bb45683974e1, type: 3}
+  legacyForceNaniteRendering: 1
+  legacyForceRasterRendering: 0
+  renderingModeSerializationVersion: 1
+  resolveMaterials:
+  - {fileID: 2100000, guid: b1f4df8cac1dcf44ca8bee25b3558dcd, type: 2}
+  - {fileID: 2100000, guid: a69ccaaa7fd70f9428fc3e601f212793, type: 2}
+  - {fileID: 2100000, guid: 5e65dc05e99391c4ca141f5388cbfe7a, type: 2}
+  renderVisibleMesh: 0
+  showAllClusters: 0
+  debugMaterial: {fileID: 0}
+  debugColorMode: 1
+  debugColorSaturation: 0.72
+  debugColorValue: 0.95
+  drawPartBounds: 0
+  drawClusterBounds: 0
+  drawOnlyVisibleClusterBounds: 1
+  boundsSphereScale: 1
+  visibleClusterCount: 0
+  lastGpuVisibleApprox: 0
+  visiblePageCount: 0
+  testedInstanceCount: 0
+  testedNodeCount: 0
+  testedPartCount: 0
+  testedClusterCount: 0

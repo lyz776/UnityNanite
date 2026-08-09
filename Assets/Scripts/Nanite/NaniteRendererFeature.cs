@@ -67,13 +67,6 @@ namespace Nanite
             PageRetirementFence
         }
 
-        public enum DebugVisualizationMode
-        {
-            Cluster = 0,
-            Triangle = 1,
-            Page = 2
-        }
-
         [System.Serializable]
         public class Settings
         {
@@ -129,13 +122,6 @@ namespace Nanite
             public bool enableVBufferPreview = false;
             [Tooltip("仅限制 VBuffer 预览绘制数量，不影响 culling 结果。<=0 表示不限制。")]
             [Min(-1)] public int vbufferPreviewMaxPackets = 2048;
-            [Header("Debug Visualization")]
-            [Tooltip("直接在画面上把当前可见 Nanite 几何按 Cluster/Triangle/Page 伪彩色预览。")]
-            public bool enableDebugVisualization = false;
-            [Tooltip("Cluster：每块 cluster 异色；Triangle：每个三角形异色；Page：每个 streaming page 异色。")]
-            public DebugVisualizationMode debugVisualizationMode = DebugVisualizationMode.Cluster;
-            [Tooltip("Debug 可视化绘制时机（建议 AfterRenderingOpaques）。")]
-            public RenderPassEvent debugVisualizationEvent = RenderPassEvent.AfterRendering;
             [Header("Formal VisibilityBuffer")]
             [Tooltip("正式 GPU-driven Visibility Buffer 链路；仅在原生渲染对照或诊断时关闭。")]
             public bool enableFormalVisibilityBuffer = true;
@@ -481,6 +467,7 @@ namespace Nanite
         bool loggedFormalRasterDiagnostics;
         Material runtimeVBufferPreviewMaterial;
         Material runtimeVBufferDecodeMaterial;
+        Material runtimeVBufferDebugResolveMaterial;
         Material runtimeDepthWriteMaterial;
         Material runtimeShadowCasterMaterial;
         Material runtimeVBufferLitResolveMaterial;
@@ -491,6 +478,7 @@ namespace Nanite
         // Current-camera RenderGraph handle. When HZB is active, WriteDepth can
         // populate Pass1 visibility IDs while producing the HZB depth source.
         TextureHandle recordedPass1VBuffer;
+        TextureHandle recordedFormalVBuffer;
 
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
         struct RasterDiagDrawCluster
@@ -865,7 +853,10 @@ namespace Nanite
             passBuildHzb = new NaniteFeaturePass(this, PassKind.BuildHzb, settings.buildHzbEvent);
             passSecondCull = new NaniteFeaturePass(this, PassKind.SecondCull, settings.secondCullEvent);
             passVBufferPreview = new NaniteFeaturePass(this, PassKind.DrawVBufferPreview, settings.vbufferPreviewEvent);
-            passDebugVisualization = new NaniteFeaturePass(this, PassKind.DrawDebugVisualization, settings.debugVisualizationEvent);
+            passDebugVisualization = new NaniteFeaturePass(
+                this,
+                PassKind.DrawDebugVisualization,
+                RenderPassEvent.AfterRendering);
             passFormalVisibility = new NaniteFeaturePass(this, PassKind.FormalVisibility, settings.formalVBufferEvent);
             passPageRetirementFence = new NaniteFeaturePass(
                 this,
@@ -1446,7 +1437,7 @@ namespace Nanite
                 renderer.EnqueuePass(passFormalVisibility);
             if (settings.enableVBufferPreview)
                 renderer.EnqueuePass(passVBufferPreview);
-            if (settings.enableDebugVisualization)
+            if (NaniteDebugVisualization.IsEnabled)
                 renderer.EnqueuePass(passDebugVisualization);
             if (sceneVisibilityBackend != null &&
                 sceneVisibilityBackend.PagePoolRequiresEviction &&
@@ -1467,13 +1458,7 @@ namespace Nanite
             passBuildHzb.renderPassEvent = (RenderPassEvent)eHzb;
             passSecondCull.renderPassEvent = settings.secondCullEvent;
             passVBufferPreview.renderPassEvent = settings.vbufferPreviewEvent;
-            // Debug is a presentation overlay. Scheduling it before temporal/post
-            // processing lets Game-view history blend the lit frame back over the
-            // diagnostic colors while the camera moves.
-            int eDebug = Mathf.Max(
-                (int)settings.debugVisualizationEvent,
-                (int)RenderPassEvent.AfterRenderingPostProcessing);
-            passDebugVisualization.renderPassEvent = (RenderPassEvent)eDebug;
+            passDebugVisualization.renderPassEvent = RenderPassEvent.AfterRendering;
             int eFormal = (int)settings.formalVBufferEvent + settings.formalVBufferQueueOffset;
             eFormal = Mathf.Clamp(
                 eFormal,
@@ -3511,6 +3496,15 @@ namespace Nanite
             internal TextureHandle vbuffer;
         }
 
+        class VBufferDebugResolveRgPassData
+        {
+            internal Material material;
+            internal Camera camera;
+            internal TextureHandle vbuffer;
+            internal int screenWidth;
+            internal int screenHeight;
+        }
+
         class DepthWriteRgPassData
         {
             internal Material material;
@@ -3694,6 +3688,7 @@ namespace Nanite
             {
                 recordedHzbDepthSource = TextureHandle.nullHandle;
                 recordedPass1VBuffer = TextureHandle.nullHandle;
+                recordedFormalVBuffer = TextureHandle.nullHandle;
             }
 
             if (passKind == PassKind.PageRetirementFence)
@@ -3985,39 +3980,61 @@ namespace Nanite
 
             if (passKind == PassKind.DrawDebugVisualization)
             {
-                var material = EnsureVBufferPreviewMaterial();
-                if (material == null)
-                    return;
-
                 UniversalResourceData resourceData = frameData.Get<UniversalResourceData>();
                 if (!resourceData.activeColorTexture.IsValid())
                     return;
 
+                var debugResolveMaterial = EnsureVBufferDebugResolveMaterial();
+                if (debugResolveMaterial != null && recordedFormalVBuffer.IsValid())
+                {
+                    int screenWidth = Mathf.Max(1, cameraData.scaledWidth);
+                    int screenHeight = Mathf.Max(1, cameraData.scaledHeight);
+                    using (var builder = renderGraph.AddRasterRenderPass<VBufferDebugResolveRgPassData>(
+                               "Nanite/DebugVisualization",
+                               out var passData,
+                               profilingSampler))
+                    {
+                        passData.material = debugResolveMaterial;
+                        passData.camera = cameraData.camera;
+                        passData.vbuffer = recordedFormalVBuffer;
+                        passData.screenWidth = screenWidth;
+                        passData.screenHeight = screenHeight;
+                        builder.AllowPassCulling(false);
+                        builder.AllowGlobalStateModification(true);
+                        builder.UseTexture(passData.vbuffer, AccessFlags.Read);
+                        builder.SetRenderAttachment(resourceData.activeColorTexture, 0, AccessFlags.ReadWrite);
+                        builder.SetRenderFunc((VBufferDebugResolveRgPassData data, RasterGraphContext context) =>
+                        {
+                            ExecuteDebugVBufferResolve(
+                                context.cmd,
+                                data.material,
+                                data.camera,
+                                data.vbuffer,
+                                data.screenWidth,
+                                data.screenHeight);
+                        });
+                    }
+                    return;
+                }
+
+                var material = EnsureVBufferPreviewMaterial();
+                if (material == null)
+                    return;
                 RecordVisibleTriangleCompactPass(renderGraph, cameraData.camera, kCompactSelectionMerged, profilingSampler);
 
                 using (var builder = renderGraph.AddRasterRenderPass<VBufferPreviewRgPassData>("Nanite/DebugVisualization", out var passData, profilingSampler))
                 {
                     passData.material = material;
                     passData.camera = cameraData.camera;
-                    passData.depth = resourceData.cameraDepthTexture.IsValid()
-                        ? resourceData.cameraDepthTexture
-                        : resourceData.activeDepthTexture;
+                    passData.depth = resourceData.activeDepthTexture;
                     builder.AllowPassCulling(false);
                     builder.AllowGlobalStateModification(true);
-                    // Debug is a sparse overlay. Preserve the already resolved camera
-                    // color and compare against a sampled depth copy in the shader.
-                    // Re-rasterizing against the live depth attachment with exact
-                    // fixed-function LEqual is unstable under Game-camera jitter:
-                    // tiny replay differences reject whole triangle fragments and the
-                    // lit image appears to progressively eat the debug colors.
                     builder.SetRenderAttachment(resourceData.activeColorTexture, 0, AccessFlags.ReadWrite);
                     if (passData.depth.IsValid())
-                        builder.UseTexture(passData.depth, AccessFlags.Read);
+                        builder.SetRenderAttachmentDepth(passData.depth, AccessFlags.Read);
 
                     builder.SetRenderFunc((VBufferPreviewRgPassData data, RasterGraphContext context) =>
                     {
-                        if (data.depth.IsValid())
-                            context.cmd.SetGlobalTexture(ShaderIds.CameraDepthTexture, data.depth);
                         ExecuteDebugVisualization(context.cmd, data.material, data.camera);
                     });
                 }
@@ -4198,6 +4215,7 @@ namespace Nanite
             var vbuffer = reusePass1VBuffer
                 ? recordedPass1VBuffer
                 : renderGraph.CreateTexture(vbufferDesc);
+            recordedFormalVBuffer = vbuffer;
 
             TextureHandle rasterDepth = resourceData.activeDepthTexture;
             if (halfResVBuffer && resourceData.activeDepthTexture.IsValid())
@@ -8306,7 +8324,7 @@ namespace Nanite
 
         void ExecuteDebugVisualization(ScriptableRenderContext context, Camera camera)
         {
-            if (!settings.enableDebugVisualization || camera == null)
+            if (!NaniteDebugVisualization.IsEnabled || camera == null)
                 return;
 
             var material = EnsureVBufferPreviewMaterial();
@@ -8322,11 +8340,11 @@ namespace Nanite
 
         void ExecuteDebugVisualization(CommandBuffer cmd, Material material, Camera camera)
         {
-            if (!settings.enableDebugVisualization || cmd == null || material == null || camera == null)
+            if (!NaniteDebugVisualization.IsEnabled || cmd == null || material == null || camera == null)
                 return;
 
             int pass = GetFormalResolvePassIndex(material, kPassDebugColorViz, kDebugColorVizPassFallback);
-            float mode = (float)settings.debugVisualizationMode;
+            float mode = (float)NaniteDebugVisualization.ActiveMode;
             int drawCalls = 0;
 
             if (EnsureVisibleTrianglesCompacted(cmd, camera, mergedSelections, kCompactSelectionMerged) &&
@@ -8373,17 +8391,17 @@ namespace Nanite
             if (!loggedDebugVizOnce && drawCalls > 0)
             {
                 loggedDebugVizOnce = true;
-                Debug.Log($"[Nanite][RF] Debug visualization active: mode={settings.debugVisualizationMode}, draws={drawCalls}");
+                Debug.Log($"[Nanite][RF] Debug visualization active: mode={NaniteDebugVisualization.ActiveMode}, draws={drawCalls}");
             }
         }
 
         void ExecuteDebugVisualization(RasterCommandBuffer cmd, Material material, Camera camera)
         {
-            if (!settings.enableDebugVisualization || cmd == null || material == null || camera == null)
+            if (!NaniteDebugVisualization.IsEnabled || cmd == null || material == null || camera == null)
                 return;
 
             int pass = GetFormalResolvePassIndex(material, kPassDebugColorViz, kDebugColorVizPassFallback);
-            float mode = (float)settings.debugVisualizationMode;
+            float mode = (float)NaniteDebugVisualization.ActiveMode;
             int drawCalls = 0;
 
             if (TryPrepareSceneVisibility(camera, mergedSelections) &&
@@ -8434,7 +8452,7 @@ namespace Nanite
             if (!loggedDebugVizOnce && drawCalls > 0)
             {
                 loggedDebugVizOnce = true;
-                Debug.Log($"[Nanite][RF] Debug visualization active: mode={settings.debugVisualizationMode}, draws={drawCalls}");
+                Debug.Log($"[Nanite][RF] Debug visualization active: mode={NaniteDebugVisualization.ActiveMode}, draws={drawCalls}");
             }
         }
 
@@ -8759,6 +8777,34 @@ namespace Nanite
             if (material == null || !vbuffer.IsValid())
                 return;
             cmd.SetGlobalTexture(ShaderIds.NaniteVBufferTex, vbuffer);
+            cmd.DrawProcedural(Matrix4x4.identity, material, 0, MeshTopology.Triangles, 3, 1);
+        }
+
+        void ExecuteDebugVBufferResolve(
+            RasterCommandBuffer cmd,
+            Material material,
+            Camera camera,
+            TextureHandle vbuffer,
+            int screenWidth,
+            int screenHeight)
+        {
+            if (material == null ||
+                !TryBindFormalResolveScene(
+                    cmd,
+                    camera,
+                    vbuffer,
+                    screenWidth,
+                    screenHeight,
+                    screenWidth,
+                    screenHeight,
+                    out _))
+                return;
+
+            ConfigureFormalResolveMaterialKeywords(
+                material,
+                false,
+                CanUseCompactFormalVBuffer());
+            cmd.SetGlobalFloat(ShaderIds.DebugVizMode, (float)NaniteDebugVisualization.ActiveMode);
             cmd.DrawProcedural(Matrix4x4.identity, material, 0, MeshTopology.Triangles, 3, 1);
         }
 
@@ -9196,6 +9242,21 @@ namespace Nanite
             return runtimeVBufferDecodeMaterial;
         }
 
+        Material EnsureVBufferDebugResolveMaterial()
+        {
+            if (runtimeVBufferDebugResolveMaterial != null)
+                return runtimeVBufferDebugResolveMaterial;
+
+            var shader = Shader.Find("Nanite/VBufferDebugResolve");
+            if (shader == null)
+                return null;
+            runtimeVBufferDebugResolveMaterial = new Material(shader)
+            {
+                name = "Nanite_VBufferDebugResolve_Runtime"
+            };
+            return runtimeVBufferDebugResolveMaterial;
+        }
+
         Material EnsureDepthWriteMaterial()
         {
             if (runtimeDepthWriteMaterial != null)
@@ -9265,6 +9326,11 @@ namespace Nanite
             {
                 DestroyObject(runtimeVBufferDecodeMaterial);
                 runtimeVBufferDecodeMaterial = null;
+            }
+            if (runtimeVBufferDebugResolveMaterial != null)
+            {
+                DestroyObject(runtimeVBufferDebugResolveMaterial);
+                runtimeVBufferDebugResolveMaterial = null;
             }
             if (runtimeDepthWriteMaterial != null)
             {

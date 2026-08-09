@@ -25,30 +25,16 @@ namespace Nanite.Editor
             public readonly List<float> parentFinite = new List<float>();
         }
 
-        [MenuItem("Nanite/Audit LOD Errors (Selected NaniteMesh)")]
+        [MenuItem("Nanite/Diagnostics/Audit LOD Errors (Selected NaniteMesh)")]
         static void AuditSelected()
         {
             var mesh = Selection.activeObject as NaniteMesh;
             if (mesh == null)
             {
-                Debug.LogWarning("[Nanite][LOD Audit] 请先在 Project 选中 NaniteMesh（如 toyota_ft1_mesh）。");
+                Debug.LogWarning("[Nanite][LOD Audit] 请先在 Project 选中 NaniteMesh。");
                 return;
             }
 
-            Debug.Log(AuditMesh(mesh));
-        }
-
-        [MenuItem("Nanite/Audit LOD Errors (toyota_ft1_mesh)")]
-        static void AuditToyota()
-        {
-            var mesh = AssetDatabase.LoadAssetAtPath<NaniteMesh>("Assets/toyota_ft1_mesh.asset");
-            if (mesh == null)
-            {
-                Debug.LogWarning("[Nanite][LOD Audit] 未找到 Assets/toyota_ft1_mesh.asset");
-                return;
-            }
-
-            Selection.activeObject = mesh;
             Debug.Log(AuditMesh(mesh));
         }
 

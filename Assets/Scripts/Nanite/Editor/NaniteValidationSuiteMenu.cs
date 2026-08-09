@@ -11,7 +11,7 @@ namespace Nanite.Editor
     {
         static readonly float[] kLodSweep = { 0.5f, 1f, 2f, 4f, 8f, 16f, 32f, 64f, 128f, 256f, 512f, 1024f };
 
-        [MenuItem("Nanite/Validation Suite/CPU vs GPU Sweep (Selected NaniteMesh)")]
+        [MenuItem("Nanite/Diagnostics/Validation/CPU vs GPU Sweep (Selected NaniteMesh)")]
         static void ValidateCpuVsGpuSweep()
         {
             if (!TryGetSelection(out var mesh, out var camera, out var shader))
@@ -67,7 +67,7 @@ namespace Nanite.Editor
             }
         }
 
-        [MenuItem("Nanite/Validation Suite/Two-Pass Merge Check (Selected NaniteMesh)")]
+        [MenuItem("Nanite/Diagnostics/Validation/Two-Pass Merge Check (Selected NaniteMesh)")]
         static void ValidateTwoPassMerge()
         {
             if (!TryGetSelection(out var mesh, out var camera, out var shader))
@@ -111,7 +111,7 @@ namespace Nanite.Editor
                 Debug.LogError("[Nanite][Validation] Two-Pass Merge 检查失败\n" + report);
         }
 
-        [MenuItem("Nanite/Validation Suite/Batched vs Legacy (Scene Proxies)")]
+        [MenuItem("Nanite/Diagnostics/Validation/Batched vs Legacy (Scene Proxies)")]
         static void ValidateBatchedVsLegacySceneProxies()
         {
             var proxies = CollectBatchableSceneProxies();
@@ -222,7 +222,7 @@ namespace Nanite.Editor
                 Debug.LogError("[Nanite][Validation] Batched vs Legacy 对拍失败\n" + headline + "\n" + sb);
         }
 
-        [MenuItem("Nanite/Validation Suite/Formal VBuffer Visibility Consistency")]
+        [MenuItem("Nanite/Diagnostics/Validation/Formal VBuffer Visibility Consistency")]
         static void ValidateFormalVisibilityConsistency()
         {
             var proxies = CollectBatchableSceneProxies();
@@ -313,7 +313,7 @@ namespace Nanite.Editor
                 Debug.LogError("[Nanite][Validation] Formal VBuffer 可见一致性失败\n" + sb);
         }
 
-        [MenuItem("Nanite/Validation Suite/Formal VBuffer Material Mapping Consistency")]
+        [MenuItem("Nanite/Diagnostics/Validation/Formal VBuffer Material Mapping Consistency")]
         static void ValidateFormalMaterialMappingConsistency()
         {
             var proxies = CollectBatchableSceneProxies();
@@ -363,7 +363,7 @@ namespace Nanite.Editor
                 Debug.LogError("[Nanite][Validation] Formal VBuffer 材质映射一致性失败\n" + sb);
         }
 
-        [MenuItem("Nanite/Validation Suite/Formal VBuffer Derivative/SampleGrad Validation")]
+        [MenuItem("Nanite/Diagnostics/Validation/Formal VBuffer Derivative/SampleGrad Validation")]
         static void ValidateFormalDerivativeContract()
         {
             string shaderPath = "Assets/Scripts/Nanite/NaniteVBufferLitResolve.shader";
@@ -391,7 +391,7 @@ namespace Nanite.Editor
                     $"[Nanite][Validation] Formal VBuffer 导数契约失败 hasBaryFunc={hasBaryFunc} hasGradSampling={hasGradSampling} hasBaryUsage={hasBaryUsage}");
         }
 
-        [MenuItem("Nanite/Validation Suite/Formal VBuffer GBuffer Regression Check")]
+        [MenuItem("Nanite/Diagnostics/Validation/Formal VBuffer GBuffer Regression Check")]
         static void ValidateFormalGBufferRegression()
         {
             const int kAfterRenderingGbuffer = 220;
@@ -455,8 +455,8 @@ namespace Nanite.Editor
                 Debug.LogError("[Nanite][Validation] Formal VBuffer GBuffer 回归检查失败\n" + sb);
         }
 
-        [MenuItem("Nanite/Validation Suite/CPU vs GPU Sweep (Selected NaniteMesh)", true)]
-        [MenuItem("Nanite/Validation Suite/Two-Pass Merge Check (Selected NaniteMesh)", true)]
+        [MenuItem("Nanite/Diagnostics/Validation/CPU vs GPU Sweep (Selected NaniteMesh)", true)]
+        [MenuItem("Nanite/Diagnostics/Validation/Two-Pass Merge Check (Selected NaniteMesh)", true)]
         static bool ValidateMenu() => Selection.activeObject is NaniteMesh;
 
         static List<NaniteRuntimeProxy> CollectBatchableSceneProxies()

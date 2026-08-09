@@ -158,6 +158,8 @@ namespace UnityNanite.TOD
     {
         public bool enabled = true;
         public TODFloatParameter opacity = new TODFloatParameter(0.42f);
+        public TODFloatParameter coverage = new TODFloatParameter(0.35f);
+        // 仅为旧 Profile 保留，不再参与运行时计算。
         public TODFloatParameter coverageOffset = new TODFloatParameter(-0.08f);
         public TODFloatParameter altitude = new TODFloatParameter(9.5f);
         public TODFloatParameter scale = new TODFloatParameter(0.52f);
@@ -174,7 +176,7 @@ namespace UnityNanite.TOD
         public TODColorParameter color =
             new TODColorParameter(new Color(0.55f, 0.72f, 1.4f));
         public TODFloatParameter intensity = new TODFloatParameter(4f);
-        public TODFloatParameter frequency = new TODFloatParameter(0.25f);
+        public TODFloatParameter frequency = new TODFloatParameter(2f);
         public TODFloatParameter duration = new TODFloatParameter(0.42f);
         public TODFloatParameter scale = new TODFloatParameter(1.2f);
         public TODFloatParameter glowSpeed = new TODFloatParameter(0.004f);

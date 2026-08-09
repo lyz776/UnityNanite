@@ -27,7 +27,7 @@ namespace Nanite.Editor
             ("Nanite/VBufferDecode", "Assets/Scripts/Nanite/NaniteVBufferDecode.shader")
         };
 
-        [MenuItem("Nanite/Performance/Build GPU Profiler Development Player")]
+        [MenuItem("Nanite/Diagnostics/Performance/Build GPU Profiler Development Player")]
         public static void BuildGpuProfilerDevelopmentPlayer()
         {
             string[] scenes = EditorBuildSettings.scenes

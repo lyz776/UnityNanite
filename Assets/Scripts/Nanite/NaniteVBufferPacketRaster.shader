@@ -394,11 +394,7 @@ Shader "Nanite/VBufferPacketRaster"
         {
             Name "DebugColorViz"
             Cull Off
-            // The debug draw replays the same geometry after formal resolve. An
-            // exact fixed-function depth test is not replay-stable when the Game
-            // camera uses temporal jitter, so perform a tolerant comparison with
-            // the resolved camera depth in the fragment shader instead.
-            ZTest Always
+            ZTest LEqual
             ZWrite Off
             Blend Off
 
@@ -408,7 +404,6 @@ Shader "Nanite/VBufferPacketRaster"
             #pragma vertex vert
             #pragma fragment frag
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "NaniteVBufferCommon.hlsl"
             #include "NaniteCompactDraw.hlsl"
 
@@ -438,7 +433,33 @@ Shader "Nanite/VBufferPacketRaster"
 
             int VertexStrideInt() { return max(3, (int)_VertexStride); }
             int UseSceneInstanceBufferInt() { return (int)_UseSceneInstanceBuffer; }
+            int HasTriangleSubMeshInt() { return (int)_HasTriangleSubMesh; }
             int DebugVizModeInt() { return (int)_DebugVizMode; }
+            int MaxSubMeshCountInt() { return max(1, (int)_MaxSubMeshCount); }
+
+            float4 ApplyDeterministicDepthTieBreak(float4 positionCS, int triId)
+            {
+                int subMesh = HasTriangleSubMeshInt() != 0
+                    ? max(0, _TriangleSubMesh[triId])
+                    : 0;
+                uint triangleRank = asuint(triId);
+                triangleRank = (triangleRank ^ 61u) ^ (triangleRank >> 16u);
+                triangleRank *= 9u;
+                triangleRank ^= triangleRank >> 4u;
+                triangleRank *= 0x27d4eb2du;
+                triangleRank ^= triangleRank >> 15u;
+                triangleRank &= 1023u;
+                float materialRank = ((float)subMesh +
+                    ((float)triangleRank + 0.5) / 1024.0) /
+                    (float)(MaxSubMeshCountInt() + 1);
+                const float kTieBreakDepth = 1.0e-5;
+            #if UNITY_REVERSED_Z
+                positionCS.z += positionCS.w * kTieBreakDepth * materialRank;
+            #else
+                positionCS.z -= positionCS.w * kTieBreakDepth * materialRank;
+            #endif
+                return positionCS;
+            }
 
             struct Attributes
             {
@@ -517,22 +538,13 @@ Shader "Nanite/VBufferPacketRaster"
                 }
                 float3 posWS = mul(localToWorld, float4(posOS, 1.0)).xyz;
                 o.positionCS = TransformWorldToHClip(posWS);
+                o.positionCS = ApplyDeterministicDepthTieBreak(o.positionCS, triId);
                 o.instanceId = (uint)max(0, instance);
                 return o;
             }
 
             float4 frag(Varyings i) : SV_Target
             {
-                float debugDepth = NanitePackDepth01(i.positionCS);
-                float sceneDepth = LoadSceneDepth(uint2(i.positionCS.xy));
-                // A small derivative-scaled tolerance absorbs raster replay and
-                // temporal-jitter quantisation without letting genuinely occluded
-                // Nanite surfaces show through foreground geometry.
-                float depthTolerance = max(
-                    2.0e-5,
-                    2.0 * max(abs(ddx(debugDepth)), abs(ddy(debugDepth))));
-                clip(depthTolerance - abs(debugDepth - sceneDepth));
-
                 int triId = (int)i.triId;
                 int mode = DebugVizModeInt();
                 uint colorId;

@@ -109,7 +109,7 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("高空云 / 分布", "clouds.latitudeWidth", "纬度渐变宽度", 0.001f, 1f),
             new TODParameterDescriptor("高空云 / 分布", "clouds.speedX", "水平速度 X"),
             new TODParameterDescriptor("高空云 / 分布", "clouds.speedY", "水平速度 Y"),
-            new TODParameterDescriptor("高空云 / 分布", "clouds.horizonFade", "地平线淡出", 0.001f, 0.5f),
+            new TODParameterDescriptor("高空云 / 分布", "clouds.horizonFade", "地平线极远淡出范围", 0.01f, 0.5f),
 
             new TODParameterDescriptor("高空云 / 光照", "clouds.sunLighting", "太阳光照", 0f, 8f),
             new TODParameterDescriptor("高空云 / 光照", "clouds.moonLighting", "月亮光照", 0f, 4f),
@@ -134,7 +134,7 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("高空云 / 光学", "clouds.multipleScattering", "多重散射近似", 0f, 2f),
 
             new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.opacity", "第二层混合强度", 0f, 1f),
-            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.coverageOffset", "覆盖率偏移", -1f, 1f),
+            new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.coverage", "第二层独立覆盖率", 0f, 1f),
             new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.altitude", "第二层高度（km）", 0.1f, 50f),
             new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.scale", "第二层尺度", 0.01f, 8f),
             new TODParameterDescriptor("高空云 / 第二层", "clouds.layer2.speedX", "第二层速度 X"),
@@ -558,6 +558,12 @@ namespace UnityNanite.TOD.Editor
                 EditorGUILayout.PropertyField(
                     profileObject.FindProperty("clouds.lightning.glowTexture"),
                     new GUIContent("闪电位置 / 发光贴图"));
+                if (GUILayout.Button("立即测试一次闪电", GUILayout.Height(24f)))
+                {
+                    TODController controller = UnityEngine.Object.FindFirstObjectByType<TODController>();
+                    if (controller != null)
+                        controller.TriggerLightning();
+                }
                 return;
             }
 

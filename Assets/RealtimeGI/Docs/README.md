@@ -244,3 +244,121 @@ GI voxelization 与 BVH refinement 直接消费该 live resident page；每次�
 - [Surfel-based Radiance Cascade GI](https://zhuanlan.zhihu.com/p/2062594335728784841)
 
 参考代码仅用于公司预研、个人学习与技术实验；进入产品前需单独完成许可证审查。
+
+## 14. 2026-08-09 风格化项目的架构收缩决议（待实施）
+
+目标画面是动态光源驱动、卡通纯净、室内外连续的低频漫反射染色；不追求实时路径追踪的高频镜面。
+默认 GI 的首要指标因此是镜头运动稳定、能量受控和固定预算，而不是以每像素随机射线加历史积累换取细节。
+
+### 本地 Lumen-Like 审阅结论
+
+不整合其代码。`LumenLike.cs` 的主体是 SEGI 风格完整稠密体素化：默认 256^3、可选 512^3，维护
+3D ARGBHalf mip chain、额外 ping-pong volume、secondary irradiance 和 RInt occupancy，并通过辅助
+voxel/shadow camera 的 `RenderWithShader` 工作。仅 256^3 时，这几组主 volume 的静态显存已约 466 MiB
+（未计屏幕 RT）；512^3 约为八倍，且 conventional camera draw 不能直接复用 Nanite 的 procedural VBuffer 几何。
+
+它所谓 `SurfaceCache` 是半分辨率的屏幕空间 radiance/normal/depth history，不是世界空间 card cache。更重要的是，
+`SurfaceCache.shader` 虽定义 `AccumulateHistorySample`，实际 update fragment 没有调用它，只把 `_BlitTexture`
+返回；不能把它视作经过验证的 temporal surface cache。该项目仍有 `doReflections`、`reflectionSteps` 和
+`skyReflectionIntensity` 的 SEGI 镜面/天空路径，也不符合“GI 接管后不再依赖 Reflection Probe/Unity sky”的契约。
+
+可借的是产品级取舍：体积表示、半/四分辨率、双边上采样和以低频为目标；不是它的辅助相机、整块 voxel volume 或代码实现。
+
+### 拟替换的默认路径
+
+```text
+Nanite geometry/material stream + TOD/local lights
+                  │（dirty brick budget）
+                  ▼
+  sparse world-space radiance / irradiance clipmap
+                  │
+       ┌──────────┴──────────┐
+       ▼                     ▼
+ full-res diffuse query   optional quarter-res glossy cone
+       │                     │
+ trilinear + normal leak  cache hit / TOD analytic miss
+       └──────────┬──────────┘
+                  ▼
+           deferred additive composite
+```
+
+- **Diffuse（默认）**：删除默认每像素 world/screen path trace、reservoir、screen history 和空间重采样；
+  像素只查询 sparse clipmap 的低频 irradiance，并做 normal/validity-aware trilinear blend。漫反射的收敛
+  发生在世界 cache 的 dirty brick budget 内，移动相机不再重置结果。
+- **Specular（可选）**：只保留 quarter-resolution 的单一宽锥/短步 cache trace，输出低至中频 glossy 信息；
+  miss 只使用 analytic TOD，绝不读 `unity_SpecCube*`、`_GlossyEnvironmentCubeMap` 或 Reflection Probe。
+  它不是高频反射替代品；高频 RTX reflection 只能作为单独的质量选项。
+- **能量与风格**：cache 只存 diffuse outgoing radiance，固定 `1/pi`、一跳或严格衰减的二跳、每 brick luminance
+  clamp；禁止把 specular lobe 写回 diffuse cache。这样红/青 emissive 只在有限、可解释的空间范围内着色。
+- **动态性**：光源/几何变化只使相交 brick 失效并分帧重算；静态 cache 保留。TOD 参数变化以量化阈值触发受影响层更新，
+  不以屏幕历史承担动态光响应。
+
+### 必须先达到的验收
+
+1. 关闭所有 Reflection Probe 与 Unity Environment Reflections 后，GI enabled 的 Nanite 间接镜面不变；关闭 GI 后只剩 TOD analytic fallback。
+2. 固定相机 1/8/30/60 帧及小幅平移后，diffuse 不能回到初帧噪声，也不得形成屏幕中心线或跨屏雾带。
+3. 红、青、白三种 emissive/动态 light 的 ROI 色溢出在 cache 更新完成后收敛到稳定半径，60 帧后不能继续扩张或穿过遮挡面。
+4. smoothness=0/0.5/1 三材质都得到非黑的可控低频镜面；高 smoothness 不以全黑或 Unity skybox 作为错误 fallback。
+5. 性能评估使用 4K Development Player，关闭 frame-debugger/trace readback。默认模式不允许执行 per-pixel diffuse world trace；
+   只报告 clipmap update、diffuse query、optional glossy 三项 GPU 时间。
+
+### 删除优先的实现约束
+
+新实现不是在旧 `GIScreenLighting` 管线旁增加一个“Low Frequency”开关。默认路径接管完成后，必须从运行时代码、
+renderer settings、RenderGraph pass、history allocation、shader kernel 及调试统计中一起删除下列旧路径：
+
+1. diffuse screen trace、compact world miss、temporal/spatial reservoir、screen history 与 A-trous 收敛链；
+2. specular screen hit、triangle refinement、temporal/spatial reservoir、scene-color mip history；
+3. `unity_SpecCube*`、`_GlossyEnvironmentCubeMap`、Reflection Probe 和 Unity Environment 作为任何 GI fallback；
+4. 为掩盖上述路径失败而返回白/黑/旧 history 的 silent fallback。
+
+允许的失败方式只有显式的：GI resource 或 world cache 无效时输出零 indirect，并通过一次性错误/Frame Debugger pass
+显示原因；不得用未经验证的 sky、probe、history 或伪随机颜色替代。旧路径在新 default path 通过本章验收前可以保留在
+工作树中以供迁移，但不能同时运行；通过后立即删除，不保留兼容开关。
+
+## 15. 2026-08-09 已确认的产品规格与验收边界
+
+本章是实现的硬约束，不是调参建议。若某个实现无法满足其中任一项，应替换该实现，而不是以更多历史、随机采样、
+白/黑 fallback 或隐藏开关掩盖它。
+
+### 平台、预算与相机
+
+- 目标 GPU 为 RTX 4070 Ti，输出 1080p；**默认 GI（clipmap 更新、diffuse query、可选 glossy query 的合计）GPU
+  时间上限为 3.0 ms，目标为 2.0 ms**。该数据只在 Development Player 中测量，关闭 Frame Debugger、AsyncGPUReadback
+  和 Editor profiling 干扰。
+- 摄像机是会频繁移动/自由旋转的第三人称机位，后期主要受限于俯视；没有持续的大位移，但过场可发生镜头切换。
+  因此 camera motion 不是 GI history 的失效条件；镜头切换只能重建屏幕临时资源，不能使世界 GI 回到噪声初态。
+- 世界同时包含室内外，工作尺度可达 10 x 10 km。全世界不得以一个稠密 volume 常驻；采用围绕活动区域的 sparse
+  clipmap，并以空间预算而非屏幕像素数控制更新成本。
+- 光源和可动几何的间接光可延迟，但从变化到稳定不得超过约 1 s。该限制由 dirty brick 调度保证，不由无限 history
+  weight 伪装。
+
+### 光传输与风格
+
+- 默认目标是一跳、低频 diffuse transport：保持明确的直射亮暗边界和 shadow 关系，GI 只抬升/着色合理的暗部，不能
+  把暗面洗到接近亮面。二跳只在有严格能量衰减、固定预算且能使室内更均匀时启用；不是默认承诺。
+- 环境贡献、反弹色和亮/暗区的 GI 强度必须能分别美术控制。未来室内/室外 classification 尚未确定，当前 TOD 只能
+  作为**有可见天空路径的世界 miss**；不能以 TOD 直接给封闭室内上色。以后可在同一接口接入室内环境 profile。
+- emissive 是点缀光源，必须有单材质/单 brick 能量上限和影响半径；不能无限扩散或用极端 luminance 换取可见性。
+- 漏光容忍度为零，尤其是墙角、遮挡物后方和动态物体经过的区域。稳定性优先于过快变亮：更新中的 brick 可以保留
+  旧的可信解并受连续性限制，但绝不能突然切为黑、白或无关颜色。
+
+### 物体、灯光和镜面
+
+- 方向光、点光、聚光是首要支持对象；设计目标为 20 个以内本地灯固定成本可控。使用 per-brick light list，禁止把
+  全灯表逐像素遍历；若 100 灯场景超预算，必须在统计中明确显示溢出/裁剪，而非静默退化。
+- 角色和动态物体必须既接收又投放 GI。静态 Nanite 是主要场景输入；动态 Nanite 和一般 Mesh 以 dirty brick 更新接入，
+  skinned/transparency 的详细策略在其首个可验收实现时确定，不能假装已经支持。
+- 镜面需要金属/磨砂金属的低至中频反射、smoothness=1 时仍保留可辨识的物体/光源轮廓，但不要求清晰镜像。默认
+  所有 RTX on/off 设备给出一致的低频结果；RTX 只能额外补高频，不能成为 correctness 的前提。
+- GI enabled 时任何间接 diffuse/specular 都不得读取 Reflection Probe、`unity_SpecCube*`、Unity environment 或默认 skybox。
+  GI disabled 时，原生反射可以恢复，作为项目临时替代方案。
+
+### 必须提供的调试与三类验收场景
+
+GPU 调试项至少包括 brick occupancy、dirty/update queue、irradiance、leak/occlusion、每灯影响范围、以及 clipmap
+update/diffuse/glossy 的分项 GPU 时间。无效资源必须显式显示为 zero indirect 和错误原因。
+
+1. **室内暖光**：颜色在 1 s 内稳定，物体遮挡 probe/field 不得造成局部“啪”地变暗或移开后缓慢回血；墙角无漏光。
+2. **室外 TOD**：阳光的明暗交界清楚，暗部可收环境/反弹色但不可被抹平；天空色只可经过可见天空路径进入。
+3. **动态灯与动态物体**：更新连续、无块状闪烁或跨屏噪声；镜头移动后不需要重新积累世界 GI。

@@ -159,6 +159,8 @@ namespace UnityNanite.TOD.Editor
             }
 
             GUILayout.FlexibleSpace();
+            if (GUILayout.Button("独立时间", GUILayout.Width(74f), GUILayout.Height(24f)))
+                TODTimePanel.Open(previewController);
             if (GUILayout.Button("刷新资源", GUILayout.Width(74f), GUILayout.Height(24f)))
                 RefreshProfiles();
             GUILayout.Space(8f);
@@ -978,6 +980,125 @@ namespace UnityNanite.TOD.Editor
         private static GUIStyle RightMiniStyle()
         {
             return new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleRight };
+        }
+    }
+
+    public sealed class TODTimePanel : EditorWindow
+    {
+        private TODController controller;
+
+        [MenuItem("Window/Unity Nanite/TOD Time Control")]
+        public static void Open()
+        {
+            Open(null);
+        }
+
+        public static void Open(TODController target)
+        {
+            TODTimePanel window = GetWindow<TODTimePanel>("TOD Time");
+            window.controller = target != null
+                ? target
+                : UnityEngine.Object.FindFirstObjectByType<TODController>();
+            window.minSize = new Vector2(430f, 126f);
+            window.Show();
+        }
+
+        private void OnEnable()
+        {
+            minSize = new Vector2(430f, 126f);
+            if (controller == null)
+                controller = UnityEngine.Object.FindFirstObjectByType<TODController>();
+            EditorApplication.update += Repaint;
+        }
+
+        private void OnDisable()
+        {
+            EditorApplication.update -= Repaint;
+        }
+
+        private void OnSelectionChange()
+        {
+            TODController selected = Selection.activeGameObject != null
+                ? Selection.activeGameObject.GetComponent<TODController>()
+                : null;
+            if (selected != null)
+                controller = selected;
+            Repaint();
+        }
+
+        private void OnGUI()
+        {
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUILayout.LabelField("24 小时 TOD 快速控制", TitleStyle());
+            controller = (TODController)EditorGUILayout.ObjectField(
+                "TOD 挂点", controller, typeof(TODController), true);
+
+            using (new EditorGUI.DisabledScope(controller == null))
+            {
+                EditorGUILayout.BeginHorizontal();
+                if (GUILayout.Button(
+                    controller != null && controller.AdvanceTime ? "Ⅱ  暂停" : "▶  播放",
+                    GUILayout.Width(82f), GUILayout.Height(25f)))
+                {
+                    Undo.RecordObject(controller, "切换 TOD 播放状态");
+                    controller.AdvanceTime = !controller.AdvanceTime;
+                    EditorUtility.SetDirty(controller);
+                }
+
+                float current = controller != null ? controller.CurrentTime : 0f;
+                EditorGUI.BeginChangeCheck();
+                float changed = EditorGUILayout.Slider(current, 0f, 24f);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    // 预览跳时不是资产编辑，不进入 Undo 栈。
+                    controller.CurrentTime = changed;
+                    SceneView.RepaintAll();
+                }
+                GUILayout.Label(FormatPanelTime(current), EditorStyles.boldLabel, GUILayout.Width(54f));
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.BeginHorizontal();
+                EditorGUI.BeginChangeCheck();
+                float speed = EditorGUILayout.FloatField(
+                    "每秒经过小时数",
+                    controller != null ? controller.HoursPerSecond : 0f);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    Undo.RecordObject(controller, "修改 TOD 时间速度");
+                    controller.HoursPerSecond = speed;
+                    EditorUtility.SetDirty(controller);
+                }
+                if (GUILayout.Button("00:00", GUILayout.Width(54f))) SetTime(0f);
+                if (GUILayout.Button("06:00", GUILayout.Width(54f))) SetTime(6f);
+                if (GUILayout.Button("12:00", GUILayout.Width(54f))) SetTime(12f);
+                if (GUILayout.Button("18:00", GUILayout.Width(54f))) SetTime(18f);
+                if (GUILayout.Button("测试闪电", GUILayout.Width(72f))) controller.TriggerLightning();
+                EditorGUILayout.EndHorizontal();
+            }
+            EditorGUILayout.EndVertical();
+        }
+
+        private void SetTime(float hour)
+        {
+            if (controller == null)
+                return;
+            controller.CurrentTime = hour;
+            SceneView.RepaintAll();
+        }
+
+        private static GUIStyle TitleStyle()
+        {
+            return new GUIStyle(EditorStyles.boldLabel)
+            {
+                fontSize = 14,
+                alignment = TextAnchor.MiddleLeft
+            };
+        }
+
+        private static string FormatPanelTime(float hour)
+        {
+            int minutes = Mathf.RoundToInt(TODProfile.WrapHour(hour) * 60f) % 1440;
+            return $"{minutes / 60:00}:{minutes % 60:00}";
         }
     }
 }
