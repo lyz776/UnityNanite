@@ -25,6 +25,10 @@ namespace RealtimeGI
         public const int RadianceLobeCount = 6;
         public const int RadianceWordsPerBrick = CellsPerBrick * RadianceLobeCount;
         public const int ValidityWordsPerBrick = CellsPerBrick;
+        public const int IrradianceProbeAxis = 2;
+        public const int IrradianceProbesPerBrick = IrradianceProbeAxis * IrradianceProbeAxis * IrradianceProbeAxis;
+        public const int IrradianceWordsPerBrick = IrradianceProbesPerBrick * RadianceLobeCount;
+        public const int IrradianceProbeValidityWordsPerBrick = IrradianceProbesPerBrick;
         // One uint per cell. The low byte stores conservative Chebyshev distance in cells.
         // Keeping cells independently writable makes iterative GPU propagation race-free.
         public const int DistanceWordsPerBrick = CellsPerBrick;
@@ -112,6 +116,8 @@ namespace RealtimeGI
         public readonly GraphicsBuffer staticDistance;
         public readonly GraphicsBuffer staticRadiance;
         public readonly GraphicsBuffer staticValidity;
+        public readonly GraphicsBuffer staticIrradiance;
+        public readonly GraphicsBuffer staticIrradianceValidity;
         public readonly GraphicsBuffer staticLightCounts;
         public readonly GraphicsBuffer staticLightIndices;
         public readonly GraphicsBuffer dynamicPageTable;
@@ -124,6 +130,8 @@ namespace RealtimeGI
         public readonly GraphicsBuffer dynamicDistance;
         public readonly GraphicsBuffer dynamicRadiance;
         public readonly GraphicsBuffer dynamicValidity;
+        public readonly GraphicsBuffer dynamicIrradiance;
+        public readonly GraphicsBuffer dynamicIrradianceValidity;
         public readonly GraphicsBuffer dynamicLightCounts;
         public readonly GraphicsBuffer dynamicLightIndices;
         public readonly GraphicsBuffer localLights;
@@ -155,8 +163,6 @@ namespace RealtimeGI
         public readonly int staticBrickCount;
         public readonly int dynamicBrickCount;
         public readonly int generation;
-        public readonly float skyIrradianceScale;
-        public readonly float mainLightBounceScale;
         // Changes only when the lighting input/cache contents are invalidated.
         // Unlike generation, this is safe for deciding whether temporal screen history can be reused.
         public readonly int lightingRevision;
@@ -182,9 +188,7 @@ namespace RealtimeGI
             int textureSliceCount,
             int localLightCount,
             int generation,
-            int lightingRevision,
-            float skyIrradianceScale,
-            float mainLightBounceScale)
+            int lightingRevision)
         {
             this.levelData = levelData;
             staticPageTable = staticLayer?.PageTableBuffer;
@@ -197,6 +201,8 @@ namespace RealtimeGI
             staticDistance = staticLayer?.DistanceBuffer;
             staticRadiance = staticLayer?.RadianceBuffer;
             staticValidity = staticLayer?.ValidityBuffer;
+            staticIrradiance = staticLayer?.IrradianceBuffer;
+            staticIrradianceValidity = staticLayer?.IrradianceValidityBuffer;
             staticLightCounts = staticLayer?.LightCountBuffer;
             staticLightIndices = staticLayer?.LightIndexBuffer;
             dynamicPageTable = dynamicLayer?.PageTableBuffer;
@@ -209,6 +215,8 @@ namespace RealtimeGI
             dynamicDistance = dynamicLayer?.DistanceBuffer;
             dynamicRadiance = dynamicLayer?.RadianceBuffer;
             dynamicValidity = dynamicLayer?.ValidityBuffer;
+            dynamicIrradiance = dynamicLayer?.IrradianceBuffer;
+            dynamicIrradianceValidity = dynamicLayer?.IrradianceValidityBuffer;
             dynamicLightCounts = dynamicLayer?.LightCountBuffer;
             dynamicLightIndices = dynamicLayer?.LightIndexBuffer;
             this.localLights = localLights;
@@ -243,8 +251,6 @@ namespace RealtimeGI
             dynamicBrickCount = 0;
             this.generation = generation;
             this.lightingRevision = lightingRevision;
-            this.skyIrradianceScale = skyIrradianceScale;
-            this.mainLightBounceScale = mainLightBounceScale;
         }
 
         public bool IsValid => levelData != null &&
@@ -252,11 +258,13 @@ namespace RealtimeGI
                                staticSurface != null && staticSurfaceUv != null && staticDistance != null &&
                                staticSurfaceIdentity != null &&
                                staticRadiance != null && staticValidity != null &&
+                               staticIrradiance != null && staticIrradianceValidity != null &&
                                staticLightCounts != null && staticLightIndices != null &&
                                dynamicPageTable != null && dynamicOccupancy != null &&
                                dynamicSurface != null && dynamicSurfaceUv != null && dynamicDistance != null &&
                                dynamicSurfaceIdentity != null &&
                                dynamicRadiance != null && dynamicValidity != null &&
+                               dynamicIrradiance != null && dynamicIrradianceValidity != null &&
                                dynamicLightCounts != null && dynamicLightIndices != null &&
                                staticSurfaceStableId != null && staticSurfacePrimitive != null &&
                                dynamicSurfaceStableId != null && dynamicSurfacePrimitive != null &&

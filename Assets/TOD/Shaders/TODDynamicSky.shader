@@ -88,6 +88,9 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float _TODCloudRimWidth;
             float _TODCloudOpacity;
             float _TODCloudCoverage;
+            float _TODCloudFarCoverage;
+            float _TODCloudFarCoverageStart;
+            float _TODCloudFarCoverageEnd;
             float _TODCloudScale;
             float _TODCloudDetailScale;
             float _TODCloudSoftness;
@@ -96,6 +99,8 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
             float2 _TODCloudSpeed;
             float _TODCloudHorizonFade;
             float _TODCloudAltitude;
+            float _TODCloudCurvature;
+            float _TODCloudWorldScale;
             float _TODCloudThickness;
             float _TODCloudDensityMultiplier;
             float _TODCloudHorizonDensity;
@@ -376,34 +381,70 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 return lerp(1.01, 0.28, pow(saturate(coverage), 0.65));
             }
 
+            float CloudLayerDistance(
+                float3 viewDirection,
+                float altitude,
+                float horizonProjectionWidth)
+            {
+                float positiveHeight = max(0.0, viewDirection.y);
+                float flatDistance = altitude /
+                    max(positiveHeight, horizonProjectionWidth);
+                if (_TODCloudCurvature <= 0.0001)
+                    return flatDistance;
+
+                // Ray intersection with a spherical cloud shell. Curvature 1
+                // uses Earth's approximate radius in kilometres; larger values
+                // make the remote cloud deck bend down more strongly.
+                float radius = 6371.0 / _TODCloudCurvature;
+                float radialProjection = radius * positiveHeight;
+                float shellDelta = altitude * (2.0 * radius + altitude);
+                float shellRoot = sqrt(
+                    radialProjection * radialProjection + shellDelta);
+                // Rationalized form avoids subtracting two large, nearly
+                // equal values when looking close to the zenith.
+                return shellDelta / max(0.0001, shellRoot + radialProjection);
+            }
+
             float4 ProceduralClouds(
                 float3 viewDirection,
                 out float rimProbe,
-                out float2 primaryCloudUV)
+                out float2 primaryCloudWorldPosition,
+                out float effectiveCoverage)
             {
-                // Keep the real horizontal-plane projection until the final
-                // fraction of a degree above the horizon. The capped region is
-                // completely hidden by the later ultra-far fade, so its frozen
-                // UV derivative cannot appear as vertical curtains.
+                // Curved mode intersects a finite spherical cloud shell.
+                // Flat mode keeps its legacy last-degree safety cap and fade.
                 float horizonProjectionWidth = max(
                     0.003,
                     _TODCloudHorizonFade * 0.05);
                 float positiveHeight = max(0.0, viewDirection.y);
-                float rayHeight = max(
-                    positiveHeight,
+                float layerDistance = CloudLayerDistance(
+                    viewDirection,
+                    _TODCloudAltitude,
                     horizonProjectionWidth);
-                float layerDistance = _TODCloudAltitude / rayHeight;
                 float2 wind = _TODCloudTime * _TODCloudSpeed;
-                float2 cloudUV = viewDirection.xz * layerDistance *
+                float2 cameraWorldPosition = _WorldSpaceCameraPos.xz *
+                    _TODCloudWorldScale;
+                float2 cloudWorldPosition = cameraWorldPosition +
+                    viewDirection.xz * layerDistance;
+                primaryCloudWorldPosition = cloudWorldPosition;
+                float farBlend = smoothstep(
+                    _TODCloudFarCoverageStart,
+                    max(_TODCloudFarCoverageStart + 0.1, _TODCloudFarCoverageEnd),
+                    layerDistance);
+                effectiveCoverage = lerp(
+                    _TODCloudCoverage,
+                    _TODCloudFarCoverage,
+                    farBlend);
+                float2 nearCloudUV = cloudWorldPosition *
                     (_TODCloudScale * 0.018) + wind;
-                primaryCloudUV = cloudUV;
-                float threshold = CloudCoverageThreshold(_TODCloudCoverage);
+                float2 cloudUV = nearCloudUV;
+                float threshold = CloudCoverageThreshold(effectiveCoverage);
                 float edge = max(0.012, _TODCloudSoftness * 0.38);
-                float coverageGate = step(0.0001, _TODCloudCoverage);
+                float coverageGate = step(0.0001, effectiveCoverage);
                 float fineShape = 0.0;
                 float density = 0.0;
                 float cloud1 = 0.0;
-                if (_TODCloudCoverage > 0.0001)
+                if (effectiveCoverage > 0.0001)
                 {
                     density = CloudRawDensity(cloudUV, fineShape);
                     cloud1 = smoothstep(
@@ -433,11 +474,15 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                     // texture from visibly lining up.
                     const float layer2Cos = 0.819152;
                     const float layer2Sin = 0.573576;
+                    float2 layer2WorldPosition = cameraWorldPosition +
+                        viewDirection.xz * CloudLayerDistance(
+                            viewDirection,
+                            _TODCloudLayer2Altitude,
+                            horizonProjectionWidth);
                     float2 layer2Direction = float2(
-                        viewDirection.x * layer2Cos - viewDirection.z * layer2Sin,
-                        viewDirection.x * layer2Sin + viewDirection.z * layer2Cos);
-                    float layer2Distance = _TODCloudLayer2Altitude / rayHeight;
-                    layer2UV = layer2Direction * layer2Distance *
+                        layer2WorldPosition.x * layer2Cos - layer2WorldPosition.y * layer2Sin,
+                        layer2WorldPosition.x * layer2Sin + layer2WorldPosition.y * layer2Cos);
+                    layer2UV = layer2Direction *
                         (_TODCloudLayer2Scale * 0.018) +
                         _TODCloudTime * _TODCloudLayer2Speed + float2(13.71, -8.43);
                     layer2Density = CloudRawDensity(layer2UV, layer2Fine);
@@ -458,7 +503,7 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 lightDirectionUV /= max(0.0001, length(lightDirectionUV));
 
                 float rimProbe1 = 0.0;
-                if (_TODCloudCoverage > 0.0001)
+                if (effectiveCoverage > 0.0001)
                 {
                     float rimDetail;
                     float rimDensity = CloudRawDensity(
@@ -489,7 +534,7 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                     1.65,
                     1.0 - saturate(abs(_TODSunDir.y)));
                 float shadowProbe = 0.0;
-                if (_TODCloudCoverage > 0.0001)
+                if (effectiveCoverage > 0.0001)
                 {
                     float shadowDetail;
                     shadowProbe = CloudRawDensity(
@@ -519,13 +564,15 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                     _TODCloudZenithDensity,
                     latitudeBlend);
                 cloud *= distribution * _TODCloudDensityMultiplier;
-                // Fade only after the plane intersection is already hundreds
-                // of kilometres away. Most of the distant cloud field remains;
-                // only the sub-degree region that would stretch is removed.
-                float ultraFarFade = smoothstep(
-                    horizonProjectionWidth * 1.2,
-                    horizonProjectionWidth * 2.8,
-                    positiveHeight);
+                // Curved projection remains finite at the horizon, so it only
+                // needs a tiny ground-boundary blend. Flat fallback keeps the
+                // old final-degree protection against infinite projection.
+                float ultraFarFade = _TODCloudCurvature > 0.0001
+                    ? smoothstep(-0.01, 0.002, viewDirection.y)
+                    : smoothstep(
+                        horizonProjectionWidth * 1.2,
+                        horizonProjectionWidth * 2.8,
+                        positiveHeight);
                 cloud *= ultraFarFade;
                 float layer2Fog = _TODCloudLayer2FogBlend * cloud2 *
                     pow(1.0 - saturate(viewDirection.y), 2.0);
@@ -685,17 +732,19 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                 sky = lerp(sky, moonSurface, moonDisk * moonVisibility);
 
                 if (_TODCloudsEnabled > 0.5 &&
-                    (_TODCloudCoverage > 0.0001 ||
+                    (max(_TODCloudCoverage, _TODCloudFarCoverage) > 0.0001 ||
                      (_TODCloudLayer2Enabled > 0.5 &&
                       _TODCloudLayer2Coverage > 0.0001 &&
                       _TODCloudLayer2Opacity > 0.0001)))
                 {
                     float rimProbe;
-                    float2 primaryCloudUV;
+                    float2 primaryCloudWorldPosition;
+                    float effectiveCoverage;
                     float4 cloudData = ProceduralClouds(
                         viewDirection,
                         rimProbe,
-                        primaryCloudUV);
+                        primaryCloudWorldPosition,
+                        effectiveCoverage);
                     float cloudDensity = cloudData.x;
 
                     // Frostbite-inspired single-segment participating media:
@@ -737,7 +786,7 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                         source * (1.0 - physicalTransmittance) /
                         safeSigmaE * _TODCloudOpacity;
 
-                    float cloudThreshold = lerp(0.64, 0.30, _TODCloudCoverage);
+                    float cloudThreshold = CloudCoverageThreshold(effectiveCoverage);
                     float shadowEdge = max(0.015, _TODCloudSoftness * 0.45);
                     float shadowOccluder = smoothstep(
                         cloudThreshold - shadowEdge,
@@ -862,12 +911,32 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                     // short multi-pulse envelope supplies the flash behavior.
                     if (_TODCloudLightningEnabled > 0.5)
                     {
-                        float2 strikeOffset = float2(
+                        float2 strikeRandom = float2(
                             Hash21(float2(_TODCloudLightningSeed, 17.3)),
                             Hash21(float2(41.7, _TODCloudLightningSeed)));
-                        float2 lightningUV = primaryCloudUV *
-                            _TODCloudLightningScale + strikeOffset +
-                            _TODCloudTime * _TODCloudLightningGlowSpeed;
+                        float strikeAngle = strikeRandom.x * 6.2831853;
+                        float2 strikeDirection = float2(
+                            cos(strikeAngle),
+                            sin(strikeAngle));
+                        float2 cameraCloudPosition = _WorldSpaceCameraPos.xz *
+                            _TODCloudWorldScale;
+                        float2 strikeCenter = cameraCloudPosition +
+                            strikeDirection * lerp(18.0, 72.0, strikeRandom.y);
+                        float strikeDiameter = 36.0 /
+                            max(0.05, _TODCloudLightningScale);
+                        float2 lightningUV =
+                            (primaryCloudWorldPosition - strikeCenter) /
+                            strikeDiameter + 0.5;
+                        float glowMotion = _TODCloudTime *
+                            _TODCloudLightningGlowSpeed * 6.2831853;
+                        lightningUV += float2(
+                            sin(glowMotion * 0.73),
+                            cos(glowMotion)) * 0.035;
+                        float lightningBounds =
+                            smoothstep(0.0, 0.035, lightningUV.x) *
+                            smoothstep(0.0, 0.035, lightningUV.y) *
+                            (1.0 - smoothstep(0.965, 1.0, lightningUV.x)) *
+                            (1.0 - smoothstep(0.965, 1.0, lightningUV.y));
                         float3 glowSample = SAMPLE_TEXTURE2D(
                             _TODCloudLightningTexture,
                             sampler_TODCloudLightningTexture,
@@ -875,9 +944,10 @@ Shader "Skybox/Unity Nanite TOD Dynamic Sky"
                         float glowMask = saturate(max(
                             glowSample.r,
                             max(glowSample.g, glowSample.b)));
-                        glowMask = smoothstep(0.08, 0.82, glowMask);
+                        glowMask = smoothstep(0.08, 0.82, glowMask) *
+                            lightningBounds;
                         float internalFlash = _TODCloudLightningPulse *
-                            lerp(0.22, 1.0, glowMask) * cloudDensity *
+                            glowMask * cloudDensity *
                             lerp(0.45, 1.0, bodyDepth);
                         cloudLuminance += _TODCloudLightningColor *
                             internalFlash * _TODCloudLightningIntensity;

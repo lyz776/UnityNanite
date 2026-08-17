@@ -34,7 +34,7 @@ namespace UnityNanite.TOD.Editor
                 EnsureCloudTextureImport(DefaultCloudShapePath);
                 EnsureCloudTextureImport(DefaultCloudUnevenPath);
                 EnsureCloudTextureImport(DefaultCloudLightningPath);
-                if (profile.generatedPresetVersion >= 13)
+                if (profile.generatedPresetVersion >= 15)
                     return;
                 UpgradeGeneratedDefaultProfile(profile);
                 AssetDatabase.SaveAssets();
@@ -113,13 +113,16 @@ namespace UnityNanite.TOD.Editor
                 return;
 
             bool cpuReadable = path != DefaultCloudLightningPath;
+            TextureWrapMode targetWrapMode = path == DefaultCloudLightningPath
+                ? TextureWrapMode.Clamp
+                : TextureWrapMode.Repeat;
             bool changed = importer.sRGBTexture ||
-                importer.wrapMode != TextureWrapMode.Repeat ||
+                importer.wrapMode != targetWrapMode ||
                 importer.filterMode != FilterMode.Bilinear ||
                 !importer.mipmapEnabled ||
                 importer.isReadable != cpuReadable;
             importer.sRGBTexture = false;
-            importer.wrapMode = TextureWrapMode.Repeat;
+            importer.wrapMode = targetWrapMode;
             importer.filterMode = FilterMode.Bilinear;
             importer.mipmapEnabled = true;
             importer.isReadable = cpuReadable;
@@ -147,9 +150,34 @@ namespace UnityNanite.TOD.Editor
 
         private static void UpgradeGeneratedDefaultProfile(TODProfile profile)
         {
-            const int currentVersion = 13;
+            const int currentVersion = 15;
             if (profile.generatedPresetVersion >= currentVersion)
                 return;
+
+            // Version 15 separates near/far coverage and uses a coarse far
+            // cloud representation to avoid horizon derivative streaks.
+            if (profile.generatedPresetVersion == 14)
+            {
+                float existingCoverage = Mathf.Clamp01(
+                    profile.clouds.coverage.Evaluate(12f));
+                profile.clouds.farCoverage = new TODFloatParameter(existingCoverage);
+                profile.clouds.farCoverageStart = new TODFloatParameter(40f);
+                profile.clouds.farCoverageEnd = new TODFloatParameter(120f);
+                profile.generatedPresetVersion = currentVersion;
+                EditorUtility.SetDirty(profile);
+                return;
+            }
+
+            // Version 14 makes the sky clouds world-locked and moves the
+            // projection onto an adjustable Earth-sized spherical shell.
+            if (profile.generatedPresetVersion == 13)
+            {
+                profile.clouds.curvature = new TODFloatParameter(1f);
+                profile.clouds.worldPositionScale = new TODFloatParameter(0.001f);
+                profile.generatedPresetVersion = currentVersion;
+                EditorUtility.SetDirty(profile);
+                return;
+            }
 
             // Version 13 makes layer-two coverage independent, fixes the
             // impractically rare/invisible lightning defaults and enables the
@@ -318,12 +346,17 @@ namespace UnityNanite.TOD.Editor
             profile.clouds.rimWidth = new TODFloatParameter(0.025f);
             profile.clouds.opacity = new TODFloatParameter(0.68f);
             profile.clouds.coverage = new TODFloatParameter(0.58f);
+            profile.clouds.farCoverage = new TODFloatParameter(0.42f);
+            profile.clouds.farCoverageStart = new TODFloatParameter(40f);
+            profile.clouds.farCoverageEnd = new TODFloatParameter(120f);
             profile.clouds.scale = new TODFloatParameter(1f);
             profile.clouds.detailScale = new TODFloatParameter(12f);
             profile.clouds.softness = new TODFloatParameter(0.1f);
             profile.clouds.erosion = new TODFloatParameter(0.44f);
             profile.clouds.distortion = new TODFloatParameter(1.2f);
             profile.clouds.altitude = new TODFloatParameter(6f);
+            profile.clouds.curvature = new TODFloatParameter(1f);
+            profile.clouds.worldPositionScale = new TODFloatParameter(0.001f);
             profile.clouds.thickness = new TODFloatParameter(1.25f);
             profile.clouds.densityMultiplier = new TODFloatParameter(1f);
             profile.clouds.horizonDensity = new TODFloatParameter(0.55f);

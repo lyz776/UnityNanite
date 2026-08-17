@@ -36,6 +36,8 @@ RWStructuredBuffer<uint> _GISurfaceKey;
 RWStructuredBuffer<uint> _GIDistance;
 RWStructuredBuffer<uint> _GIRadiance;
 RWStructuredBuffer<uint> _GIValidity;
+RWStructuredBuffer<uint> _GIIrradiance;
+RWStructuredBuffer<uint> _GIIrradianceValidity;
 
 StructuredBuffer<GIInstanceData> _GIInstances;
 StructuredBuffer<GIGeometryData> _GIGeometries;
@@ -117,6 +119,10 @@ uint _GIInstanceCount;
 uint _GITargetDynamic;
 uint _GIVoxelWorkCapacity;
 uint _GIWorkGeneration;
+// Geometry invalidation is frame-scoped, while radiance invalidation is event-scoped.
+// Keeping these tokens separate prevents an unchanged scene from recomputing every
+// resident brick merely because a new frame was recorded.
+uint _GIRadianceGeneration;
 uint _GIPhysicalPageCapacity;
 uint _GIInitializeAllocator;
 uint _GIAllocationLevel;
@@ -204,8 +210,8 @@ void GIAppendRadiance(uint physicalBrick)
 {
     uint oldGeneration;
     InterlockedExchange(_GIPhysicalRadianceGeneration[physicalBrick],
-                        _GIWorkGeneration, oldGeneration);
-    if (oldGeneration == _GIWorkGeneration)
+                        _GIRadianceGeneration, oldGeneration);
+    if (oldGeneration == _GIRadianceGeneration)
         return;
     uint slot;
     InterlockedAdd(_GIAllocatorState[GI_ALLOC_RADIANCE_COUNT], 1u, slot);
@@ -417,6 +423,9 @@ void BuildDirtyWorkQueues(uint3 dispatchId : SV_DispatchThreadID)
         GIGpuClipmapBrickData brick = _GIBrickData[physicalBrick];
         uint address = GIPageAddress(brick.level, brick.worldBrick);
         _GIPageTable[address] = (int)physicalBrick;
+        // Voxel content was rebuilt. Its cached source radiance and free-space probes
+        // cannot belong to this content, even if the lighting itself did not change.
+        _GIPhysicalRadianceGeneration[physicalBrick] = 0u;
         GIAppendRadiance(physicalBrick);
     }
 }
@@ -484,6 +493,10 @@ void ClearBrickRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThr
         _GIValidity[physicalBrick * GI_CELLS_PER_BRICK + cell] = 0u;
     for (uint word = threadId.x; word < GI_RADIANCE_WORDS_PER_BRICK; word += 128u)
         _GIRadiance[physicalBrick * GI_RADIANCE_WORDS_PER_BRICK + word] = 0u;
+    for (uint probe = threadId.x; probe < GI_IRRADIANCE_PROBES_PER_BRICK; probe += 128u)
+        _GIIrradianceValidity[physicalBrick * GI_IRRADIANCE_PROBES_PER_BRICK + probe] = 0u;
+    for (uint word = threadId.x; word < GI_IRRADIANCE_WORDS_PER_BRICK; word += 128u)
+        _GIIrradiance[physicalBrick * GI_IRRADIANCE_WORDS_PER_BRICK + word] = 0u;
 }
 
 float3 GIClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c)

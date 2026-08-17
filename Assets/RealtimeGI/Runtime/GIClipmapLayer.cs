@@ -21,6 +21,8 @@ namespace RealtimeGI
         GraphicsBuffer brickDataBuffer;
         GraphicsBuffer radianceBuffer;
         GraphicsBuffer validityBuffer;
+        GraphicsBuffer irradianceBuffer;
+        GraphicsBuffer irradianceValidityBuffer;
         GraphicsBuffer radianceDirtyBuffer;
         GraphicsBuffer lightCountBuffer;
         GraphicsBuffer lightIndexBuffer;
@@ -49,6 +51,8 @@ namespace RealtimeGI
         public GraphicsBuffer BrickDataBuffer => brickDataBuffer;
         public GraphicsBuffer RadianceBuffer => radianceBuffer;
         public GraphicsBuffer ValidityBuffer => validityBuffer;
+        public GraphicsBuffer IrradianceBuffer => irradianceBuffer;
+        public GraphicsBuffer IrradianceValidityBuffer => irradianceValidityBuffer;
         public GraphicsBuffer RadianceDirtyBuffer => radianceDirtyBuffer;
         public GraphicsBuffer LightCountBuffer => lightCountBuffer;
         public GraphicsBuffer LightIndexBuffer => lightIndexBuffer;
@@ -90,6 +94,12 @@ namespace RealtimeGI
                 this.capacity * GIClipmapConstants.RadianceWordsPerBrick, 4, debugName + " Directional Radiance RGB9E5");
             validityBuffer = NewBuffer(
                 this.capacity * GIClipmapConstants.ValidityWordsPerBrick, 4, debugName + " Radiance Validity");
+            irradianceBuffer = NewBuffer(
+                this.capacity * GIClipmapConstants.IrradianceWordsPerBrick, 4,
+                debugName + " Free Space Irradiance RGB9E5");
+            irradianceValidityBuffer = NewBuffer(
+                this.capacity * GIClipmapConstants.IrradianceProbeValidityWordsPerBrick, 4,
+                debugName + " Free Space Irradiance Validity");
             brickDataBuffer = NewBuffer(this.capacity, GIClipmapConstants.BrickDataStride, debugName + " Brick Data");
             // GPU allocation produces both queues.  Allocate their hard capacity once so
             // no CPU count/readback is needed to resize them in the frame loop.
@@ -174,6 +184,8 @@ namespace RealtimeGI
             brickDataBuffer?.Release();
             radianceBuffer?.Release();
             validityBuffer?.Release();
+            irradianceBuffer?.Release();
+            irradianceValidityBuffer?.Release();
             radianceDirtyBuffer?.Release();
             lightCountBuffer?.Release();
             lightIndexBuffer?.Release();
@@ -199,6 +211,8 @@ namespace RealtimeGI
             brickDataBuffer = null;
             radianceBuffer = null;
             validityBuffer = null;
+            irradianceBuffer = null;
+            irradianceValidityBuffer = null;
             radianceDirtyBuffer = null;
             lightCountBuffer = null;
             lightIndexBuffer = null;

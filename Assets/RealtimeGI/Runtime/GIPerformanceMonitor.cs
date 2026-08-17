@@ -17,10 +17,8 @@ namespace RealtimeGI
         [SerializeField] float clipmapTotalMs;
         [SerializeField] float distancePropagationMs;
         [SerializeField] float radianceUpdateMs;
-        [SerializeField] float diffuseTraceMs;
-        [SerializeField] float specularTraceMs;
-        [SerializeField] float specularFilterMs;
-        [SerializeField] float upsampleMs;
+        [SerializeField] float diffuseQueryMs;
+        [SerializeField] float glossyQueryMs;
         [SerializeField] float measuredSubtotalMs;
 
         [Header("Capacity (read-only)")]
@@ -28,33 +26,20 @@ namespace RealtimeGI
         [SerializeField] int dynamicBricks;
         [SerializeField] int pendingRadianceBricks;
         [SerializeField] float poolMiB;
-        [SerializeField] uint tracedRays;
-        [SerializeField] float screenHitPercent;
-        [SerializeField] float averageWorldSteps;
-        [SerializeField] float validRadianceCacheHitPercent;
-        [SerializeField] uint invalidRadianceCacheHits;
 
         Recorder clipmapRecorder;
         Recorder distanceRecorder;
         Recorder radianceRecorder;
-        Recorder diffuseRecorder;
-        Recorder specularRecorder;
-        Recorder reuseRecorder;
-        Recorder temporalRecorder;
-        Recorder spatialRecorder;
-        Recorder upsampleRecorder;
+        Recorder diffuseQueryRecorder;
+        Recorder glossyQueryRecorder;
 
         void OnEnable()
         {
             clipmapRecorder = Enable("RealtimeGI/Clipmap Total");
             distanceRecorder = Enable("RealtimeGI/Distance Propagation");
             radianceRecorder = Enable("RealtimeGI/Radiance Update");
-            diffuseRecorder = Enable("RealtimeGI/Diffuse Trace");
-            specularRecorder = Enable("RealtimeGI/Specular Trace");
-            reuseRecorder = Enable("RealtimeGI/Specular Reuse");
-            temporalRecorder = Enable("RealtimeGI/Specular Temporal");
-            spatialRecorder = Enable("RealtimeGI/Specular Spatial");
-            upsampleRecorder = Enable("RealtimeGI/Upsample");
+            diffuseQueryRecorder = Enable("RealtimeGI/World Diffuse Query");
+            glossyQueryRecorder = Enable("RealtimeGI/World Glossy Query");
         }
 
         static Recorder Enable(string marker)
@@ -69,13 +54,9 @@ namespace RealtimeGI
             clipmapTotalMs = Smooth(clipmapTotalMs, GpuMs(clipmapRecorder));
             distancePropagationMs = Smooth(distancePropagationMs, GpuMs(distanceRecorder));
             radianceUpdateMs = Smooth(radianceUpdateMs, GpuMs(radianceRecorder));
-            diffuseTraceMs = Smooth(diffuseTraceMs, GpuMs(diffuseRecorder));
-            specularTraceMs = Smooth(specularTraceMs, GpuMs(specularRecorder));
-            float filter = GpuMs(reuseRecorder) + GpuMs(temporalRecorder) + GpuMs(spatialRecorder);
-            specularFilterMs = Smooth(specularFilterMs, filter);
-            upsampleMs = Smooth(upsampleMs, GpuMs(upsampleRecorder));
-            measuredSubtotalMs = clipmapTotalMs + diffuseTraceMs + specularTraceMs +
-                                 specularFilterMs + upsampleMs;
+            diffuseQueryMs = Smooth(diffuseQueryMs, GpuMs(diffuseQueryRecorder));
+            glossyQueryMs = Smooth(glossyQueryMs, GpuMs(glossyQueryRecorder));
+            measuredSubtotalMs = clipmapTotalMs + diffuseQueryMs + glossyQueryMs;
 
 
             GIClipmapSystem clipmaps = GIClipmapSystem.Active;
@@ -85,13 +66,6 @@ namespace RealtimeGI
             dynamicBricks = clipmaps.DynamicBrickCount;
             pendingRadianceBricks = clipmaps.PendingRadianceBrickCount;
             poolMiB = clipmaps.EstimatedPoolMiB;
-            RealtimeGIRendererFeature.TraceCounterSnapshot counters =
-                RealtimeGIRendererFeature.LatestTraceCounters;
-            tracedRays = counters.rays;
-            screenHitPercent = counters.rays > 0 ? counters.screenHits * 100f / counters.rays : 0f;
-            averageWorldSteps = counters.AverageWorldSteps;
-            validRadianceCacheHitPercent = counters.ValidCachePercent;
-            invalidRadianceCacheHits = counters.invalidCacheHits;
         }
 
         float Smooth(float previous, float next)
@@ -110,12 +84,8 @@ namespace RealtimeGI
             Disable(clipmapRecorder);
             Disable(distanceRecorder);
             Disable(radianceRecorder);
-            Disable(diffuseRecorder);
-            Disable(specularRecorder);
-            Disable(reuseRecorder);
-            Disable(temporalRecorder);
-            Disable(spatialRecorder);
-            Disable(upsampleRecorder);
+            Disable(diffuseQueryRecorder);
+            Disable(glossyQueryRecorder);
         }
 
         static void Disable(Recorder recorder)

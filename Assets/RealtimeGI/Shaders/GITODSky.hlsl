@@ -85,18 +85,6 @@ float3 GIEvaluateTODSky(float3 direction)
     return GITODApplyColorGrade(sky);
 }
 
-float3 GIEvaluateTODDiffuseSky(float3 normal)
-{
-    normal = normalize(normal);
-    // A compact cosine-hemisphere irradiance approximation. The weighted samples are
-    // radiance; PI is the cosine-hemisphere integral for a constant environment.
-    float3 vertical = normal.y >= 0.0 ? float3(0.0, 1.0, 0.0) : float3(0.0, -1.0, 0.0);
-    // Do not depend on PI being provided by the including shader. GIRadianceCache.compute
-    // has a deliberately small include surface and D3D11 otherwise sees PI as undefined.
-    return (GIEvaluateTODSky(normal) * 0.60 +
-            GIEvaluateTODSky(vertical) * 0.40) * 3.14159265359;
-}
-
 float3 GIEvaluateTODGlossySky(float3 reflectionDirection, float roughness)
 {
     float3 sharp = GIEvaluateTODSky(reflectionDirection);

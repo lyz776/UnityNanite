@@ -228,6 +228,12 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODCloudRimWidth", Mathf.Max(0.001f, value.clouds.rimWidth.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudOpacity", Mathf.Clamp01(value.clouds.opacity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudCoverage", Mathf.Clamp01(value.clouds.coverage.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudFarCoverage", Mathf.Clamp01(value.clouds.farCoverage.Evaluate(hour)));
+            float farCoverageStart = Mathf.Max(0f, value.clouds.farCoverageStart.Evaluate(hour));
+            Shader.SetGlobalFloat("_TODCloudFarCoverageStart", farCoverageStart);
+            Shader.SetGlobalFloat(
+                "_TODCloudFarCoverageEnd",
+                Mathf.Max(farCoverageStart + 0.1f, value.clouds.farCoverageEnd.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudScale", Mathf.Max(0.01f, value.clouds.scale.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudDetailScale", Mathf.Max(0.1f, value.clouds.detailScale.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudSoftness", Mathf.Max(0.001f, value.clouds.softness.Evaluate(hour)));
@@ -237,6 +243,8 @@ namespace UnityNanite.TOD
                 value.clouds.speedX.Evaluate(hour), value.clouds.speedY.Evaluate(hour), 0f, 0f));
             Shader.SetGlobalFloat("_TODCloudHorizonFade", Mathf.Max(0.001f, value.clouds.horizonFade.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudAltitude", Mathf.Max(0.1f, value.clouds.altitude.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudCurvature", Mathf.Clamp(value.clouds.curvature.Evaluate(hour), 0f, 32f));
+            Shader.SetGlobalFloat("_TODCloudWorldScale", Mathf.Max(0f, value.clouds.worldPositionScale.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudThickness", Mathf.Max(0.001f, value.clouds.thickness.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudDensityMultiplier", Mathf.Max(0f, value.clouds.densityMultiplier.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudHorizonDensity", Mathf.Max(0f, value.clouds.horizonDensity.Evaluate(hour)));
@@ -248,8 +256,10 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat("_TODCloudPhaseForward", Mathf.Clamp(value.clouds.phaseForward.Evaluate(hour), 0f, 0.95f));
             Shader.SetGlobalFloat("_TODCloudPhaseBackward", Mathf.Clamp(value.clouds.phaseBackward.Evaluate(hour), -0.9f, 0f));
             Shader.SetGlobalFloat("_TODCloudPhaseBlend", Mathf.Clamp01(value.clouds.phaseBlend.Evaluate(hour)));
-            Shader.SetGlobalFloat("_TODCloudSunLighting", Mathf.Max(0f, value.clouds.sunLighting.Evaluate(hour)));
-            Shader.SetGlobalFloat("_TODCloudMoonLighting", Mathf.Max(0f, value.clouds.moonLighting.Evaluate(hour)));
+            // These artistic gains overlap the directional palette and are no
+            // longer profile-facing. Keep stable authored values internally.
+            Shader.SetGlobalFloat("_TODCloudSunLighting", 0.85f);
+            Shader.SetGlobalFloat("_TODCloudMoonLighting", 0.22f);
             SetColor("_TODCloudAmbientColor", value.clouds.ambientColor.Evaluate(hour));
             Shader.SetGlobalFloat("_TODCloudAmbientIntensity", Mathf.Max(0f, value.clouds.ambientIntensity.Evaluate(hour)));
             Shader.SetGlobalFloat("_TODCloudMultipleScattering", Mathf.Max(0f, value.clouds.multipleScattering.Evaluate(hour)));
@@ -261,7 +271,7 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat(
                 "_TODCloudSelfShadowDistance",
                 Mathf.Max(0f, value.clouds.selfShadowDistance.Evaluate(hour)));
-            Shader.SetGlobalFloat("_TODCloudStylization", Mathf.Clamp01(value.clouds.stylization.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudStylization", 0.62f);
             Shader.SetGlobalFloat(
                 "_TODCloudLightSteps",
                 Mathf.Clamp(Mathf.Round(value.clouds.lightSteps.Evaluate(hour)), 1f, 8f));
@@ -274,9 +284,7 @@ namespace UnityNanite.TOD
             Shader.SetGlobalFloat(
                 "_TODCloudSunTransmissionPower",
                 Mathf.Max(0.1f, value.clouds.sunTransmissionPower.Evaluate(hour)));
-            Shader.SetGlobalFloat(
-                "_TODCloudUndersideStrength",
-                Mathf.Clamp01(value.clouds.undersideStrength.Evaluate(hour)));
+            Shader.SetGlobalFloat("_TODCloudUndersideStrength", 0.56f);
 
             TODCloudSecondaryLayerSettings layer2 =
                 value.clouds.layer2 ?? (value.clouds.layer2 = new TODCloudSecondaryLayerSettings());
@@ -447,10 +455,15 @@ namespace UnityNanite.TOD
             Vector3 moonDirection,
             float cloudTime)
         {
+            Camera cloudCamera = Camera.current != null ? Camera.current : Camera.main;
+            Vector2 cameraWorldPosition = cloudCamera != null
+                ? new Vector2(cloudCamera.transform.position.x, cloudCamera.transform.position.z) *
+                    Mathf.Max(0f, value.clouds.worldPositionScale.Evaluate(hour))
+                : Vector2.zero;
             float sunCloudTransmission = EvaluateCloudTransmission(
-                value.clouds, sunDirection, hour, cloudTime);
+                value.clouds, sunDirection, hour, cloudTime, cameraWorldPosition);
             float moonCloudTransmission = EvaluateCloudTransmission(
-                value.clouds, moonDirection, hour, cloudTime);
+                value.clouds, moonDirection, hour, cloudTime, cameraWorldPosition);
             ApplyLensFlare(
                 sunLensFlare,
                 value.lensFlare,
@@ -525,7 +538,8 @@ namespace UnityNanite.TOD
             TODCloudSettings clouds,
             Vector3 direction,
             float hour,
-            float cloudTime)
+            float cloudTime,
+            Vector2 cameraWorldPosition)
         {
             if (clouds == null || !clouds.enabled || direction.y <= 0.025f)
                 return 1f;
@@ -542,8 +556,10 @@ namespace UnityNanite.TOD
                 clouds.scale.Evaluate(hour),
                 new Vector2(clouds.speedX.Evaluate(hour), clouds.speedY.Evaluate(hour)),
                 coverage,
+                Mathf.Clamp01(clouds.farCoverage.Evaluate(hour)),
                 hour,
                 cloudTime,
+                cameraWorldPosition,
                 false);
 
             TODCloudSecondaryLayerSettings layer2 = clouds.layer2;
@@ -557,8 +573,10 @@ namespace UnityNanite.TOD
                     layer2.scale.Evaluate(hour),
                     new Vector2(layer2.speedX.Evaluate(hour), layer2.speedY.Evaluate(hour)),
                     Mathf.Clamp01(layer2.coverage.Evaluate(hour)),
+                    Mathf.Clamp01(layer2.coverage.Evaluate(hour)),
                     hour,
                     cloudTime,
+                    cameraWorldPosition,
                     true) * Mathf.Clamp01(layer2.opacity.Evaluate(hour));
             }
 
@@ -576,10 +594,12 @@ namespace UnityNanite.TOD
             float horizonProjectionWidth = Mathf.Max(
                 0.003f,
                 clouds.horizonFade.Evaluate(hour) * 0.05f);
-            float horizonVisibility = SmoothStep(
-                horizonProjectionWidth * 1.2f,
-                horizonProjectionWidth * 2.8f,
-                Mathf.Max(0f, direction.y));
+            float horizonVisibility = clouds.curvature.Evaluate(hour) > 0.0001f
+                ? SmoothStep(-0.01f, 0.002f, direction.y)
+                : SmoothStep(
+                    horizonProjectionWidth * 1.2f,
+                    horizonProjectionWidth * 2.8f,
+                    Mathf.Max(0f, direction.y));
             mask *= horizonVisibility * distribution *
                 Mathf.Max(0f, clouds.densityMultiplier.Evaluate(hour));
             return Mathf.Pow(Mathf.Clamp01(1f - Mathf.Clamp01(mask) * opacity), 4f);
@@ -591,30 +611,55 @@ namespace UnityNanite.TOD
             float altitude,
             float scale,
             Vector2 speed,
-            float coverage,
+            float nearCoverage,
+            float farCoverage,
             float hour,
             float cloudTime,
+            Vector2 cameraWorldPosition,
             bool rotate)
         {
-            if (coverage <= 0.0001f || clouds.shapeTexture == null || clouds.unevenTexture == null)
+            if (Mathf.Max(nearCoverage, farCoverage) <= 0.0001f ||
+                clouds.shapeTexture == null || clouds.unevenTexture == null)
                 return 0f;
             if (!clouds.shapeTexture.isReadable || !clouds.unevenTexture.isReadable)
-                return coverage * coverage;
+                return Mathf.Max(nearCoverage, farCoverage) *
+                    Mathf.Max(nearCoverage, farCoverage);
 
             float horizonProjectionWidth = Mathf.Max(
                 0.003f,
                 clouds.horizonFade.Evaluate(hour) * 0.05f);
             float positiveHeight = Mathf.Max(0f, direction.y);
-            float rayHeight = Mathf.Max(
-                positiveHeight,
-                horizonProjectionWidth);
-            Vector2 planeDirection = new Vector2(direction.x, direction.z);
+            float safeAltitude = Mathf.Max(0.1f, altitude);
+            float flatDistance = safeAltitude /
+                Mathf.Max(positiveHeight, horizonProjectionWidth);
+            float curvature = Mathf.Clamp(clouds.curvature.Evaluate(hour), 0f, 32f);
+            float layerDistance = flatDistance;
+            if (curvature > 0.0001f)
+            {
+                float radius = 6371f / curvature;
+                float radialProjection = radius * positiveHeight;
+                float shellDelta = safeAltitude * (2f * radius + safeAltitude);
+                float shellRoot = Mathf.Sqrt(
+                    radialProjection * radialProjection + shellDelta);
+                layerDistance = shellDelta /
+                    Mathf.Max(0.0001f, shellRoot + radialProjection);
+            }
+
+            Vector2 planeDirection = cameraWorldPosition +
+                new Vector2(direction.x, direction.z) * layerDistance;
             if (rotate)
                 planeDirection = new Vector2(
                     planeDirection.x * 0.819152f - planeDirection.y * 0.573576f,
                     planeDirection.x * 0.573576f + planeDirection.y * 0.819152f);
-            Vector2 uv = planeDirection * (Mathf.Max(0.1f, altitude) / rayHeight) *
-                (Mathf.Max(0.01f, scale) * 0.018f) + speed * cloudTime;
+            float farStart = Mathf.Max(0f, clouds.farCoverageStart.Evaluate(hour));
+            float farEnd = Mathf.Max(farStart + 0.1f, clouds.farCoverageEnd.Evaluate(hour));
+            float farBlend = SmoothStep(farStart, farEnd, layerDistance);
+            float coverage = Mathf.Lerp(
+                Mathf.Clamp01(nearCoverage),
+                Mathf.Clamp01(farCoverage),
+                farBlend);
+            Vector2 uv = planeDirection * (Mathf.Max(0.01f, scale) * 0.018f) +
+                speed * cloudTime;
             if (rotate)
                 uv += new Vector2(13.71f, -8.43f);
 

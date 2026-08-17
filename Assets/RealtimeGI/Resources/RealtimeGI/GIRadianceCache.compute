@@ -2,6 +2,7 @@
 #pragma kernel UpdateSurfaceRadiance
 #pragma kernel CommitSurfaceRadiance
 #pragma kernel BuildBrickLightLists
+#pragma kernel BuildFreeSpaceIrradiance
 #pragma target 5.0
 
 #include "../../Shaders/GISceneCommon.hlsl"
@@ -23,6 +24,8 @@ RWStructuredBuffer<uint> _GITargetRadiance;
 RWStructuredBuffer<uint> _GITargetRadianceScratch;
 RWStructuredBuffer<uint> _GITargetValidity;
 RWStructuredBuffer<uint> _GITargetValidityScratch;
+RWStructuredBuffer<uint> _GITargetIrradiance;
+RWStructuredBuffer<uint> _GITargetIrradianceValidity;
 StructuredBuffer<GIMaterialData> _GIMaterials;
 StructuredBuffer<GILocalLightData> _GILocalLights;
 RWStructuredBuffer<uint> _GITargetLightCounts;
@@ -53,15 +56,12 @@ uint _GIMaterialCount;
 uint _GILocalLightCount;
 uint _GIMaxShadowedLocalLights;
 uint _GIMaxLightsPerBrick;
-uint _GISecondaryBounceRays;
-uint _GIRadianceFrameIndex;
 uint _GITargetLayer;
+uint _GIRadianceRevision;
 uint _GITextureSliceCount;
 float3 _GIMainLightDirection;
 float3 _GIMainLightColor;
 float _GIRadianceShadowDistance;
-float _GISecondaryBounceIntensity;
-float _GISkyIrradianceScale;
 float _GIMainLightBounceScale;
 float _GIRadianceHistoryWeight;
 float _GIRadianceClamp;
@@ -116,6 +116,8 @@ float3 GIUnpackRgb9E5(uint packed)
     return (float3)mantissa * exp2((float)exponentValue - 9.0);
 }
 
+// Deterministic content identity for cache invalidation and fixed probe placement.
+// This is not a sampling RNG; do not remove it with stochastic sampling helpers.
 uint GIHash(uint value)
 {
     value ^= value >> 16u;
@@ -123,23 +125,6 @@ uint GIHash(uint value)
     value ^= value >> 15u;
     value *= 0x846ca68bu;
     return value ^ (value >> 16u);
-}
-
-float2 GIRandom2(uint seed)
-{
-    return float2(GIHash(seed), GIHash(seed ^ 0x9e3779b9u)) * (1.0 / 4294967296.0);
-}
-
-float3 GICosineHemisphere(float3 normal, float2 randomValue)
-{
-    float radius = sqrt(randomValue.x);
-    float angle = 6.28318530718 * randomValue.y;
-    float3 helper = abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
-    float3 tangent = normalize(cross(helper, normal));
-    float3 bitangent = cross(normal, tangent);
-    return normalize(tangent * (radius * cos(angle)) +
-                     bitangent * (radius * sin(angle)) +
-                     normal * sqrt(max(0.0, 1.0 - randomValue.x)));
 }
 
 float3 GILobeAxis(uint lobe)
@@ -429,7 +414,8 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
     // leaving an area and returning.
     uint historyIdentity = GIHash(
         materialRevision ^ sourceIdentity * 0x9e3779b9u ^
-        packedSurface * 0x85ebca6bu) & 0xffffu;
+        packedSurface * 0x85ebca6bu ^
+        _GIRadianceRevision * 0xc2b2ae35u) & 0xffffu;
     uint previousValidity = _GITargetLayer == 0u
         ? _GIStaticValidity[targetCellAddress] : _GIDynamicValidity[targetCellAddress];
     uint previousIdentity = previousValidity >> 16u;
@@ -475,65 +461,12 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
                             (attenuation * noL * visibility * max(0.0, light.parameters.w));
     }
 
-    float3 indirectIrradiance = 0.0;
-    uint bounceRayCount = min(_GISecondaryBounceRays, 4u);
-    // Four directions seed a newly valid cell; subsequent sweeps use at least two. This is
-    // still amortized by the radiance-brick budget, but avoids writing binary 0/1 sky
-    // visibility and a single saturated bounce into a persistent Surface Cache cell.
-    uint minimumQualityRayCount = previousConfidence > 0u ? 2u : 4u;
-    uint visibilityRayCount = max(minimumQualityRayCount, bounceRayCount);
-    float visibleSkySamples = 0.0;
-    float2 sampleRotation = GIRandom2(
-        targetCellAddress ^ (_GITargetLayer * 0x68bc21ebu) ^ 0xa511e9b3u);
-    [loop]
-    for (uint rayIndex = 0u; rayIndex < visibilityRayCount; rayIndex++)
-    {
-        float sequenceIndex = (float)(_GIRadianceFrameIndex * visibilityRayCount +
-                                      rayIndex + 1u);
-        float2 directionSample = frac(
-            sampleRotation + sequenceIndex * float2(0.754877666, 0.569840296));
-        float3 rayDirection = GICosineHemisphere(normal, directionSample);
-        float hitT;
-        uint hitLayer;
-        uint hitLevel;
-        int hitPhysicalBrick;
-        uint hitLocalCell;
-        bool blocked = GITraceScene(
-            worldPosition + normal * (level.cellSize * 0.25), rayDirection,
-            _GIRadianceShadowDistance, brick.level, sourceIdentity,
-            hitT, hitLayer, hitLevel, hitPhysicalBrick, hitLocalCell);
-        if (!blocked)
-            visibleSkySamples += 1.0;
-        else if (bounceRayCount > 0u)
-        {
-            // Cosine sampling estimates irradiance as PI times incoming radiance.
-            indirectIrradiance += GIReadCachedRadiance(
-                hitPhysicalBrick, hitLocalCell, hitLayer, -rayDirection) * GI_RADIANCE_PI;
-        }
-    }
-    if (bounceRayCount > 0u)
-        indirectIrradiance *= _GISecondaryBounceIntensity / (float)visibilityRayCount;
-
-    float measuredSkyVisibility = visibleSkySamples / (float)visibilityRayCount;
-    float previousSkyVisibility = previousConfidence > 0u
-        ? ((previousValidity >> 8u) & 0xffu) / 255.0
-        : measuredSkyVisibility;
-    // Visibility is a separate transport term.  Do not lower sky energy globally to hide
-    // leaks: accumulate an amortized cosine visibility estimate per Surface cell instead.
-    float skyVisibilityHistory = previousConfidence > 0u
-        ? max(0.75, saturate(_GIRadianceHistoryWeight)) : 0.0;
-    float skyVisibility = lerp(
-        measuredSkyVisibility, previousSkyVisibility, skyVisibilityHistory);
-    directIrradiance += GIEvaluateTODDiffuseSky(normal) *
-                        (_GISkyIrradianceScale * skyVisibility);
-
-    // The cache stores outgoing diffuse radiance, not irradiance.  Convert with the
-    // Lambert 1/PI factor and remove the metallic portion from diffuse albedo.  The old
-    // expression amplified every bounce by PI and also mixed directional specular lobes
-    // into the diffuse cache, producing the red/cyan pollution seen across whole rows.
+    // This cache is a deterministic source cache for the free-space field, not a recursive
+    // GI solver. A stochastic secondary bounce and sky-visibility estimate made a Brick
+    // change energy whenever its round-robin update slot came around. Direct TOD sky is
+    // evaluated only when a free-space probe ray truly leaves the scene below.
     float3 diffuseColor = baseColor * (1.0 - saturate(metallic));
-    float3 diffuseRadiance = emissive +
-        diffuseColor * (directIrradiance + indirectIrradiance) * (1.0 / GI_RADIANCE_PI);
+    float3 diffuseRadiance = emissive + diffuseColor * directIrradiance * (1.0 / GI_RADIANCE_PI);
     [unroll]
     for (uint outputLobe = 0u; outputLobe < GI_RADIANCE_LOBE_COUNT; outputLobe++)
     {
@@ -550,13 +483,9 @@ void UpdateSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
         _GITargetRadianceScratch[scratchRadianceBase + outputLobe] =
             GIPackRgb9E5(clamp(nextRadiance, 0.0, _GIRadianceClamp));
     }
-    // The middle byte stores temporally accumulated sky visibility. Confidence only gates
-    // readability and the high word identifies the exact cell contents.
+    // Confidence only gates readability; the high word identifies the exact cell contents.
     uint nextConfidence = 255u;
-    uint packedSkyVisibility = (uint)round(saturate(skyVisibility) * 255.0);
-    _GITargetValidityScratch[scratchCellAddress] = nextConfidence |
-                                                   (packedSkyVisibility << 8u) |
-                                                   (historyIdentity << 16u);
+    _GITargetValidityScratch[scratchCellAddress] = nextConfidence | (historyIdentity << 16u);
 }
 
 [numthreads(8, 8, 8)]
@@ -577,4 +506,85 @@ void CommitSurfaceRadiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_Group
         _GITargetRadiance[targetRadianceBase + lobe] =
             _GITargetRadianceScratch[scratchRadianceBase + lobe];
     _GITargetValidity[targetCellAddress] = _GITargetValidityScratch[scratchCellAddress];
+}
+
+bool GIProbeSceneOccupied(GIClipmapLevelData level, int3 worldCell)
+{
+    int ignoredBrick;
+    uint ignoredCell;
+    return GIReadOccupancy(level, _GIStaticPageTable, _GIStaticOccupancy,
+                           worldCell, ignoredBrick, ignoredCell) ||
+           GIReadOccupancy(level, _GIDynamicPageTable, _GIDynamicOccupancy,
+                           worldCell, ignoredBrick, ignoredCell);
+}
+
+bool GIFindFreeProbeCell(GIClipmapLevelData level, int3 desiredCell, out int3 freeCell)
+{
+    // A probe is a free-space sample, never a winning surface voxel.  The short deterministic
+    // search makes newly voxelized geometry displace a probe instead of turning its direct
+    // lighting into fake incident GI.  Relocation/depth moments are the next leak-control step.
+    const int3 offsets[7] = {
+        int3(0, 0, 0), int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0),
+        int3(0, -1, 0), int3(0, 0, 1), int3(0, 0, -1)
+    };
+    [unroll]
+    for (uint candidate = 0u; candidate < 7u; candidate++)
+    {
+        int3 cell = desiredCell + offsets[candidate];
+        if (!GIProbeSceneOccupied(level, cell))
+        {
+            freeCell = cell;
+            return true;
+        }
+    }
+    freeCell = desiredCell;
+    return false;
+}
+
+[numthreads(8, 1, 1)]
+void BuildFreeSpaceIrradiance(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    if (groupId.x >= _GIRadianceDirtyBrickCount || threadId.x >= GI_IRRADIANCE_PROBES_PER_BRICK)
+        return;
+
+    uint physicalBrick = _GIRadianceDirtyBricks[groupId.x];
+    GIGpuClipmapBrickData brick = _GITargetBrickData[physicalBrick];
+    GIClipmapLevelData level = _GIClipmapLevels[brick.level];
+    uint probeIndex = threadId.x;
+    uint3 probeCoordinate = uint3(probeIndex & 1u, (probeIndex >> 1u) & 1u,
+                                  (probeIndex >> 2u) & 1u);
+    int3 desiredCell = brick.worldBrick * GI_BRICK_SIZE + int3(probeCoordinate * 4u + 2u);
+    uint probeAddress = physicalBrick * GI_IRRADIANCE_PROBES_PER_BRICK + probeIndex;
+    uint lobeAddress = physicalBrick * GI_IRRADIANCE_WORDS_PER_BRICK +
+                       probeIndex * GI_RADIANCE_LOBE_COUNT;
+
+    int3 probeCell;
+    if (!GIFindFreeProbeCell(level, desiredCell, probeCell))
+    {
+        [unroll]
+        for (uint lobe = 0u; lobe < GI_RADIANCE_LOBE_COUNT; lobe++)
+            _GITargetIrradiance[lobeAddress + lobe] = 0u;
+        _GITargetIrradianceValidity[probeAddress] = 0u;
+        return;
+    }
+
+    float3 probePosition = ((float3)probeCell + 0.5) * level.cellSize;
+    [unroll]
+    for (uint lobe = 0u; lobe < GI_RADIANCE_LOBE_COUNT; lobe++)
+    {
+        float3 direction = GILobeAxis(lobe);
+        float hitT;
+        uint hitLayer;
+        uint hitLevel;
+        int hitPhysicalBrick;
+        uint hitLocalCell;
+        bool hit = GITraceScene(probePosition, direction, _GIRadianceShadowDistance,
+                                brick.level, 0u, hitT, hitLayer, hitLevel,
+                                hitPhysicalBrick, hitLocalCell);
+        float3 incoming = hit
+            ? GIReadCachedRadiance(hitPhysicalBrick, hitLocalCell, hitLayer, -direction)
+            : GIEvaluateTODSky(direction);
+        _GITargetIrradiance[lobeAddress + lobe] = GIPackRgb9E5(incoming);
+    }
+    _GITargetIrradianceValidity[probeAddress] = 1u;
 }

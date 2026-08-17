@@ -213,7 +213,11 @@ namespace UnityNanite.TOD
         public TODFloatParameter rimPower = new TODFloatParameter(1f);
         public TODFloatParameter rimWidth = new TODFloatParameter(0.025f);
         public TODFloatParameter opacity = new TODFloatParameter(0.68f);
+        // coverage is the near-field coverage retained for serialized profile compatibility.
         public TODFloatParameter coverage = new TODFloatParameter(0.58f);
+        public TODFloatParameter farCoverage = new TODFloatParameter(0.42f);
+        public TODFloatParameter farCoverageStart = new TODFloatParameter(40f);
+        public TODFloatParameter farCoverageEnd = new TODFloatParameter(120f);
         public TODFloatParameter scale = new TODFloatParameter(1f);
         public TODFloatParameter detailScale = new TODFloatParameter(12f);
         public TODFloatParameter softness = new TODFloatParameter(0.1f);
@@ -222,6 +226,12 @@ namespace UnityNanite.TOD
         public TODFloatParameter speedX = new TODFloatParameter(0.006f);
         public TODFloatParameter speedY = new TODFloatParameter(0.002f);
         public TODFloatParameter altitude = new TODFloatParameter(6f);
+        // 0 = local flat plane, 1 = approximately Earth-sized spherical shell.
+        // Values above 1 deliberately exaggerate the far-distance downward arc.
+        public TODFloatParameter curvature = new TODFloatParameter(1f);
+        // Converts Unity world units to kilometres before sampling the cloud map.
+        // The default assumes the usual Unity convention of one unit per metre.
+        public TODFloatParameter worldPositionScale = new TODFloatParameter(0.001f);
         public TODFloatParameter thickness = new TODFloatParameter(1.25f);
         public TODFloatParameter densityMultiplier = new TODFloatParameter(1f);
         public TODFloatParameter horizonDensity = new TODFloatParameter(0.55f);

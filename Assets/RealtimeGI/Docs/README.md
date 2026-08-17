@@ -153,19 +153,20 @@ low-resolution GGX world proposal
 
 ## 8. Diffuse 与 Surface Radiance Cache
 
-必须保留的稳定性策略：
+默认 diffuse 不再使用 screen trace、reservoir、随机二次反弹或屏幕 history。它有两层明确分工：
 
-- 新 Cell 在启用 secondary bounce 时使用 4 条低差异 cosine hemisphere ray；
-- 稳定 Cell 至少 2 条；
-- per-Cell Cranley-Patterson rotation + R2 sequence；
-- radiance history 下限 0.65；
-- validity 保存 confidence、sky visibility 与 material revision；
-- diffuse radiance 写入六个 lobe，读取时用该 Cell 的精确法线执行正半球判断；这避免对角法线混合到被清零的负轴 lobe 而系统性损失反弹能量；
-- `secondaryBounceRays=0` 是明确关闭开关。
+- **Surface source cache**：只保存 `emissive + 材质颜色 × 可见方向光/点光/聚光` 的一跳出射 radiance；不采样
+  TOD sky，不递归读取别的 cell，不执行随机多 bounce。
+- **Free-space irradiance probes**：每 Brick 固定 `2×2×2` probe。每个 probe 沿六个固定轴向做 unified
+  static/dynamic Clipmap trace；命中时读取上述 source cache，真正 world miss 才读取 analytic TOD sky。
+  屏幕端只查询这个 field，完全不读 Surface source cache。
 
-Screen diffuse 正式基线为 `0.25` 分辨率、每 probe 每帧一条新 proposal、2x2 方向分层、persistent temporal/spatial reservoir、luminance moments、几何/方差过滤和 emissive alias importance sampling。`0.125` 只保留为诊断开关，不是产品性能档：它把一个样本扩展到 8x8 full-resolution footprint，远景会产生不可接受的低频斑块。最终显示 irradiance 是同一局部表面多个 reservoir 的 W/M 向量估计均值，path reservoir 仍保留单一 representative 用于后续重连；有限命中只有在 C0 Cell 尺度的共面 receiver 邻域内才能进入显示重建，不能把另一个物体的高能路径搬过来。有限 diffuse reuse 使用严格 world-space visibility；相应 temporal kernel 必须绑定完整 Scene/Clipmap 资源，而不是只绑定 GBuffer。
+删除这些旧路径的理由是可验证的：它们让同一 Brick 在 round-robin 更新时得到不同随机 sky/multi-bounce 值，再被直接
+扩散成可见的白块、闪烁和 cluster 分界。`ClearBrickRadiance` 同时清空 source radiance 与 free-space probe payload/validity，
+因此物理 Brick 被重新分配到新世界位置时不会显示旧位置的 irradiance。
 
-最终 2x2 上采样同时检查材质签名、法线、世界位置距离与切平面误差，并在可逆的压缩辐射空间内插值。该处理只作用于显示重建；Surface Cache 与 persistent reservoir 仍保存原始 HDR 能量。
+本阶段仍未达到“零漏光”验收：probe relocation 尚未持久化，且没有 directional distance moments/receiver-to-probe
+visibility。它们只能建立在本节的确定性 source/probe 数据链通过稳定性 review 后；不能重新引入随机屏幕 history 作为补丁。
 
 ## 9. 材质与更新语义
 
@@ -362,3 +363,92 @@ update/diffuse/glossy 的分项 GPU 时间。无效资源必须显式显示为 z
 1. **室内暖光**：颜色在 1 s 内稳定，物体遮挡 probe/field 不得造成局部“啪”地变暗或移开后缓慢回血；墙角无漏光。
 2. **室外 TOD**：阳光的明暗交界清楚，暗部可收环境/反弹色但不可被抹平；天空色只可经过可见天空路径进入。
 3. **动态灯与动态物体**：更新连续、无块状闪烁或跨屏噪声；镜头移动后不需要重新积累世界 GI。
+
+## 16. 实施状态
+
+### 阶段一：世界缓存 diffuse 默认路径（2026-08-09，待场景 review）
+
+已删除 `RealtimeGIRendererFeature` 中的 screen trace、HZB、world-miss queue、camera history、scene-color mip、
+diffuse/specular reservoir、temporal/spatial/A-trous 以及它们的 trace readback。`GIScreenLighting.compute` 现在只有
+`GatherWorldDiffuse`：每个可见 receiver 在当前世界位置的 sparse clipmap 邻域作 deterministic trilinear gather，
+没有随机数、跨帧屏幕数据或 Unity/Probe/sky fallback。旧 GPU monitor 的 ray/screen-hit 指标也同步删除，改为
+clipmap、world diffuse、world glossy 三项时间。
+
+这个阶段**尚未实现 glossy**；compute 明确输出零镜面，不能把现有 Unity IBL 当作替代。它的目标是先验证世界
+diffuse 数据链、画面移动稳定性和旧依赖的确实移除，而不是宣称漫反射质量已经达到最终标准。
+
+本地验证：`dotnet build RealtimeGI.csproj --no-restore` 通过（0 warning / 0 error）；Unity Editor 已重新导入 compute
+shader，修复过一次缺失的 `GIUnpackSurfaceNormal` 后，日志中没有新的 `GIScreenLighting` shader error。Renderer asset
+目前 `m_Active: 0`，未被自动启用，避免未 review 的阶段一改变项目画面。
+
+### 阶段一 review 方式
+
+启用 `PC_Renderer` 内的 `RealtimeGIRendererFeature` 后，固定相机等待 clipmap 工作队列稳定，再缓慢旋转/平移。
+预期：没有中心线、没有相机相关的重新积累、没有 Reflect Probe/Unity sky 造成的镜面；当前镜面应为零，diffuse
+可能偏弱或过局部，这属于下一阶段要解决的真实性问题。若出现 shader/RenderGraph 错误，需先记录完整 Console 和
+Frame Debugger 的 `RealtimeGI/World Cache Diffuse`，不能以开关或 fallback 绕过。
+
+### 阶段一 review 结论（2026-08-10：否决 gather 算法，保留清理成果）
+
+场景 review 证明旧屏幕路径已不再参与：输出没有 screen history 的中心线/重积累，红色 emissive 也确实能让相邻物体
+接收红色间接光。但 `GatherWorldDiffuse` 的表示选择错误，不能进入产品。
+
+`GIRadianceCache` 的每个 occupied cell 存的是**表面出射 radiance**：它已包含该表面自己的方向光、local light、
+可见 TOD sky、材质颜色和 emissive。`GatherWorldDiffuse` 把 receiver 上方八个 cell 的这些值直接作 trilinear
+normalised average，等价于把“一个由某个 winning surface 代表的体素”当成自由空间 probe。结果是：
+
+1. receiver 自身或极近的、直接受光的 cell 可能重新注入其 direct lighting；
+2. 八 cell 的主导 surface 在 Nanite cluster/voxel 边界改变，故出现按 cluster 分块的颜色和亮度；
+3. gather 没有 receiver 到 sample 的 visibility，遮挡面后仍可能拿到邻近 surface 的能量；
+4. 因为 cell radiance 含 TOD/direct 的白色成分，白色材质会被不正确地强化。
+
+这不是调 `_GIDiffuseIntensity`、加 history 或扩大 blur 能修好的问题。下一实现改为每 brick 的 sparse free-space
+irradiance probes：probe 只存自身位置的入射光，更新时使用固定世界 trace/visibility；屏幕只 trilinear 查询 probe
+field，必要时做 receiver-to-probe leak test。表面 radiance cache 继续作为 probe trace 的 hit radiance source，
+但不再直接作为 receiver 的体积数据。
+
+### 阶段一.五：free-space irradiance probe field（2026-08-10，待场景 review）
+
+已删除被否决的 surface-cell gather。每个 dirty physical brick 在 surface radiance commit 后生成固定 2x2x2
+free-space probes；probe 先在七个确定候选 cell 中离开 occupied cell，再向六个轴向做 unified static/dynamic
+clipmap trace。trace hit 只读取**命中表面**的 outgoing radiance，world miss 才读取 analytic TOD sky。全分辨率 pass
+仅对这个 probe field 进行三线性查询和法线方向积分，没有 history、reprojection、screen trace 或随机数。
+
+本步 review 预期是：Nanite cluster 的蓝/白/黑 surface-cache 拼图消失；red emissive 仍以平滑、低频方式染到相邻物体；
+移动相机不触发 GI 重积累。它还不是漏光验收完成：探针 relocation 尚未持久化，且尚无 directional depth moments/
+receiver-to-probe visibility。若本步通过画面 review，下一步只做这些 leak-control 数据，不会先加入 glossy 或 denoising。
+
+### 阶段一.五 review 修复：去除随机 source 与旧 probe 残留（2026-08-10，待 review）
+
+该版本第一次场景 review **未通过**：画面出现每秒亮度跳变、无白色 emissive 时的局部爆白，以及 free-space field
+本身的不均匀。根因不是艺术强度，而是两条数据完整性错误：
+
+1. Surface source cache 仍在执行随机 secondary-bounce 与随机 sky-visibility 估计；同一个 Brick 的 round-robin 更新
+   写出不同能量，随后 probe 立即把它传播到画面。
+2. `ClearBrickRadiance` 清掉了旧 Surface source，却没有清掉同一物理 Brick 的 probe payload/validity；Brick 重分配时
+   新世界位置可能短暂采到旧位置的 irradiance。
+
+修复删除了 secondary-bounce、随机 sky visibility、对应 Inspector 字段、shader 参数、签名项和无效的 static-bounce
+遗留字段。Surface source 现为确定性的 `emissive + direct directional/local response`；TOD sky 仅在 probe ray 的真实
+world miss 进入。物理 Brick 清理时同步清空 probe 值与有效位。一次性 GPU forensics 额外输出每层有效 free-space
+probe 数、首个 probe 的非零 lobe 数与解码后的最大 RGB，以便把后续异常明确归因到 field 数据，而非后处理。
+
+本地 `dotnet build RealtimeGI.csproj --no-restore` 已通过（0 error；3 个现有 Inspector 统计字段的 CS0414 warning）。
+下次 review 只检查这三个可证伪结果：固定机位 10 秒无周期跳变；无白 emissive 区不再突然爆白；移动/转动相机不会重置
+世界 GI。若仍失败，先读取新的 forensics 数值再定位，不添加 blur、亮度 clamp 或 hidden fallback。
+
+### 阶段一.五 review 修复二：分离几何帧与辐照版本（2026-08-10，待 review）
+
+再次审计 GPU 队列发现了一个独立、确定的持续更新错误：`_GIWorkGeneration` 每帧递增，本来只用于识别本帧的几何 dirty
+page，却同时被 `GIAppendRadiance` 当作“该物理 brick 已更新辐照”的版本。因此在无几何、无光照变化的静态场景中，
+`BuildRadianceWorkQueue` 仍会按 round-robin 每帧重算所有 resident brick；这既浪费预算，也会把任何 source 误差持续带回
+画面。现在它们是两个 token：
+
+1. `_GIWorkGeneration` 仍只管理 page/voxel dirty 生命周期；
+2. `_GIRadianceGeneration` 只在量化后的光照签名改变时递增；静态未变化的 brick 不再进入 radiance queue；
+3. 新分配或被重新 voxelize 的 brick 会显式清除自身 radiance-generation，并强制更新一次；
+4. source cache 的内容 identity 也包含 lighting revision，因此真实灯光改变时不会把旧光和新光按 history 混合。
+
+这一步的预期不是让 GI 变亮或靠 clamp 隐藏异常，而是让固定相机、固定 TOD 下的 `RealtimeGI/Radiance Update` 在初始填充后
+降为近零工作量，并且画面不再按循环周期更新。真正的 TOD/灯光变化仍会分批重算 resident bricks；是否在用户给定的 1 秒
+更新上限内，由下一轮 GPU 队列统计和场景录像测量后决定。
