@@ -182,6 +182,7 @@ namespace UnityNanite.TOD.Editor
             new TODParameterDescriptor("主方向光", "lighting.mainLightColor", "主光颜色", true),
             new TODParameterDescriptor("主方向光", "lighting.mainLightIntensity", "主光强度", 0f, 8f),
             new TODParameterDescriptor("主方向光", "lighting.shadowStrength", "阴影强度", 0f, 1f),
+            new TODParameterDescriptor("天空 / GI", "sky.giIntensity", "GI 天空强度", 0f, 8f),
 
             new TODParameterDescriptor("Lens Flare", "lensFlare.sunIntensity", "太阳 Flare 强度", 0f, 8f),
             new TODParameterDescriptor("Lens Flare", "lensFlare.sunScale", "太阳 Flare 尺寸", 0f, 4f),

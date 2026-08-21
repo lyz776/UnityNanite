@@ -136,7 +136,7 @@ namespace UnityEngine.Rendering.Universal
             }
         }
 
-        internal bool usesDeferredLighting => renderingModeActual == RenderingMode.Deferred || renderingModeActual == RenderingMode.DeferredPlus;
+        public bool usesDeferredLighting => renderingModeActual == RenderingMode.Deferred || renderingModeActual == RenderingMode.DeferredPlus;
 
         internal bool usesClusterLightLoop => renderingModeActual == RenderingMode.ForwardPlus || renderingModeActual == RenderingMode.DeferredPlus;
 

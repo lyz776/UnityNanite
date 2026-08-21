@@ -82,6 +82,9 @@ Shader "Hidden/TerrainEngine/Details/UniversalPipeline/Vertexlit"
             #pragma multi_compile_fragment _ _GBUFFER_NORMALS_OCT
             #pragma multi_compile_fragment _ _RENDER_PASS_ENABLED
 
+            // Terrain detail is tagged MaterialUnlit even though this pass bakes its
+            // own vertex/direct/indirect lighting into the GBuffer color target.
+            #define REALTIME_GI_KEEP_NATIVE_DIFFUSE 1
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/GBufferOutput.hlsl"

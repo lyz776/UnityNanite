@@ -112,7 +112,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Unity.RenderPipelines.Core.Runtime::UnityEngine.Rendering.LensFlareComponentSRP
   m_LensFlareData: {fileID: 11400000, guid: bd7eaf3bd49c39f4cb77bd809459aa72, type: 2}
   version: 0
-  intensity: 0.17394619
+  intensity: 2.3380725
   maxAttenuationDistance: 10000
   maxAttenuationScale: 10000
   distanceAttenuationCurve:

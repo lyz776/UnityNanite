@@ -242,7 +242,11 @@ GBufferFragOutput LitGBufferPassFragment(Varyings input)
                                               inputData.bakedGI, surfaceData.occlusion, inputData.positionWS,
                                               inputData.normalWS, inputData.viewDirectionWS, inputData.normalizedScreenSpaceUV);
 
-    return PackGBuffersBRDFData(brdfData, inputData, surfaceData.smoothness, surfaceData.emission + color, surfaceData.occlusion);
+    half3 surfaceLighting = lerp(
+        surfaceData.emission + color,
+        surfaceData.emission,
+        saturate((half)_RealtimeGIDiffuseEnabled));
+    return PackGBuffersBRDFData(brdfData, inputData, surfaceData.smoothness, surfaceLighting, surfaceData.occlusion);
 }
 
 #endif

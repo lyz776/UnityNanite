@@ -4,11 +4,10 @@
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/EntityLighting.hlsl"
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/ImageBasedLighting.hlsl"
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/RealtimeLights.hlsl"
-#include "Assets/RealtimeGI/Shaders/GITODSky.hlsl"
 
-// Set only while deferred GBuffer materials are laid down. RealtimeGI injects the
-// replacement diffuse term after Nanite has produced final depth and normals.
-float _RealtimeGIDeferredInjection;
+// Set only around deferred material laydown. RealtimeGI resolves indirect diffuse
+// after the complete GBuffer (including external geometry systems) exists.
+float _RealtimeGIDiffuseEnabled;
 
 #define AMBIENT_PROBE_BUFFER 0
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/AmbientProbe.hlsl"
@@ -424,12 +423,39 @@ half3 CalculateIrradianceFromReflectionProbes(half3 reflectVector, float3 positi
 
 half3 GlossyEnvironmentReflection(half3 reflectVector, float3 positionWS, half perceptualRoughness, half occlusion, float2 normalizedScreenSpaceUV)
 {
-    // RealtimeGI injects the traced term separately.  Keep the analytic TOD sky
-    // during history warm-up and cross-fade it as the traced solution takes over.
-    // Reflection probes and Unity skybox IBL remain intentionally excluded.
-    half takeover = saturate((half)_RealtimeGIDeferredInjection);
-    return (half3)GIEvaluateTODGlossySky(reflectVector, perceptualRoughness) *
-        occlusion * (1.0h - takeover);
+    half3 irradiance;
+
+#if !defined(_ENVIRONMENTREFLECTIONS_OFF)
+    if (_REFLECTION_PROBE_BLENDING)
+    {
+        irradiance = CalculateIrradianceFromReflectionProbes(reflectVector, positionWS, perceptualRoughness, normalizedScreenSpaceUV);
+    }
+    else
+    {
+        if (_REFLECTION_PROBE_BOX_PROJECTION)
+        {
+            #if defined(REFLECTION_PROBE_ROTATION)
+            float3 probeCenterPosWS0 = unity_SpecCube0_BoxMin.xyz + (unity_SpecCube0_BoxMax.xyz - unity_SpecCube0_BoxMin.xyz) / 2;
+            float3 rotPosWS0 = RotateVectorByQuat(unity_SpecCube0_Rotation, positionWS - probeCenterPosWS0) + probeCenterPosWS0;
+            half3 rotReflectVector0 = RotateVectorByQuat(unity_SpecCube0_Rotation, reflectVector);
+            float4 inverseRotation0 = -unity_SpecCube0_Rotation;
+            inverseRotation0.w = -inverseRotation0.w;
+            reflectVector = BoxProjectedCubemapDirection(rotReflectVector0, rotPosWS0, unity_SpecCube0_ProbePosition, unity_SpecCube0_BoxMin, unity_SpecCube0_BoxMax);
+            reflectVector = RotateVectorByQuat(inverseRotation0, reflectVector);
+            #else
+            reflectVector = BoxProjectedCubemapDirection(reflectVector, positionWS, unity_SpecCube0_ProbePosition, unity_SpecCube0_BoxMin, unity_SpecCube0_BoxMax);
+            #endif
+        }
+        half mip = PerceptualRoughnessToMipmapLevel(perceptualRoughness);
+        half4 encodedIrradiance = half4(SAMPLE_TEXTURECUBE_LOD(unity_SpecCube0, samplerunity_SpecCube0, reflectVector, mip));
+
+        irradiance = DecodeHDREnvironment(encodedIrradiance, unity_SpecCube0_HDR);
+    }
+#else
+    irradiance = _GlossyEnvironmentColor.rgb;
+#endif
+
+    return irradiance * occlusion;
 }
 
 #if !USE_CLUSTER_LIGHT_LOOP
@@ -441,9 +467,15 @@ half3 GlossyEnvironmentReflection(half3 reflectVector, float3 positionWS, half p
 
 half3 GlossyEnvironmentReflection(half3 reflectVector, half perceptualRoughness, half occlusion)
 {
-    half takeover = saturate((half)_RealtimeGIDeferredInjection);
-    return (half3)GIEvaluateTODGlossySky(reflectVector, perceptualRoughness) *
-        occlusion * (1.0h - takeover);
+#if !defined(_ENVIRONMENTREFLECTIONS_OFF)
+    half3 irradiance;
+    half mip = PerceptualRoughnessToMipmapLevel(perceptualRoughness);
+    half4 encodedIrradiance = half4(SAMPLE_TEXTURECUBE_LOD(unity_SpecCube0, samplerunity_SpecCube0, reflectVector, mip));
+    irradiance = DecodeHDREnvironment(encodedIrradiance, unity_SpecCube0_HDR);
+    return irradiance * occlusion;
+#else
+    return _GlossyEnvironmentColor.rgb * occlusion;
+#endif
 }
 
 half3 SubtractDirectMainLightFromLightmap(Light mainLight, half3 normalWS, half3 bakedGI)
@@ -482,7 +514,10 @@ half3 GlobalIllumination(BRDFData brdfData, BRDFData brdfDataClearCoat, float cl
     half NoV = saturate(dot(normalWS, viewDirectionWS));
     half fresnelTerm = Pow4(1.0 - NoV);
 
-    half3 indirectDiffuse = bakedGI * (1.0h - saturate((half)_RealtimeGIDeferredInjection));
+    half3 indirectDiffuse = bakedGI;
+#if !defined(REALTIME_GI_KEEP_NATIVE_DIFFUSE)
+    indirectDiffuse *= 1.0h - saturate((half)_RealtimeGIDiffuseEnabled);
+#endif
     half3 indirectSpecular = GlossyEnvironmentReflection(reflectVector, positionWS, brdfData.perceptualRoughness, 1.0h, normalizedScreenSpaceUV);
 
     half3 color = EnvironmentBRDF(brdfData, indirectDiffuse, indirectSpecular, fresnelTerm);
@@ -531,7 +566,10 @@ half3 GlobalIllumination(BRDFData brdfData, BRDFData brdfDataClearCoat, float cl
     half NoV = saturate(dot(normalWS, viewDirectionWS));
     half fresnelTerm = Pow4(1.0 - NoV);
 
-    half3 indirectDiffuse = bakedGI * (1.0h - saturate((half)_RealtimeGIDeferredInjection));
+    half3 indirectDiffuse = bakedGI;
+#if !defined(REALTIME_GI_KEEP_NATIVE_DIFFUSE)
+    indirectDiffuse *= 1.0h - saturate((half)_RealtimeGIDiffuseEnabled);
+#endif
     half3 indirectSpecular = GlossyEnvironmentReflection(reflectVector, brdfData.perceptualRoughness, half(1.0));
 
     half3 color = EnvironmentBRDF(brdfData, indirectDiffuse, indirectSpecular, fresnelTerm);

@@ -10,6 +10,8 @@ namespace UnityEngine.Rendering.Universal.Internal
         // Statics
         private static readonly int s_CameraNormalsTextureID = Shader.PropertyToID("_CameraNormalsTexture");
         private static readonly int s_CameraRenderingLayersTextureID = Shader.PropertyToID("_CameraRenderingLayersTexture");
+        private static readonly int s_RealtimeGIDiffuseEnabledID =
+            Shader.PropertyToID("_RealtimeGIDiffuseEnabled");
         private static readonly ShaderTagId s_ShaderTagLit = new ShaderTagId("Lit");
         private static readonly ShaderTagId s_ShaderTagSimpleLit = new ShaderTagId("SimpleLit");
         private static readonly ShaderTagId s_ShaderTagUnlit = new ShaderTagId("Unlit");
@@ -133,6 +135,8 @@ namespace UnityEngine.Rendering.Universal.Internal
             UniversalLightData lightData = frameData.Get<UniversalLightData>();
 
             m_PassData.deferredLights = m_DeferredLights;
+            m_PassData.realtimeGIDiffuseEnabled =
+                frameData.Get<UniversalResourceData>().realtimeGIDiffuseEnabled;
             InitRendererLists(ref m_PassData, context, default(RenderGraph), universalRenderingData, cameraData, lightData, false);
 
             var cmd = renderingData.commandBuffer;
@@ -167,7 +171,11 @@ namespace UnityEngine.Rendering.Universal.Internal
                 cmd.SetGlobalTexture(ShaderPropertyId.screenSpaceIrradiance, data.screenSpaceIrradianceHdl);
             }
 
+            cmd.SetGlobalFloat(
+                s_RealtimeGIDiffuseEnabledID,
+                data.realtimeGIDiffuseEnabled ? 1.0f : 0.0f);
             cmd.DrawRendererList(rendererList);
+            cmd.SetGlobalFloat(s_RealtimeGIDiffuseEnabledID, 0.0f);
 
             // Render objects that did not match any shader pass with error shader
             RenderingUtils.DrawRendererListObjectsWithError(cmd, ref errorRendererList);
@@ -187,6 +195,7 @@ namespace UnityEngine.Rendering.Universal.Internal
             internal RendererListHandle objectsWithErrorRendererListHdl;
 
             internal TextureHandle screenSpaceIrradianceHdl;
+            internal bool realtimeGIDiffuseEnabled;
 
 #if URP_COMPATIBILITY_MODE
             internal TextureHandle[] gbuffer;
@@ -266,6 +275,7 @@ namespace UnityEngine.Rendering.Universal.Internal
 
             builder.SetRenderAttachmentDepth(cameraDepth, AccessFlags.Write);
             passData.deferredLights = m_DeferredLights;
+            passData.realtimeGIDiffuseEnabled = resourceData.realtimeGIDiffuseEnabled;
 
             InitRendererLists(ref passData, default(ScriptableRenderContext), renderGraph, renderingData, cameraData, lightData, true);
             builder.UseRendererList(passData.rendererListHdl);

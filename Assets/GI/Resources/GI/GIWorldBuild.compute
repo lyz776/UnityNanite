@@ -1,0 +1,432 @@
+// Porting reference:
+// AKGWSB/UnrealEngine:4.27-akgi
+// Engine/Shaders/Private/RealtimeGI/VoxelClipmapUpdate.usf
+// The UE GPU allocator/culling framework is intentionally not carried over.
+// Node 1 import revision: explicit RendererData reference.
+#pragma kernel ClearCells
+#pragma kernel SelectSurface
+#pragma kernel CommitSurface
+#pragma kernel SelectNaniteSurface
+#pragma kernel CommitNaniteSurface
+#pragma kernel ClearNaniteDiagnostics
+#pragma kernel BuildConservativeDistance
+#pragma target 5.0
+
+#include "../../Shaders/GIWorldCommon.hlsl"
+
+struct GIWorldTriangle
+{
+    float3 position0;
+    uint material;
+    float3 position1;
+    uint sourceId;
+    float3 position2;
+    uint flags;
+    float3 normal;
+    uint reserved;
+};
+
+StructuredBuffer<GIWorldLevelData> _GIWorldLevels;
+StructuredBuffer<int> _GIWorldPageTable;
+StructuredBuffer<GIWorldBrickData> _GIWorldBricks;
+StructuredBuffer<GIWorldTriangle> _GIWorldTriangles;
+struct GIWorldTriangleWork
+{
+    uint triangleIndex;
+    uint physicalBrick;
+    uint instanceIndex;
+};
+StructuredBuffer<GIWorldTriangleWork> _GIWorldTriangleWork;
+
+struct GIMeshGpuInstance
+{
+    float4x4 localToWorld;
+    uint material;
+    uint sourceId;
+    uint flags;
+    uint reserved;
+};
+StructuredBuffer<GIMeshGpuInstance> _GIMeshInstances;
+
+struct GINaniteGpuInstance
+{
+    float4x4 localToWorld;
+    uint material;
+    uint sourceId;
+    uint reserved0;
+    uint reserved1;
+};
+
+struct GINaniteTriangleWork
+{
+    uint pageId;
+    uint triangleCount;
+    uint physicalBrick;
+    uint instanceIndex;
+    uint keyBase;
+    uint reserved;
+};
+
+struct GINaniteResidentPageEntry
+{
+    uint vertexBase;
+    uint indexBase;
+    uint vertexCount;
+    uint indexCount;
+    uint flags;
+    uint generation;
+    uint reserved0;
+    uint reserved1;
+};
+
+struct GINaniteResidentVertex
+{
+    float3 positionOS;
+    float2 uv;
+    float3 normalOS;
+    float4 tangentOS;
+};
+
+StructuredBuffer<GINaniteGpuInstance> _GINaniteInstances;
+StructuredBuffer<GINaniteTriangleWork> _GINaniteTriangleWork;
+StructuredBuffer<GINaniteResidentPageEntry> _GINaniteResidentPageTable;
+StructuredBuffer<GINaniteResidentVertex> _GINaniteResidentVertices;
+StructuredBuffer<uint> _GINaniteResidentIndices;
+StructuredBuffer<uint> _GINaniteResidencyBits;
+RWStructuredBuffer<uint> _GIWorldWinner;
+RWStructuredBuffer<uint> _GIWorldOccupancy;
+RWStructuredBuffer<uint> _GIWorldSurface;
+RWStructuredBuffer<uint> _GIWorldDistance;
+RWStructuredBuffer<uint> _GINaniteDiagnostics;
+StructuredBuffer<uint> _GIWorldDirtyBricks;
+uint _GIWorldDirtyBrickCount;
+uint _GIWorldBuildGeneration;
+uint _GIWorldTriangleWorkCount;
+uint _GINaniteTriangleWorkCount;
+uint _GINanitePoolGeneration;
+uint _GINaniteGeometryReadyFlag;
+uint _GINaniteDispatchWidth;
+
+float3 GIClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c)
+{
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+        return a + ab * (d1 / max(d1 - d3, 1e-8));
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+        return a + ac * (d2 / max(d2 - d6, 1e-8));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+        return b + (c - b) * ((d4 - d3) / max((d4 - d3) + (d5 - d6), 1e-8));
+    float denominator = max(va + vb + vc, 1e-8);
+    return a + ab * (vb / denominator) + ac * (vc / denominator);
+}
+
+float2 GIPackOct(float3 n)
+{
+    n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1e-8);
+    float2 oct = n.xy;
+    if (n.z < 0.0)
+        oct = (1.0 - abs(oct.yx)) * float2(oct.x >= 0.0 ? 1.0 : -1.0,
+                                               oct.y >= 0.0 ? 1.0 : -1.0);
+    return oct;
+}
+
+uint GIPackNormal(float3 normal)
+{
+    uint2 oct = (uint2)round(saturate(GIPackOct(normal) * 0.5 + 0.5) * 255.0);
+    return oct.x | (oct.y << 8u);
+}
+
+bool GITriangleTouchesCell(GIWorldTriangle surfaceTriangle, float3 center, float cellSize, out float distance)
+{
+    float3 closest = GIClosestPointOnTriangle(
+        center, surfaceTriangle.position0, surfaceTriangle.position1, surfaceTriangle.position2);
+    distance = length(closest - center);
+    return distance <= cellSize * 0.9;
+}
+
+[numthreads(64, 1, 1)]
+void ClearCells(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint dirtyCell = dispatchId.x;
+    uint cellCount = _GIWorldDirtyBrickCount * GI_WORLD_CELLS_PER_BRICK;
+    if (dirtyCell >= cellCount) return;
+    uint localCell = dirtyCell % GI_WORLD_CELLS_PER_BRICK;
+    uint physicalBrick = _GIWorldDirtyBricks[dirtyCell / GI_WORLD_CELLS_PER_BRICK];
+    uint cell = physicalBrick * GI_WORLD_CELLS_PER_BRICK + localCell;
+    _GIWorldWinner[cell] = 0xffffffffu;
+    uint surfaceAddress = cell * GI_WORLD_SURFACE_WORDS_PER_CELL;
+    _GIWorldSurface[surfaceAddress] = 0u;
+    _GIWorldSurface[surfaceAddress + 1u] = 0u;
+    _GIWorldSurface[surfaceAddress + 2u] = 0u;
+    _GIWorldDistance[cell] = 1u;
+    if ((localCell & 31u) == 0u)
+        _GIWorldOccupancy[physicalBrick * GI_WORLD_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u] = 0u;
+}
+
+void GIVisitTriangleCells(uint workIndex, bool commit)
+{
+    GIWorldTriangleWork work = _GIWorldTriangleWork[workIndex];
+    uint triangleIndex = work.triangleIndex;
+    GIWorldTriangle surfaceTriangle = _GIWorldTriangles[triangleIndex];
+    GIMeshGpuInstance instance = _GIMeshInstances[work.instanceIndex];
+    surfaceTriangle.position0 = mul(instance.localToWorld, float4(surfaceTriangle.position0, 1.0)).xyz;
+    surfaceTriangle.position1 = mul(instance.localToWorld, float4(surfaceTriangle.position1, 1.0)).xyz;
+    surfaceTriangle.position2 = mul(instance.localToWorld, float4(surfaceTriangle.position2, 1.0)).xyz;
+    float3 transformedCross = cross(
+        surfaceTriangle.position1 - surfaceTriangle.position0,
+        surfaceTriangle.position2 - surfaceTriangle.position0);
+    if (dot(transformedCross, transformedCross) < 1e-12)
+        return;
+    surfaceTriangle.normal = normalize(transformedCross);
+    surfaceTriangle.material = instance.material;
+    surfaceTriangle.sourceId = instance.sourceId;
+    surfaceTriangle.flags = instance.flags;
+    surfaceTriangle.reserved = instance.reserved;
+    uint physicalBrick = work.physicalBrick;
+    GIWorldBrickData brick = _GIWorldBricks[physicalBrick];
+    if (brick.valid == 0u || brick.generation != _GIWorldBuildGeneration)
+        return;
+    GIWorldLevelData level = _GIWorldLevels[brick.level];
+        float cellSize = level.cellSize;
+        float3 boundsMin = min(surfaceTriangle.position0, min(surfaceTriangle.position1, surfaceTriangle.position2)) - cellSize;
+        float3 boundsMax = max(surfaceTriangle.position0, max(surfaceTriangle.position1, surfaceTriangle.position2)) + cellSize;
+        int3 minCell = (int3)floor(boundsMin / cellSize);
+        int3 maxCell = (int3)floor(boundsMax / cellSize);
+        int3 brickMin = brick.worldBrick * GI_WORLD_BRICK_SIZE;
+        int3 brickMax = brickMin + GI_WORLD_BRICK_SIZE - 1;
+        minCell = max(minCell, brickMin);
+        maxCell = min(maxCell, brickMax);
+        if (any(minCell > maxCell))
+            return;
+        [loop]
+        for (int z = minCell.z; z <= maxCell.z; z++)
+        [loop]
+        for (int y = minCell.y; y <= maxCell.y; y++)
+        [loop]
+        for (int x = minCell.x; x <= maxCell.x; x++)
+        {
+            uint localCell = GILocalCellIndex(int3(x, y, z) - brickMin);
+            float distance;
+            float3 center = (float3(x, y, z) + 0.5) * cellSize;
+            if (!GITriangleTouchesCell(surfaceTriangle, center, cellSize, distance))
+                continue;
+            uint cellAddress = (uint)physicalBrick * GI_WORLD_CELLS_PER_BRICK + localCell;
+            // The work index identifies the instance as well as shared geometry. Nanite
+            // reserves the high half of the winner key space.
+            uint key = workIndex & 0x7fffffffu;
+            if (!commit)
+            {
+                InterlockedMin(_GIWorldWinner[cellAddress], key);
+            }
+            else if (_GIWorldWinner[cellAddress] == key)
+            {
+                uint surfaceAddress = cellAddress * GI_WORLD_SURFACE_WORDS_PER_CELL;
+                _GIWorldSurface[surfaceAddress] = GIPackNormal(surfaceTriangle.normal);
+                _GIWorldSurface[surfaceAddress + 1u] = surfaceTriangle.material;
+                _GIWorldSurface[surfaceAddress + 2u] = surfaceTriangle.reserved;
+                _GIWorldDistance[cellAddress] = 0u;
+                InterlockedOr(
+                    _GIWorldOccupancy[(uint)physicalBrick * GI_WORLD_OCCUPANCY_WORDS_PER_BRICK +
+                                      localCell / 32u],
+                    1u << (localCell & 31u));
+            }
+        }
+}
+
+[numthreads(64, 1, 1)]
+void SelectSurface(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x < _GIWorldTriangleWorkCount)
+        GIVisitTriangleCells(dispatchId.x, false);
+}
+
+[numthreads(64, 1, 1)]
+void CommitSurface(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x < _GIWorldTriangleWorkCount)
+        GIVisitTriangleCells(dispatchId.x, true);
+}
+
+bool GIReadNaniteTriangle(
+    GINaniteTriangleWork work,
+    uint triangleInPage,
+    bool recordDiagnostics,
+    out float3 position0,
+    out float3 position1,
+    out float3 position2,
+    out float3 normal,
+    out uint material)
+{
+    position0 = position1 = position2 = 0.0.xxx;
+    normal = float3(0.0, 1.0, 0.0);
+    material = 0xffffffffu;
+    uint residencyWord = _GINaniteResidencyBits[work.pageId >> 5u];
+    if ((residencyWord & (1u << (work.pageId & 31u))) == 0u)
+        return false;
+    GINaniteResidentPageEntry page = _GINaniteResidentPageTable[work.pageId];
+    if ((page.flags & _GINaniteGeometryReadyFlag) == 0u ||
+        page.generation != _GINanitePoolGeneration)
+        return false;
+    uint firstIndex = triangleInPage * 3u;
+    if (firstIndex + 2u >= page.indexCount)
+        return false;
+    uint index0 = _GINaniteResidentIndices[page.indexBase + firstIndex];
+    uint index1 = _GINaniteResidentIndices[page.indexBase + firstIndex + 1u];
+    uint index2 = _GINaniteResidentIndices[page.indexBase + firstIndex + 2u];
+    if (recordDiagnostics)
+        InterlockedAdd(_GINaniteDiagnostics[0], 1u);
+
+    GINaniteGpuInstance instance = _GINaniteInstances[work.instanceIndex];
+    position0 = mul(instance.localToWorld,
+        float4(_GINaniteResidentVertices[index0].positionOS, 1.0)).xyz;
+    position1 = mul(instance.localToWorld,
+        float4(_GINaniteResidentVertices[index1].positionOS, 1.0)).xyz;
+    position2 = mul(instance.localToWorld,
+        float4(_GINaniteResidentVertices[index2].positionOS, 1.0)).xyz;
+    float3 crossValue = cross(position1 - position0, position2 - position0);
+    if (dot(crossValue, crossValue) < 1e-12)
+        return false;
+    normal = normalize(crossValue);
+    material = instance.material;
+    if (recordDiagnostics)
+        InterlockedAdd(_GINaniteDiagnostics[1], 1u);
+    return true;
+}
+
+void GIVisitNaniteTriangle(uint workIndex, uint triangleInPage, bool commit)
+{
+    GINaniteTriangleWork work = _GINaniteTriangleWork[workIndex];
+    uint physicalBrick = work.physicalBrick;
+    GIWorldBrickData brick = _GIWorldBricks[physicalBrick];
+    if (brick.valid == 0u || brick.generation != _GIWorldBuildGeneration)
+        return;
+
+    float3 position0, position1, position2, normal;
+    uint material;
+    if (!GIReadNaniteTriangle(
+            work, triangleInPage, !commit,
+            position0, position1, position2, normal, material))
+        return;
+
+    GIWorldLevelData level = _GIWorldLevels[brick.level];
+    float cellSize = level.cellSize;
+    int3 minCell = (int3)floor((min(position0, min(position1, position2)) - cellSize) / cellSize);
+    int3 maxCell = (int3)floor((max(position0, max(position1, position2)) + cellSize) / cellSize);
+    int3 brickMin = brick.worldBrick * GI_WORLD_BRICK_SIZE;
+    int3 brickMax = brickMin + GI_WORLD_BRICK_SIZE - 1;
+    minCell = max(minCell, brickMin);
+    maxCell = min(maxCell, brickMax);
+    if (any(minCell > maxCell))
+        return;
+    if (!commit)
+        InterlockedAdd(_GINaniteDiagnostics[2], 1u);
+
+    GIWorldTriangle surfaceTriangle;
+    surfaceTriangle.position0 = position0;
+    surfaceTriangle.position1 = position1;
+    surfaceTriangle.position2 = position2;
+    surfaceTriangle.normal = normal;
+    surfaceTriangle.material = material;
+    surfaceTriangle.sourceId = 0u;
+    surfaceTriangle.flags = 2u;
+    surfaceTriangle.reserved = _GINaniteInstances[work.instanceIndex].reserved0;
+
+    [loop]
+    for (int z = minCell.z; z <= maxCell.z; z++)
+    [loop]
+    for (int y = minCell.y; y <= maxCell.y; y++)
+    [loop]
+    for (int x = minCell.x; x <= maxCell.x; x++)
+    {
+        float distance;
+        float3 center = (float3(x, y, z) + 0.5) * cellSize;
+        if (!GITriangleTouchesCell(surfaceTriangle, center, cellSize, distance))
+            continue;
+        if (!commit)
+            InterlockedAdd(_GINaniteDiagnostics[3], 1u);
+        uint localCell = GILocalCellIndex(int3(x, y, z) - brickMin);
+        uint cellAddress = physicalBrick * GI_WORLD_CELLS_PER_BRICK + localCell;
+        if (!commit)
+        {
+            InterlockedMin(
+                _GIWorldWinner[cellAddress], 0x80000000u | (work.keyBase + triangleInPage));
+        }
+        else if (_GIWorldWinner[cellAddress] ==
+                 (0x80000000u | (work.keyBase + triangleInPage)))
+        {
+            uint surfaceAddress = cellAddress * GI_WORLD_SURFACE_WORDS_PER_CELL;
+            _GIWorldSurface[surfaceAddress] = GIPackNormal(normal) | (1u << 31u);
+            _GIWorldSurface[surfaceAddress + 1u] = material;
+            _GIWorldSurface[surfaceAddress + 2u] = surfaceTriangle.reserved;
+            _GIWorldDistance[cellAddress] = 0u;
+            InterlockedOr(
+                _GIWorldOccupancy[physicalBrick * GI_WORLD_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u],
+                1u << (localCell & 31u));
+            InterlockedAdd(_GINaniteDiagnostics[4], 1u);
+        }
+    }
+}
+
+[numthreads(8, 1, 1)]
+void ClearNaniteDiagnostics(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x < 5u)
+        _GINaniteDiagnostics[dispatchId.x] = 0u;
+}
+
+[numthreads(64, 1, 1)]
+void SelectNaniteSurface(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint workIndex = groupId.x + groupId.y * _GINaniteDispatchWidth;
+    if (workIndex >= _GINaniteTriangleWorkCount)
+        return;
+    GINaniteTriangleWork work = _GINaniteTriangleWork[workIndex];
+    for (uint triangleIndex = groupThreadId.x;
+         triangleIndex < work.triangleCount;
+         triangleIndex += 64u)
+        GIVisitNaniteTriangle(workIndex, triangleIndex, false);
+}
+
+[numthreads(64, 1, 1)]
+void CommitNaniteSurface(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint workIndex = groupId.x + groupId.y * _GINaniteDispatchWidth;
+    if (workIndex >= _GINaniteTriangleWorkCount)
+        return;
+    GINaniteTriangleWork work = _GINaniteTriangleWork[workIndex];
+    for (uint triangleIndex = groupThreadId.x;
+         triangleIndex < work.triangleCount;
+         triangleIndex += 64u)
+        GIVisitNaniteTriangle(workIndex, triangleIndex, true);
+}
+
+[numthreads(64, 1, 1)]
+void BuildConservativeDistance(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint dirtyCell = dispatchId.x;
+    uint cellCount = _GIWorldDirtyBrickCount * GI_WORLD_CELLS_PER_BRICK;
+    if (dirtyCell >= cellCount) return;
+    uint localCell = dirtyCell % GI_WORLD_CELLS_PER_BRICK;
+    uint physicalBrick = _GIWorldDirtyBricks[dirtyCell / GI_WORLD_CELLS_PER_BRICK];
+    uint cell = physicalBrick * GI_WORLD_CELLS_PER_BRICK + localCell;
+    // Node 1 correctness baseline: 0 for occupied, 1 for empty. This is conservative and
+    // cannot skip geometry. Wider propagation is added only after debug trace validation.
+    uint word = _GIWorldOccupancy[physicalBrick * GI_WORLD_OCCUPANCY_WORDS_PER_BRICK + localCell / 32u];
+    _GIWorldDistance[cell] = (word & (1u << (localCell & 31u))) != 0u ? 0u : 1u;
+}

@@ -314,6 +314,9 @@ Shader "Universal Render Pipeline/Complex Lit"
 
             // -------------------------------------
             // Includes
+            // ComplexLit is stamped as MaterialUnlit in deferred and is therefore
+            // outside RealtimeGI's Lit/SimpleLit diffuse composite.
+            #define REALTIME_GI_KEEP_NATIVE_DIFFUSE 1
             #include "Packages/com.unity.render-pipelines.universal/Shaders/LitInput.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/Shaders/LitGBufferPass.hlsl"
             ENDHLSL

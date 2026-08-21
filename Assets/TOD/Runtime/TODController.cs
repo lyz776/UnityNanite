@@ -758,6 +758,10 @@ namespace UnityNanite.TOD
             RenderSettings.fogColor = value.fog.bottomColor.Evaluate(hour);
             RenderSettings.fogStartDistance = Mathf.Max(0f, value.fog.startDistance.Evaluate(hour));
             RenderSettings.fogEndDistance = Mathf.Max(RenderSettings.fogStartDistance + 0.001f, value.fog.endDistance.Evaluate(hour));
+            Shader.SetGlobalColor("_GIEnvironmentSkyColor", value.sky.lightTop.Evaluate(hour));
+            Shader.SetGlobalFloat("_GIEnvironmentIntensity",
+                Mathf.Max(0f, value.sky.giIntensity.Evaluate(hour)));
+
         }
 
         private static void SetColor(string property, Color value)

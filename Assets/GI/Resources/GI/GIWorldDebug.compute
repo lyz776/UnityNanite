@@ -1,0 +1,166 @@
+// Porting reference:
+// AKGWSB/UnrealEngine:4.27-akgi
+// Engine/Shaders/Private/RealtimeGI/VoxelRaytracing.ush and VisualizeVoxel.usf.
+// Debug output exposes LOD/fallback/confidence instead of hiding invalid fine data.
+// Node 1 import revision: explicit RendererData reference.
+#pragma kernel TraceWorldDebug
+#pragma target 5.0
+
+#include "../../Shaders/GIWorldCommon.hlsl"
+
+StructuredBuffer<GIWorldLevelData> _GIWorldLevels;
+StructuredBuffer<int> _GIWorldPageTable;
+StructuredBuffer<GIWorldBrickData> _GIWorldBricks;
+StructuredBuffer<uint> _GIWorldOccupancy;
+StructuredBuffer<uint> _GIWorldSurface;
+StructuredBuffer<uint> _GIWorldDistance;
+RWTexture2D<float4> _GIWorldDebugOutput;
+float4x4 _GIInverseViewProjection;
+float3 _GICameraPosition;
+float _GIMaxTraceDistance;
+uint2 _GIOutputSize;
+uint _GIDebugMode;
+uint _GIWorldCurrentGeneration;
+
+bool GITraceLevel(
+    uint levelIndex,
+    float3 rayOrigin,
+    float3 rayDirection,
+    float minDistance,
+    float maxDistance,
+    out float hitT,
+    out int hitBrick,
+    out uint hitCell,
+    out uint steps,
+    out float coveredUntil)
+{
+    GIWorldLevelData level = _GIWorldLevels[levelIndex];
+    float3 boundsMin = (float3)(level.originBrick * GI_WORLD_BRICK_SIZE) * level.cellSize;
+    float3 boundsMax = boundsMin + GI_WORLD_PAGE_AXIS * GI_WORLD_BRICK_SIZE * level.cellSize;
+    float entryT;
+    float exitT;
+    hitT = maxDistance;
+    hitBrick = -1;
+    hitCell = 0u;
+    steps = 0u;
+    coveredUntil = minDistance;
+    if (!GIRayBox(rayOrigin, rayDirection, boundsMin, boundsMax, maxDistance, entryT, exitT))
+        return false;
+
+    float t = max(minDistance, entryT);
+    coveredUntil = max(t, exitT);
+    float stepSize = level.cellSize * 0.75;
+    [loop]
+    for (uint step = 0u; step < 1024u && t <= exitT; step++)
+    {
+        steps++;
+        float3 position = rayOrigin + rayDirection * t;
+        int3 worldCell = (int3)floor(position / level.cellSize);
+        int physicalBrick;
+        uint localCell;
+        if (GIReadOccupied(level, _GIWorldPageTable, _GIWorldBricks,
+                           _GIWorldOccupancy, worldCell, physicalBrick, localCell))
+        {
+            hitT = t;
+            hitBrick = physicalBrick;
+            hitCell = localCell;
+            return true;
+        }
+        // Distance is currently a strict 0/1 lower bound. It is already part of the ABI,
+        // but node 1 deliberately prioritizes correctness over empty-space skipping.
+        t += stepSize;
+    }
+    return false;
+}
+
+float3 GILevelColor(uint level)
+{
+    if (level == 0u) return float3(0.15, 0.9, 0.25);
+    if (level == 1u) return float3(0.1, 0.55, 1.0);
+    if (level == 2u) return float3(1.0, 0.65, 0.1);
+    return float3(0.85, 0.2, 0.9);
+}
+
+[numthreads(8, 8, 1)]
+void TraceWorldDebug(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= _GIOutputSize)) return;
+    float2 uv = (float2(dispatchId.xy) + 0.5) / float2(_GIOutputSize);
+    float2 ndc = uv * 2.0 - 1.0;
+    float4 nearWorld = mul(_GIInverseViewProjection, float4(ndc, 0.0, 1.0));
+    float4 farWorld = mul(_GIInverseViewProjection, float4(ndc, 1.0, 1.0));
+    nearWorld.xyz /= max(abs(nearWorld.w), 1e-6);
+    farWorld.xyz /= max(abs(farWorld.w), 1e-6);
+    float3 nearDirection = nearWorld.xyz - _GICameraPosition;
+    float3 farDirection = farWorld.xyz - _GICameraPosition;
+    float3 direction = normalize(dot(nearDirection, nearDirection) > dot(farDirection, farDirection)
+        ? nearDirection : farDirection);
+
+    bool hit = false;
+    uint hitLevel = 0u;
+    int hitBrick = -1;
+    uint hitCell = 0u;
+    uint totalSteps = 0u;
+    float continuation = 0.0;
+    float hitDistance = _GIMaxTraceDistance;
+    [loop]
+    for (uint level = 0u; level < GI_WORLD_LEVEL_COUNT; level++)
+    {
+        float candidateT;
+        int candidateBrick;
+        uint candidateCell;
+        uint steps;
+        float coveredUntil;
+        bool candidate = GITraceLevel(level, _GICameraPosition, direction,
+            continuation, _GIMaxTraceDistance, candidateT, candidateBrick,
+            candidateCell, steps, coveredUntil);
+        totalSteps += steps;
+        if (candidate)
+        {
+            hit = true;
+            hitLevel = level;
+            hitBrick = candidateBrick;
+            hitCell = candidateCell;
+            hitDistance = candidateT;
+            break;
+        }
+        continuation = max(continuation, coveredUntil);
+    }
+
+    if (!hit)
+    {
+        _GIWorldDebugOutput[dispatchId.xy] = float4(0.01, 0.015, 0.025, 1.0);
+        return;
+    }
+
+    uint address = (uint)hitBrick * GI_WORLD_CELLS_PER_BRICK + hitCell;
+    uint surfaceAddress = address * GI_WORLD_SURFACE_WORDS_PER_CELL;
+    uint normalPacked = _GIWorldSurface[surfaceAddress];
+    bool naniteSurface = (normalPacked & (1u << 31u)) != 0u;
+    uint packedBaseColor = _GIWorldSurface[surfaceAddress + 1u];
+    float3 normal = GIUnpackOctNormal(normalPacked);
+    float3 baseColor = float3(packedBaseColor & 255u,
+        (packedBaseColor >> 8u) & 255u, (packedBaseColor >> 16u) & 255u) / 255.0;
+    float confidence = 1.0 - (float)hitLevel / GI_WORLD_LEVEL_COUNT * 0.35;
+
+    float3 color;
+    if (_GIDebugMode == 1u)
+        color = GILevelColor(hitLevel) * confidence;
+    else if (_GIDebugMode == 2u)
+        color = normal * 0.5 + 0.5;
+    else if (_GIDebugMode == 3u)
+        color = baseColor;
+    else if (_GIDebugMode == 4u)
+        color = confidence.xxx;
+    else if (_GIDebugMode == 5u)
+        color = naniteSurface ? float3(0.0, 0.85, 1.0) : float3(1.0, 0.35, 0.05);
+    else if (_GIDebugMode == 6u)
+        color = _GIWorldBricks[hitBrick].generation == _GIWorldCurrentGeneration
+            ? float3(1.0, 0.1, 0.85)
+            : float3(0.08, 0.12, 0.18);
+    else
+        color = baseColor * (0.25 + 0.75 * saturate(dot(normal, normalize(float3(0.4, 0.8, 0.2)))))
+            * GILevelColor(hitLevel);
+
+    _GIWorldDebugOutput[dispatchId.xy] = float4(color, 1.0);
+}

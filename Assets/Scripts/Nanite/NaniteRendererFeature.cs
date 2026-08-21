@@ -389,6 +389,8 @@ namespace Nanite
             public static readonly int NaniteSoftwareDepth = Shader.PropertyToID("_NaniteSoftwareDepth");
             public static readonly int NaniteSoftwareWinner = Shader.PropertyToID("_NaniteSoftwareWinner");
             public static readonly int NaniteSoftwareClusters = Shader.PropertyToID("_NaniteSoftwareClusters");
+            public static readonly int RealtimeGIDiffuseEnabled =
+                Shader.PropertyToID("_RealtimeGIDiffuseEnabled");
             public static readonly int NaniteSoftwareTileList = Shader.PropertyToID("_NaniteSoftwareTileList");
             public static readonly int NaniteSoftwareScreenWidth = Shader.PropertyToID("_NaniteSoftwareScreenWidth");
             public static readonly int NaniteSoftwareScreenHeight = Shader.PropertyToID("_NaniteSoftwareScreenHeight");
@@ -1463,7 +1465,7 @@ namespace Nanite
             eFormal = Mathf.Clamp(
                 eFormal,
                 (int)RenderPassEvent.AfterRenderingGbuffer + 1,
-                (int)RenderPassEvent.BeforeRenderingDeferredLights - 1);
+                (int)RenderPassEvent.BeforeRenderingDeferredLights - 2);
             passFormalVisibility.renderPassEvent = (RenderPassEvent)eFormal;
 
             if (!loggedPassOrderWarning &&
@@ -3648,6 +3650,7 @@ namespace Nanite
             internal Material material;
             internal Camera camera;
             internal TextureHandle vbuffer;
+            internal bool realtimeGIDiffuseEnabled;
             internal bool writeToGBuffer;
             internal bool useGBufferDepthSlice;
             internal bool useTileMaterialMask;
@@ -4503,6 +4506,7 @@ namespace Nanite
                 passData.material = resolveMaterial;
                 passData.camera = camera;
                 passData.vbuffer = vbuffer;
+                passData.realtimeGIDiffuseEnabled = resourceData.realtimeGIDiffuseEnabled;
                 passData.writeToGBuffer = true;
                 passData.useGBufferDepthSlice = hasGBufferDepthSlice;
                 // 只能读取本视图、本帧确实执行过 classify 的 mask；仅检查 buffer 是否存在会读到陈旧数据。
@@ -4541,6 +4545,7 @@ namespace Nanite
                         data.material,
                         data.camera,
                         data.vbuffer,
+                        data.realtimeGIDiffuseEnabled,
                         data.useGBufferDepthSlice,
                         data.useTileMaterialMask,
                         data.screenWidth,
@@ -6314,6 +6319,7 @@ namespace Nanite
             Material material,
             Camera camera,
             TextureHandle vbuffer,
+            bool realtimeGIDiffuseEnabled,
             bool useGBufferDepthSlice,
             bool useTileMaterialMask,
             int screenWidth,
@@ -6325,6 +6331,10 @@ namespace Nanite
             if (material == null ||
                 !TryBindFormalResolveScene(cmd, camera, vbuffer, screenWidth, screenHeight, vbufferWidth, vbufferHeight, out _))
                 return;
+
+            cmd.SetGlobalFloat(
+                ShaderIds.RealtimeGIDiffuseEnabled,
+                realtimeGIDiffuseEnabled ? 1.0f : 0.0f);
 
             bool useCompactVBuffer = CanUseCompactFormalVBuffer();
             ConfigureFormalResolveMaterialKeywords(
@@ -6510,6 +6520,7 @@ namespace Nanite
             cmd.SetGlobalFloat(ShaderIds.ResolveMaterialMode, 0f);
             cmd.SetGlobalFloat(ShaderIds.ResolveAbsorbedFamily, 0f);
             cmd.SetGlobalFloat(ShaderIds.UseCompactedTileBins, 0f);
+            cmd.SetGlobalFloat(ShaderIds.RealtimeGIDiffuseEnabled, 0.0f);
 
             RecordFormalPerfSample(1, drawCount, sceneVisibilityBackend.MaterialCount, 1f);
 

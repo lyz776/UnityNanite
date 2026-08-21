@@ -9,17 +9,26 @@ MonoBehaviour:
   m_GameObject: {fileID: 0}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 31c35a5653c34aa78673086e7c2e6032, type: 3}
-  m_Name: RealtimeGIRendererFeature
-  m_EditorClassIdentifier: RealtimeGI::RealtimeGI.RealtimeGIRendererFeature
+  m_Script: {fileID: 11500000, guid: 72dc485af9fc413ca930d1d911201442, type: 3}
+  m_Name: GIWorldRendererFeature
+  m_EditorClassIdentifier: Assembly-CSharp::UnityNanite.GI.GIWorldRendererFeature
   m_Active: 1
   settings:
     enableInSceneView: 1
+    enableDebug: 0
+    debugMode: 14
     diffuseIntensity: 1
-    enableGlossy: 1
-    glossyIntensity: 1
-    screenLightingShader: {fileID: 7200000, guid: 8ecfe36bca684db9be134731e21828c9, type: 3}
-    compositeShader: {fileID: 4800000, guid: 97a6c21fe47943a0a46becfd0f7a4230, type: 3}
+    stylizedDiffuse: 1
+    stylizedShadowThreshold: 1
+    stylizedShadowSoftness: 1
+    diffuseTraceDistance: 80
+    maxTraceDistance: 2000
+    worldBuildShader: {fileID: 7200000, guid: 89b3bc47f4fb442f9f0ab7571937fd27, type: 3}
+    worldDebugShader: {fileID: 7200000, guid: 67fc82c9bb45449ca57f41c18b56bbfd, type: 3}
+    screenSurfaceShader: {fileID: 7200000, guid: 82ab3c06d9fa42c6bb3827df456ef225, type: 3}
+    screenProbeShader: {fileID: 7200000, guid: 9a070602b6fb48eda698c14307d9afcc, type: 3}
+    diffuseCompositeShader: {fileID: 4800000, guid: d287e13814264023b8fc9a2fb256ce63, type: 3}
+    screenProbeTileSize: 8
 --- !u!114 &-1619528804519490273
 MonoBehaviour:
   m_ObjectHideFlags: 0

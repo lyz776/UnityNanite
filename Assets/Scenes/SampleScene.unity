@@ -1681,13 +1681,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 55066533}
   serializedVersion: 2
-  m_LocalRotation: {x: -0.95056546, y: -0.30899101, z: 0.029561704, w: 0.00872137}
-  m_LocalPosition: {x: 0, y: 4.91, z: -0.4}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -106.6, y: -3.93, z: 0.8}
   m_LocalScale: {x: 116.41339, y: 4.835038, z: 67.082214}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: -180.097, y: 3.5310059, z: -36.011993}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &57329539
 GameObject:
   m_ObjectHideFlags: 0
@@ -22697,8 +22697,6 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 910652240}
-  - component: {fileID: 910652242}
-  - component: {fileID: 910652241}
   m_Layer: 0
   m_Name: GameObject
   m_TagString: Untagged
@@ -22721,87 +22719,6 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &910652241
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 910652239}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: a3a630c632e14c68b4cfb27d955aeb54, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: RealtimeGI::RealtimeGI.GIClipmapSystem
-  scene: {fileID: 910652242}
-  focus: {fileID: 0}
-  clipmapBuildShader: {fileID: 7200000, guid: 790a50f237d4412498b39e6080e94ead, type: 3}
-  radianceCacheShader: {fileID: 7200000, guid: 30f3127bad3bde848b65ed9ed0e26577, type: 3}
-  staticBrickCapacity: 8192
-  dynamicBrickCapacity: 2048
-  maxCellsPerTriangle: 4096
-  maxVoxelWorkItems: 65535
-  distancePropagationPasses: 7
-  staticGeometryBricksPerFrame: 8
-  dynamicGeometryBricksPerFrame: 12
-  staticRadianceBricksPerFrame: 12
-  dynamicRadianceBricksPerFrame: 24
-  enableRadianceShadows: 1
-  radianceShadowDistance: 80
-  maxUploadedLocalLights: 2048
-  maxLocalLightsPerBrick: 32
-  maxShadowedLocalLightsPerSurface: 2
-  secondaryBounceRays: 1
-  secondaryBounceIntensity: 1
-  skyIrradianceScale: 1
-  mainLightBounceScale: 1
-  staticBounceSweeps: 3
-  radianceHistoryWeight: 0.65
-  radianceClamp: 32
-  materialTextureResolution: 128
-  automaticUpdate: 1
-  enableAsyncCompute: 1
-  generation: 1030982
-  staticBrickCount: 0
-  dynamicBrickCount: 0
-  droppedStaticBricks: 0
-  droppedDynamicBricks: 0
-  streamedVertexCount: 47463
-  streamedTriangleCount: 40826
-  invalidGeometryCount: 0
-  invalidatedStaticBrickCount: 0
-  invalidatedDynamicBrickCount: 0
-  staticVoxelWorkOverflow: 0
-  dynamicVoxelWorkOverflow: 0
-  pendingStaticRadianceBricks: 0
-  pendingDynamicRadianceBricks: 0
-  updatedRadianceBricks: 0
-  activeLocalLightCount: 0
-  remainingStaticBounceSweeps: 0
-  estimatedPoolMiB: 399.13583
---- !u!114 &910652242
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 910652239}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 2be67ef39a3e429ea725893ab3cfbfb0, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: RealtimeGI::RealtimeGI.RealtimeGIScene
-  automaticUpdate: 1
-  includeOrdinaryMeshes: 1
-  includeSkinnedMeshes: 1
-  includeNaniteMeshes: 1
-  sceneRevision: 1381115
-  instanceCount: 434
-  geometryCount: 3
-  materialCount: 8
-  materialBindingCount: 436
-  emissiveAliasCount: 32
-  materialSlotOverflowCount: 0
 --- !u!1 &911724303
 GameObject:
   m_ObjectHideFlags: 0
@@ -49764,11 +49681,11 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 4768363337982011800, guid: c1758b19eebaee348b2678246184e2ad, type: 3}
       propertyPath: intensity
-      value: 1.3148041
+      value: 0.7785244
       objectReference: {fileID: 0}
     - target: {fileID: 4768363337982011800, guid: c1758b19eebaee348b2678246184e2ad, type: 3}
       propertyPath: allowOffScreen
-      value: 1
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 4768363337982011800, guid: c1758b19eebaee348b2678246184e2ad, type: 3}
       propertyPath: m_LensFlareData
@@ -49872,7 +49789,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8892115874952329115, guid: c1758b19eebaee348b2678246184e2ad, type: 3}
       propertyPath: allowOffScreen
-      value: 1
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 8892115874952329115, guid: c1758b19eebaee348b2678246184e2ad, type: 3}
       propertyPath: environmentOcclusion
@@ -59361,8 +59278,8 @@ Transform:
   - {fileID: 643278045}
   - {fileID: 1923424066}
   - {fileID: 1472570594}
-  - {fileID: 432474335}
   - {fileID: 909919067}
+  - {fileID: 432474335}
   - {fileID: 31753277}
   - {fileID: 1960264549}
   m_Father: {fileID: 0}

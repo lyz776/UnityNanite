@@ -1,0 +1,905 @@
+// Minimal Node 3 diffuse path. A small cosine direction set is traced per
+// low-resolution receiver, temporally accumulated, then reconstructed.
+#pragma kernel BuildGeometryNormals
+#pragma kernel PlacePrimaryProbes
+#pragma kernel TracePrimaryRays
+#pragma kernel TraceSpecularRays
+#pragma kernel ResolveDiffuseIrradiance
+#pragma kernel AccumulatePrimaryHistory
+#pragma kernel AccumulateSpecularHistory
+#pragma kernel FilterProbeCache
+#pragma kernel FilterSpecularCache
+#pragma kernel FilterDiffuseIrradiance
+#pragma kernel ResolveSpecularIrradiance
+#pragma kernel VisualizePrimaryProbes
+#pragma multi_compile _ _GBUFFER_NORMALS_OCT
+#pragma target 5.0
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/GBufferCommon.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/BRDF.hlsl"
+#include "../../Shaders/GIWorldCommon.hlsl"
+
+static const float GI_PI = 3.14159265359;
+Texture2D<float> _GIDepthTexture;
+Texture2D<float4> _GINormalTexture;
+Texture2D<float4> _GIScreenSurfaceInput;
+Texture2D<float4> _GICameraColorInput;
+Texture2D<float4> _GISpecularBaseInput;
+Texture2D<float4> _GISpecularMaterialInput;
+RWTexture2D<float4> _GIGeometryNormal;
+RWTexture2D<float4> _GIProbeReceiverPosition;
+RWTexture2D<float4> _GIProbeReceiverNormal;
+RWTexture2D<uint2> _GIProbeReceiverPixel;
+RWTexture2D<float4> _GIPrimaryIrradiance;
+RWTexture2D<float4> _GIPrimarySpecular;
+Texture2D<float4> _GIPrimarySpecularDebugInput;
+Texture2D<float4> _GIPrimarySpecularInput;
+RWTexture2D<float4> _GIRawIrradiance;
+Texture2D<float4> _GIHistoryIrradianceInput;
+Texture2D<float4> _GIHistoryPositionInput;
+Texture2D<float4> _GIHistoryNormalInput;
+Texture2D<float4> _GIHistoryMomentsInput;
+RWTexture2D<float4> _GIHistoryIrradianceOutput;
+RWTexture2D<float4> _GIHistoryPositionOutput;
+RWTexture2D<float4> _GIHistoryNormalOutput;
+RWTexture2D<float4> _GIHistoryMomentsOutput;
+Texture2D<float4> _GISpecularHistoryInput;
+RWTexture2D<float4> _GISpecularHistoryOutput;
+Texture2D<float4> _GISpecularHistoryOutputInput;
+RWTexture2D<float4> _GIFilteredProbeIrradiance;
+RWTexture2D<float4> _GIFilteredSpecular;
+Texture2D<float4> _GIFilteredSpecularInput;
+RWTexture2D<float4> _GIResolvedIrradiance;
+RWTexture2D<float4> _GIResolvedSpecular;
+RWTexture2D<float4> _GIProbeDebug;
+Texture2D<float4> _GIResolvedSpecularInput;
+
+// Read-only aliases keep reconstruction and history kernels on SRV slots.  The
+// corresponding RW resources above are used only by the kernels that produce them.
+Texture2D<float4> _GIGeometryNormalInput;
+Texture2D<float4> _GIProbeReceiverPositionInput;
+Texture2D<float4> _GIProbeReceiverNormalInput;
+Texture2D<uint2> _GIProbeReceiverPixelInput;
+Texture2D<float4> _GIPrimaryIrradianceInput;
+Texture2D<float4> _GIFilteredProbeIrradianceInput;
+
+StructuredBuffer<GIWorldLevelData> _GIWorldLevels;
+StructuredBuffer<int> _GIWorldPageTable;
+StructuredBuffer<GIWorldBrickData> _GIWorldBricks;
+StructuredBuffer<uint> _GIWorldOccupancy;
+StructuredBuffer<uint> _GIWorldSurface;
+StructuredBuffer<uint> _GIWorldDistance;
+
+float4x4 _GIInverseViewProjection;
+float4x4 _GIViewProjection;
+float4x4 _GIPreviousViewProjection;
+float3 _GICameraPosition;
+float3 _GIMainLightDirection;
+float3 _GIMainLightColor;
+float3 _GIEnvironmentSkyColor;
+float _GIEnvironmentIntensity;
+float _GITraceDistance;
+uint2 _GIScreenSize;
+uint2 _GIProbeGridSize;
+uint _GIProbeTileSize;
+uint _GIProbeDebugMode;
+
+uint _GIHasMainLight;
+uint _GIFrameIndex;
+uint _GIHistoryValid;
+
+
+bool GIIsBackground(float depth)
+{
+#if UNITY_REVERSED_Z
+    return depth <= 1e-6;
+#else
+    return depth >= 0.999999;
+#endif
+}
+
+float3 GIReadSkyFromCamera(float3 direction)
+{
+    float3 samplePosition = _GICameraPosition + normalize(direction) * 1000.0;
+    float2 uv = ComputeNormalizedDeviceCoordinates(samplePosition, _GIViewProjection);
+    if (any(uv <= 0.001) || any(uv >= 0.999)) return 0.0;
+    uint2 pixel = min((uint2)(uv * _GIScreenSize), _GIScreenSize - 1u);
+    float depth = _GIDepthTexture.Load(int3(pixel, 0));
+    if (!GIIsBackground(depth)) return 0.0;
+    return max(0.0, _GICameraColorInput.Load(int3(pixel, 0)).rgb);
+}
+
+bool GILoadPosition(uint2 pixel, out float3 position)
+{
+    float depth = _GIDepthTexture.Load(int3(pixel, 0));
+    if (GIIsBackground(depth))
+    {
+        position = 0.0;
+        return false;
+    }
+    float2 uv = (float2(pixel) + 0.5) / float2(_GIScreenSize);
+    position = ComputeWorldSpacePosition(uv, depth, _GIInverseViewProjection);
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void BuildGeometryNormals(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIScreenSize)) return;
+    uint2 p = id.xy;
+    float3 center;
+    if (!GILoadPosition(p, center))
+    {
+        _GIGeometryNormal[p] = 0.0;
+        return;
+    }
+    uint2 px0 = uint2(p.x > 0u ? p.x - 1u : p.x, p.y);
+    uint2 px1 = uint2(min(p.x + 1u, _GIScreenSize.x - 1u), p.y);
+    uint2 py0 = uint2(p.x, p.y > 0u ? p.y - 1u : p.y);
+    uint2 py1 = uint2(p.x, min(p.y + 1u, _GIScreenSize.y - 1u));
+    float3 x0, x1, y0, y1;
+    bool vx0 = GILoadPosition(px0, x0), vx1 = GILoadPosition(px1, x1);
+    bool vy0 = GILoadPosition(py0, y0), vy1 = GILoadPosition(py1, y1);
+    float3 dx = vx1 && (!vx0 || distance(x1, center) <= distance(x0, center))
+        ? x1 - center : vx0 ? center - x0 : 0.0;
+    float3 dy = vy1 && (!vy0 || distance(y1, center) <= distance(y0, center))
+        ? y1 - center : vy0 ? center - y0 : 0.0;
+    float3 display = normalize(UnpackGBufferNormal(_GINormalTexture.Load(int3(p, 0)).xyz));
+    float3 c = cross(dx, dy);
+    float3 normal = dot(c, c) > 1e-12 ? normalize(c) : display;
+    if (dot(normal, display) < 0.0) normal = -normal;
+    _GIGeometryNormal[p] = float4(normal, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void PlacePrimaryProbes(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    uint2 begin = id.xy * _GIProbeTileSize;
+    uint2 end = min(begin + _GIProbeTileSize, _GIScreenSize);
+    int2 center = int2(begin + (end - begin) / 2u);
+    uint2 selected = begin;
+    uint best = 0xffffffffu;
+    bool found = false;
+    for (uint y = begin.y; y < end.y; y++)
+    for (uint x = begin.x; x < end.x; x++)
+    {
+        uint2 p = uint2(x, y);
+        float3 unused;
+        if (!GILoadPosition(p, unused)) continue;
+        int2 d = int2(p) - center;
+        uint d2 = (uint)dot(d, d);
+        if (!found || d2 < best) { found = true; best = d2; selected = p; }
+    }
+    if (!found)
+    {
+        _GIProbeReceiverPosition[id.xy] = 0.0;
+        _GIProbeReceiverNormal[id.xy] = 0.0;
+        _GIProbeReceiverPixel[id.xy] = begin;
+        _GIPrimaryIrradiance[id.xy] = 0.0;
+        return;
+    }
+    float3 position;
+    GILoadPosition(selected, position);
+    _GIProbeReceiverPosition[id.xy] = float4(position, 1.0);
+    _GIProbeReceiverNormal[id.xy] = _GIGeometryNormal.Load(int3(selected, 0));
+    _GIProbeReceiverPixel[id.xy] = selected;
+    _GIPrimaryIrradiance[id.xy] = 0.0;
+}
+
+float3 GICosineDirection(float3 position, uint sampleIndex, float3 normal)
+{
+    // World position rotates the fixed direction set continuously. Receiver motion
+    // therefore cannot cross a hash cell and suddenly select unrelated rays.
+    // Cranley-Patterson rotation: each receiver gets a stable spatial phase and
+    // advances through a low-discrepancy temporal sequence. The temporal resolve
+    // below is responsible for integrating these samples; raw frames are never
+    // consumed by final reconstruction.
+    float rotation = frac(dot(position, float3(0.071, 0.113, 0.173)) +
+                          (float)(_GIFrameIndex & 255u) * 0.61803398875);
+    float2 u = float2(
+        ((float)sampleIndex + 0.5) * 0.25,
+        frac(rotation + (float)sampleIndex * 0.61803398875));
+    float r = sqrt(u.x), angle = 2.0 * GI_PI * u.y;
+    float s, c; sincos(angle, s, c);
+    float3 local = float3(r * c, r * s, sqrt(max(0.0, 1.0 - u.x)));
+    float3 helper = abs(normal.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 tangent = normalize(cross(helper, normal));
+    return normalize(tangent * local.x + cross(normal, tangent) * local.y + normal * local.z);
+}
+
+bool GIProject(float3 position, out float2 uv)
+{
+    float4 clip = mul(_GIViewProjection, float4(position, 1.0));
+    if (clip.w <= 1e-5) { uv = 0.0; return false; }
+    // Match URP's render-texture convention. On D3D the Y flip is baked into
+    // the GPU projection matrix and must be undone when converting CS to NDC.
+    // This is the same helper used by the stable gi3 reprojection path.
+    uv = ComputeNormalizedDeviceCoordinates(position, _GIViewProjection);
+    return all(uv > 0.001) && all(uv < 0.999);
+}
+
+bool GITraceScreen(float3 origin, float3 direction, out uint2 hitPixel)
+{
+    float previousT = 0.1;
+    for (uint step = 0u; step < 32u; step++)
+    {
+        float t = previousT + max(0.12, previousT * 0.18);
+        if (t > min(_GITraceDistance, 40.0)) break;
+        float3 rayPosition = origin + direction * t;
+        float2 uv;
+        if (!GIProject(rayPosition, uv)) break;
+        uint2 pixel = min((uint2)(uv * _GIScreenSize), _GIScreenSize - 1u);
+        float3 scenePosition;
+        if (GILoadPosition(pixel, scenePosition))
+        {
+            float rayDepth = distance(rayPosition, _GICameraPosition);
+            float sceneDepth = distance(scenePosition, _GICameraPosition);
+            float thickness = 0.08 + sceneDepth * 0.0025;
+            if (rayDepth >= sceneDepth - thickness && rayDepth <= sceneDepth + thickness * 2.0)
+            {
+                float3 hitNormal = normalize(_GIGeometryNormal.Load(int3(pixel, 0)).xyz);
+                if (dot(hitNormal, -direction) > 0.05)
+                {
+                    hitPixel = pixel;
+                    return true;
+                }
+            }
+        }
+        previousT = t;
+    }
+    hitPixel = 0u;
+    return false;
+}
+
+bool GITraceWorld(float3 origin, float3 direction, out float3 radiance)
+{
+    float continuation = 0.0;
+    for (uint levelIndex = 0u; levelIndex < GI_WORLD_LEVEL_COUNT; levelIndex++)
+    {
+        GIWorldLevelData level = _GIWorldLevels[levelIndex];
+        float3 boundsMin = (float3)(level.originBrick * GI_WORLD_BRICK_SIZE) * level.cellSize;
+        float3 boundsMax = boundsMin + GI_WORLD_PAGE_AXIS * GI_WORLD_BRICK_SIZE * level.cellSize;
+        float entryT, exitT;
+        if (!GIRayBox(origin, direction, boundsMin, boundsMax, _GITraceDistance, entryT, exitT))
+            continue;
+        // Skip the receiver's own conservative voxel. Starting at the box entry
+        // immediately re-hits the source cell and creates fake self-bounce.
+        float t = max(max(continuation, entryT), level.cellSize * 1.5);
+        for (uint step = 0u; step < 512u && t <= exitT; step++)
+        {
+            int3 worldCell = (int3)floor((origin + direction * t) / level.cellSize);
+            int brick; uint cell;
+            if (GIReadOccupied(level, _GIWorldPageTable, _GIWorldBricks,
+                               _GIWorldOccupancy, worldCell, brick, cell))
+            {
+                uint address = (uint)brick * GI_WORLD_CELLS_PER_BRICK + cell;
+                uint surfaceAddress = address * GI_WORLD_SURFACE_WORDS_PER_CELL;
+                float3 normal = GIUnpackOctNormal(_GIWorldSurface[surfaceAddress]);
+                float3 baseColor = GIUnpackRgb8(_GIWorldSurface[surfaceAddress + 1u]);
+                float3 emission = GIUnpackRgbe8(_GIWorldSurface[surfaceAddress + 2u]);
+                float direct = _GIHasMainLight != 0u
+                    ? saturate(dot(normal, normalize(_GIMainLightDirection))) : 0.0;
+                radiance = emission + baseColor * _GIMainLightColor * direct * (1.0 / GI_PI);
+                return true;
+            }
+            t += level.cellSize * 0.75;
+        }
+        continuation = max(continuation, exitT);
+    }
+    // Keep the environment miss inline. Unity's compute importer compiles
+    // every helper for every kernel and older backends can reject a helper
+    // prototype/definition pair as an undeclared identifier.
+    radiance = max(0.0, _GIEnvironmentSkyColor * max(0.0, _GIEnvironmentIntensity));
+    return false;
+}
+
+float4 GITraceReceiver(float4 receiver, float3 normal)
+{
+    if (receiver.a <= 0.0) return 0.0;
+    float3 origin = receiver.xyz + normal * 0.08;
+    float3 radianceSum = 0.0;
+    for (uint sampleIndex = 0u; sampleIndex < 4u; sampleIndex++)
+    {
+        float3 direction = GICosineDirection(receiver.xyz, sampleIndex, normal);
+        float3 radiance = 0.0;
+        uint2 hitPixel;
+        if (GITraceScreen(origin, direction, hitPixel))
+        {
+            float4 hit = _GIScreenSurfaceInput.Load(int3(hitPixel, 0));
+            radiance = hit.a > 0.0 ? hit.rgb : 0.0;
+        }
+        else
+            GITraceWorld(origin, direction, radiance);
+        // Misses intentionally contribute zero. Dividing by the fixed sample count
+        // keeps sparse hits from being promoted to full-energy fireflies.
+        radianceSum += max(0.0, radiance);
+    }
+    return float4(radianceSum * (GI_PI * 0.25), 1.0);
+}
+
+float3 GITraceSpecular(float3 origin, float3 normal)
+{
+    float3 viewDirection = normalize(_GICameraPosition - origin);
+    float3 direction = normalize(reflect(-viewDirection, normal));
+    uint2 hitPixel;
+    if (GITraceScreen(origin + normal * 0.08, direction, hitPixel))
+    {
+        float4 hit = _GIScreenSurfaceInput.Load(int3(hitPixel, 0));
+        return hit.a > 0.0 ? max(0.0, hit.rgb) : 0.0;
+    }
+    float3 worldRadiance = 0.0;
+    GITraceWorld(origin + normal * 0.08, direction, worldRadiance);
+    return max(0.0, worldRadiance);
+}
+
+float3 GIReadScreenIncomingRadiance(uint2 pixel)
+{
+    float4 base = _GISpecularBaseInput.Load(int3(pixel, 0));
+    float4 material = _GISpecularMaterialInput.Load(int3(pixel, 0));
+    float3 normal = normalize(UnpackGBufferNormal(
+        _GINormalTexture.Load(int3(pixel, 0)).xyz));
+    float direct = _GIHasMainLight != 0u
+        ? saturate(dot(normal, normalize(_GIMainLightDirection))) : 0.0;
+    float3 emission = max(0.0, _GIScreenSurfaceInput.Load(int3(pixel, 0)).rgb);
+    float3 diffuse = base.rgb * _GIMainLightColor * direct * (1.0 / GI_PI);
+    uint flags = UnpackGBufferMaterialFlags(base.a);
+    if ((flags & kMaterialFlagSpecularSetup) != 0u)
+        diffuse *= max(0.0, 1.0 - ReflectivitySpecular(material.rgb));
+    else
+        diffuse *= max(0.0, 1.0 - saturate(material.r) * 0.96);
+    return max(0.0, diffuse + emission);
+}
+
+float3 GIGetSpecularF0(uint2 pixel, out float smoothness)
+{
+    float4 base = _GISpecularBaseInput.Load(int3(pixel, 0));
+    float4 material = _GISpecularMaterialInput.Load(int3(pixel, 0));
+    float4 packedNormal = _GINormalTexture.Load(int3(pixel, 0));
+    smoothness = saturate(packedNormal.a);
+    uint flags = UnpackGBufferMaterialFlags(base.a);
+    if ((flags & kMaterialFlagSpecularSetup) != 0u)
+        return max(0.0, material.rgb);
+    // URP's metallic GBuffer stores reflectivity in GBuffer1.r, not the
+    // source metallic slider. Recover the metallic value before constructing
+    // F0; treating reflectivity as metallic makes dielectric F0 depend on the
+    // base colour and breaks the smoothness/energy response.
+    float reflectivity = saturate(material.r);
+    float metallic = saturate((reflectivity - 0.04) / 0.96);
+    return lerp(0.04.xxx, base.rgb, metallic);
+}
+
+float3 GIEvaluateSpecular(float3 normal, float3 viewDirection, float3 lightDirection,
+                          float3 f0, float smoothness)
+{
+    float NoV = saturate(dot(normal, viewDirection));
+    float NoL = saturate(dot(normal, lightDirection));
+    if (NoV <= 1e-4 || NoL <= 1e-4) return 0.0.xxx;
+    float3 halfDirection = normalize(viewDirection + lightDirection);
+    float NoH = saturate(dot(normal, halfDirection));
+    float VoH = saturate(dot(viewDirection, halfDirection));
+    float roughness = max(0.045, 1.0 - smoothness);
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float denominator = max(1e-4, NoH * NoH * (alpha2 - 1.0) + 1.0);
+    float D = alpha2 / (GI_PI * denominator * denominator);
+    float k = (roughness + 1.0); k = k * k * 0.125;
+    float Gv = NoV / lerp(NoV, 1.0, k);
+    float Gl = NoL / lerp(NoL, 1.0, k);
+    float3 F = f0 + (1.0.xxx - f0) * pow(1.0 - VoH, 5.0);
+    float3 brdf = D * Gv * Gl * F / max(4.0 * NoV * NoL, 1e-4);
+    // Importance sampling already accounts for the lobe. Do not apply a second
+    // artistic energy clamp here: it makes narrow (high-smoothness) lobes go
+    // dark when only a few valid samples are available.
+    return brdf * NoL;
+}
+
+uint GIHash(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16u);
+}
+
+float2 GISpecularSample(uint2 pixel, uint sampleIndex)
+{
+    uint seed = GIHash(pixel.x * 1973u + pixel.y * 9277u +
+                       _GIFrameIndex * 26699u + sampleIndex * 7919u);
+    float u0 = (float(sampleIndex) + 0.5) / 8.0;
+    float u1 = frac((float)(seed & 0x00ffffffu) / 16777216.0 +
+                    (float)(_GIFrameIndex & 255u) * 0.61803398875);
+    return float2(u0, u1);
+}
+
+void GIImportanceSampleGGX(float2 u, float roughness, float3 normal,
+                           float3 viewDirection, out float3 lightDirection,
+                           out float pdf)
+{
+    float alpha = max(0.045, roughness * roughness);
+    float phi = 2.0 * GI_PI * u.y;
+    float cosTheta = sqrt((1.0 - u.x) / max(1.0 + (alpha * alpha - 1.0) * u.x, 1e-5));
+    float sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
+    float s, c; sincos(phi, s, c);
+    float3 helper = abs(normal.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 tangent = normalize(cross(helper, normal));
+    float3 bitangent = cross(normal, tangent);
+    float3 halfVector = normalize(tangent * (sinTheta * c) +
+                                   bitangent * (sinTheta * s) + normal * cosTheta);
+    if (dot(halfVector, viewDirection) < 0.0) halfVector = -halfVector;
+    lightDirection = normalize(reflect(-viewDirection, halfVector));
+    float NoH = saturate(dot(normal, halfVector));
+    float VoH = saturate(dot(viewDirection, halfVector));
+    float alpha2 = alpha * alpha;
+    float denominator = max(1e-4, NoH * NoH * (alpha2 - 1.0) + 1.0);
+    float D = alpha2 / (GI_PI * denominator * denominator);
+    pdf = max(1e-4, D * NoH / max(4.0 * VoH, 1e-4));
+}
+
+[numthreads(8, 8, 1)]
+void TracePrimaryRays(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    float4 p = _GIProbeReceiverPosition.Load(int3(id.xy, 0));
+    float3 n = normalize(_GIProbeReceiverNormal.Load(int3(id.xy, 0)).xyz);
+    _GIPrimaryIrradiance[id.xy] = GITraceReceiver(p, n);
+}
+
+[numthreads(8, 8, 1)]
+void TraceSpecularRays(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    float4 receiver = _GIProbeReceiverPosition.Load(int3(id.xy, 0));
+    float4 receiverNormal = _GIProbeReceiverNormal.Load(int3(id.xy, 0));
+    if (receiver.a <= 0.0 || receiverNormal.a <= 0.0)
+    {
+        _GIPrimarySpecular[id.xy] = 0.0;
+        return;
+    }
+    uint2 pixel = _GIProbeReceiverPixel.Load(int3(id.xy, 0));
+    float smoothness;
+    float3 f0 = GIGetSpecularF0(pixel, smoothness);
+    float roughness = saturate(1.0 - smoothness);
+    float3 viewDirection = normalize(_GICameraPosition - receiver.xyz);
+    float3 normal = normalize(receiverNormal.xyz);
+    float3 radianceSum = 0.0;
+    const uint sampleCount = 8u;
+    [unroll]
+    for (uint sampleIndex = 0u; sampleIndex < sampleCount; sampleIndex++)
+    {
+        float3 direction; float pdf;
+        GIImportanceSampleGGX(GISpecularSample(pixel, sampleIndex), roughness,
+                              normal, viewDirection, direction, pdf);
+        if (dot(normal, direction) <= 0.001) continue;
+        float3 radiance = 0.0; uint2 hitPixel; bool hit;
+        hit = GITraceScreen(receiver.xyz + normal * 0.08, direction, hitPixel);
+        if (hit) radiance = GIReadScreenIncomingRadiance(hitPixel);
+        else hit = GITraceWorld(receiver.xyz + normal * 0.08, direction, radiance);
+        if (!hit)
+        {
+            // Prefer the actual TOD sky rendered this frame (including clouds)
+            // over the constant fallback colour. The depth test prevents scene
+            // surfaces from being sampled as if they were sky.
+            float3 cameraSky = GIReadSkyFromCamera(direction);
+            if (max(cameraSky.r, max(cameraSky.g, cameraSky.b)) > 1e-5)
+                radiance = cameraSky;
+        }
+        // A world miss still returns the TOD environment radiance. Treat it as a
+        // valid low-frequency sample; otherwise smooth surfaces become black
+        // simply because their narrow lobe misses scene geometry.
+        if (!hit && max(radiance.r, max(radiance.g, radiance.b)) <= 1e-5)
+            radiance = 0.0;
+        float3 brdfWeight = GIEvaluateSpecular(normal, viewDirection, direction, f0, smoothness);
+        // Ratio-estimator form used by AKGI: BRDF * NoL / sampling PDF.
+        radianceSum += radiance * brdfWeight / pdf;
+    }
+    // Fixed-count estimator: black misses remain valid observations. This keeps
+    // temporal history stable instead of amplifying whichever rays happened to hit.
+    _GIPrimarySpecular[id.xy] = float4(max(0.0, radianceSum / sampleCount), 1.0);
+}
+
+void GIAccumulateCandidate(float3 position, float3 normal, uint2 pixel, int2 probe,
+                           inout float3 sum, inout float weightSum)
+{
+    if (any(probe < 0) || any(probe >= int2(_GIProbeGridSize))) return;
+    float4 receiver = _GIProbeReceiverPositionInput.Load(int3(probe, 0));
+    if (receiver.a <= 0.0) return;
+    float3 receiverNormal = normalize(
+        _GIProbeReceiverNormalInput.Load(int3(probe, 0)).xyz);
+    float normalWeight = saturate((dot(normal, receiverNormal) - 0.45) / 0.55);
+    float receiverDepth = distance(receiver.xyz, _GICameraPosition);
+    float positionDepth = distance(position, _GICameraPosition);
+    float depthLimit = max(0.3, positionDepth * 0.04);
+    float depthWeight = saturate(1.0 - abs(receiverDepth - positionDepth) / depthLimit);
+    uint2 receiverPixel = _GIProbeReceiverPixelInput.Load(int3(probe, 0));
+    float pixelWeight = rcp(1.0 + length(float2(int2(receiverPixel) - int2(pixel))) /
+                            max(1.0, (float)_GIProbeTileSize));
+    float weight = normalWeight * depthWeight * pixelWeight;
+    float4 irradiance = _GIFilteredProbeIrradianceInput.Load(int3(probe, 0));
+    // Alpha describes receiver validity, not whether a ray happened to hit. A valid
+    // zero estimate must participate or isolated hits turn into bright probe pixels.
+    if (irradiance.a <= 0.0) return;
+    sum += irradiance.rgb * weight;
+    weightSum += weight;
+}
+
+[numthreads(8, 8, 1)]
+void ResolveDiffuseIrradiance(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIScreenSize)) return;
+    float3 position;
+    if (!GILoadPosition(id.xy, position))
+    {
+        _GIRawIrradiance[id.xy] = 0.0;
+        return;
+    }
+    float3 normal = normalize(_GIGeometryNormalInput.Load(int3(id.xy, 0)).xyz);
+    int2 center = int2(id.xy / _GIProbeTileSize);
+    float3 sum = 0.0;
+    float weightSum = 0.0;
+    for (int y = -2; y <= 2; y++)
+    for (int x = -2; x <= 2; x++)
+    {
+        int2 probe = center + int2(x, y);
+        GIAccumulateCandidate(position, normal, id.xy, probe, sum, weightSum);
+    }
+    _GIRawIrradiance[id.xy] = float4(
+        weightSum > 1e-5 ? sum / weightSum : 0.0, weightSum > 1e-5 ? 1.0 : 0.0);
+}
+
+bool GIReprojectProbeHistory(float3 position, float3 normal,
+                             out uint2 historyProbe, out float historyAge)
+{
+    historyProbe = 0u;
+    historyAge = 0.0;
+    if (_GIHistoryValid == 0u) return false;
+    float4 clip = mul(_GIPreviousViewProjection, float4(position, 1.0));
+    if (clip.w <= 1e-5) return false;
+    float2 uv = ComputeNormalizedDeviceCoordinates(
+        position, _GIPreviousViewProjection);
+    if (any(uv <= 0.001) || any(uv >= 0.999)) return false;
+    int2 center = int2(min((uint2)(uv * _GIScreenSize) / _GIProbeTileSize,
+                           _GIProbeGridSize - 1u));
+    float positionLimit = max(0.15, distance(position, _GICameraPosition) * 0.025);
+    float bestDistance = positionLimit;
+    bool found = false;
+    for (int y = -1; y <= 1; y++)
+    for (int x = -1; x <= 1; x++)
+    {
+        int2 candidate = center + int2(x, y);
+        if (any(candidate < 0) || any(candidate >= int2(_GIProbeGridSize))) continue;
+        uint2 candidateProbe = (uint2)candidate;
+        float4 oldPosition = _GIHistoryPositionInput.Load(int3(candidateProbe, 0));
+        float4 oldNormal = _GIHistoryNormalInput.Load(int3(candidateProbe, 0));
+        float4 oldIrradiance = _GIHistoryIrradianceInput.Load(int3(candidateProbe, 0));
+        if (oldPosition.a <= 0.0 || oldNormal.a <= 0.0 || oldIrradiance.a <= 0.0 ||
+            dot(normalize(oldNormal.xyz), normal) < 0.8)
+            continue;
+        float candidateDistance = distance(oldPosition.xyz, position);
+        if (candidateDistance >= bestDistance) continue;
+        found = true;
+        bestDistance = candidateDistance;
+        historyProbe = candidateProbe;
+        historyAge = oldIrradiance.a;
+    }
+    return found;
+}
+
+void GIAccumulateHistory(uint2 probe, float4 receiver,
+                         float4 receiverNormal, float4 current)
+{
+    if (receiver.a <= 0.0 || receiverNormal.a <= 0.0 || current.a <= 0.0)
+    {
+        _GIHistoryIrradianceOutput[probe] = 0.0;
+        _GIHistoryPositionOutput[probe] = 0.0;
+        _GIHistoryNormalOutput[probe] = 0.0;
+        _GIHistoryMomentsOutput[probe] = 0.0;
+        return;
+    }
+    float3 position = receiver.xyz;
+    float3 normal = normalize(receiverNormal.xyz);
+    uint2 historyProbe;
+    float historyAge;
+    float3 result = current.rgb;
+    float currentLuminance = dot(max(0.0, current.rgb),
+        float3(0.2126, 0.7152, 0.0722));
+    float2 moments = float2(currentLuminance,
+        currentLuminance * currentLuminance);
+    if (GIReprojectProbeHistory(position, normal, historyProbe, historyAge))
+    {
+        float3 history = max(0.0, _GIHistoryIrradianceInput.Load(int3(historyProbe, 0)).rgb);
+        float4 oldMoments = _GIHistoryMomentsInput.Load(int3(historyProbe, 0));
+        // Bounded running mean from gi3's temporal contract.  Every four-ray
+        // observation, including a valid black observation, advances history.
+        float newSampleWeight = rcp(min(historyAge, 31.0) + 1.0);
+        result = lerp(history, current.rgb, newSampleWeight);
+        moments = lerp(max(0.0, oldMoments.xy), moments, newSampleWeight);
+        historyAge = min(historyAge + 1.0, 32.0);
+    }
+    else
+    {
+        historyAge = 1.0;
+    }
+    _GIHistoryIrradianceOutput[probe] = float4(result, historyAge);
+    _GIHistoryPositionOutput[probe] = receiver;
+    _GIHistoryNormalOutput[probe] = float4(normal, 1.0);
+    float variance = max(0.0, moments.y - moments.x * moments.x);
+    _GIHistoryMomentsOutput[probe] = float4(
+        moments, historyAge, variance);
+}
+
+[numthreads(8, 8, 1)]
+void AccumulatePrimaryHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    GIAccumulateHistory(id.xy,
+        _GIProbeReceiverPositionInput.Load(int3(id.xy, 0)),
+        _GIProbeReceiverNormalInput.Load(int3(id.xy, 0)),
+        _GIPrimaryIrradianceInput.Load(int3(id.xy, 0)));
+}
+
+[numthreads(8, 8, 1)]
+void AccumulateSpecularHistory(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    float4 receiver = _GIProbeReceiverPositionInput.Load(int3(id.xy, 0));
+    float4 receiverNormal = _GIProbeReceiverNormalInput.Load(int3(id.xy, 0));
+    float4 current = _GIPrimarySpecularInput.Load(int3(id.xy, 0));
+    if (receiver.a <= 0.0 || receiverNormal.a <= 0.0 || current.a <= 0.0)
+    {
+        _GISpecularHistoryOutput[id.xy] = 0.0;
+        return;
+    }
+    float3 result = max(0.0, current.rgb);
+    float sampleCount = 1.0;
+    uint2 receiverPixel = _GIProbeReceiverPixelInput.Load(int3(id.xy, 0));
+    float smoothness;
+    GIGetSpecularF0(receiverPixel, smoothness);
+    float roughness = saturate(1.0 - smoothness);
+    uint2 historyProbe; float diffuseHistoryAge;
+    if (GIReprojectProbeHistory(receiver.xyz, normalize(receiverNormal.xyz),
+                                historyProbe, diffuseHistoryAge))
+    {
+        float4 old = _GISpecularHistoryInput.Load(int3(historyProbe, 0));
+        float4 oldPosition = _GIHistoryPositionInput.Load(int3(historyProbe, 0));
+        float4 oldNormal = _GIHistoryNormalInput.Load(int3(historyProbe, 0));
+        float geometry = old.a > 0.0 && oldPosition.a > 0.0 && oldNormal.a > 0.0
+            ? saturate((dot(normalize(receiverNormal.xyz), normalize(oldNormal.xyz)) - 0.55) / 0.45)
+            : 0.0;
+        geometry *= old.a > 0.0 ? saturate(1.0 - distance(receiver.xyz, oldPosition.xyz) /
+                         max(0.35, distance(receiver.xyz, _GICameraPosition) * 0.035)) : 0.0;
+        if (geometry > 0.0)
+        {
+            // Broad GGX lobes need more temporal reuse. Keep glossy receivers
+            // responsive, but let rough receivers average a longer sequence.
+            float historyWeight = 0.45 + (0.12 - 0.45) * roughness;
+            result = lerp(max(0.0, old.rgb), result,
+                          max(0.08, historyWeight * geometry));
+            sampleCount = min(old.a + 1.0, 8.0 + (32.0 - 8.0) * roughness);
+        }
+    }
+    _GISpecularHistoryOutput[id.xy] = float4(result, sampleCount);
+}
+
+[numthreads(8, 8, 1)]
+void FilterProbeCache(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    float4 centerPosition = _GIHistoryPositionOutput.Load(int3(id.xy, 0));
+    float4 centerNormal = _GIHistoryNormalOutput.Load(int3(id.xy, 0));
+    if (centerPosition.a <= 0.0 || centerNormal.a <= 0.0)
+    {
+        _GIFilteredProbeIrradiance[id.xy] = 0.0;
+        return;
+    }
+    float3 normal = normalize(centerNormal.xyz);
+    float positionLimit = max(0.35,
+        distance(centerPosition.xyz, _GICameraPosition) * 0.035);
+    float3 sum = 0.0;
+    float weightSum = 0.0;
+    float minimumAge = 32.0;
+    for (int y = -2; y <= 2; y++)
+    for (int x = -2; x <= 2; x++)
+    {
+        int2 candidate = int2(id.xy) + int2(x, y);
+        if (any(candidate < 0) || any(candidate >= int2(_GIProbeGridSize)))
+            continue;
+        float4 candidatePosition = _GIHistoryPositionOutput.Load(int3(candidate, 0));
+        float4 candidateNormal = _GIHistoryNormalOutput.Load(int3(candidate, 0));
+        float4 irradiance = _GIHistoryIrradianceOutput.Load(int3(candidate, 0));
+        float4 candidateMoments = _GIHistoryMomentsOutput.Load(int3(candidate, 0));
+        if (candidatePosition.a <= 0.0 || candidateNormal.a <= 0.0 || irradiance.a <= 0.0)
+            continue;
+        float normalWeight = saturate((dot(normal, normalize(candidateNormal.xyz)) - 0.55) / 0.45);
+        float positionWeight = saturate(1.0 -
+            distance(centerPosition.xyz, candidatePosition.xyz) / positionLimit);
+        float spatialWeight = rcp(1.0 + (float)(x * x + y * y) * 0.35);
+        float noise = saturate(sqrt(max(0.0, candidateMoments.w)) /
+            max(candidateMoments.x + 0.05, 0.05));
+        // Noisy/new receivers borrow more from compatible neighbours; converged
+        // receivers keep their accumulated mean. Geometry gates remain authoritative.
+        float convergenceWeight = (1.0 + 0.5 * noise) *
+            (0.65 + 0.35 * saturate(irradiance.a * (1.0 / 8.0)));
+        float weight = normalWeight * positionWeight * spatialWeight * convergenceWeight;
+        sum += irradiance.rgb * weight;
+        weightSum += weight;
+        minimumAge = min(minimumAge, irradiance.a);
+    }
+    _GIFilteredProbeIrradiance[id.xy] = float4(
+        weightSum > 1e-5 ? sum / weightSum : 0.0,
+        weightSum > 1e-5 ? minimumAge : 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void FilterSpecularCache(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIProbeGridSize)) return;
+    float4 center = _GIHistoryPositionOutput.Load(int3(id.xy, 0));
+    float4 centerNormal = _GIHistoryNormalOutput.Load(int3(id.xy, 0));
+    if (center.a <= 0.0 || centerNormal.a <= 0.0)
+    {
+        _GIFilteredSpecular[id.xy] = 0.0;
+        return;
+    }
+    float3 sum = 0.0; float weightSum = 0.0;
+    float3 normal = normalize(centerNormal.xyz);
+    uint2 receiverPixel = _GIProbeReceiverPixelInput.Load(int3(id.xy, 0));
+    float smoothness;
+    GIGetSpecularF0(receiverPixel, smoothness);
+    float roughness = saturate(1.0 - smoothness);
+    float limit = max(0.75 + roughness * 0.75,
+                      distance(center.xyz, _GICameraPosition) * (0.06 + roughness * 0.04));
+    for (int y = -1; y <= 1; y++)
+    for (int x = -1; x <= 1; x++)
+    {
+        int2 candidate = int2(id.xy) + int2(x, y);
+        if (any(candidate < 0) || any(candidate >= int2(_GIProbeGridSize))) continue;
+        float4 p = _GIHistoryPositionOutput.Load(int3(candidate, 0));
+        float4 n = _GIHistoryNormalOutput.Load(int3(candidate, 0));
+        float4 s = _GISpecularHistoryOutputInput.Load(int3(candidate, 0));
+        if (p.a <= 0.0 || n.a <= 0.0 || s.a <= 0.0) continue;
+        float normalThreshold = 0.65 + (0.45 - 0.65) * roughness;
+        float normalRange = 0.35 + (0.55 - 0.35) * roughness;
+        float nw = saturate((dot(normal, normalize(n.xyz)) - normalThreshold) /
+                            normalRange);
+        float pw = saturate(1.0 - distance(center.xyz, p.xyz) / limit);
+        float w = nw * pw * rcp(1.0 + (float)(x * x + y * y) * 0.5);
+        sum += s.rgb * w; weightSum += w;
+    }
+    float3 filtered = weightSum > 1e-5 ? sum / weightSum : 0.0;
+    float4 centerHistory = _GISpecularHistoryOutputInput.Load(int3(id.xy, 0));
+    if (centerHistory.a > 0.0)
+        filtered = lerp(filtered, max(0.0, centerHistory.rgb), 0.35);
+    _GIFilteredSpecular[id.xy] = float4(filtered,
+                                         weightSum > 1e-5 ? 1.0 : 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void FilterDiffuseIrradiance(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIScreenSize)) return;
+    float3 position;
+    if (!GILoadPosition(id.xy, position))
+    {
+        _GIResolvedIrradiance[id.xy] = 0.0;
+        return;
+    }
+    float3 normal = normalize(_GIGeometryNormal.Load(int3(id.xy, 0)).xyz);
+    float depth = distance(position, _GICameraPosition);
+    float positionLimit = max(0.12, depth * 0.015);
+    float3 sum = 0.0;
+    float weightSum = 0.0;
+    for (int y = -4; y <= 4; y += 2)
+    for (int x = -4; x <= 4; x += 2)
+    {
+        int2 candidate = int2(id.xy) + int2(x, y);
+        if (any(candidate < 0) || any(candidate >= int2(_GIScreenSize))) continue;
+        float3 candidatePosition;
+        if (!GILoadPosition((uint2)candidate, candidatePosition)) continue;
+        float3 candidateNormal = normalize(_GIGeometryNormal.Load(int3(candidate, 0)).xyz);
+        float normalWeight = saturate((dot(normal, candidateNormal) - 0.35) / 0.65);
+        float positionWeight = saturate(1.0 - distance(position, candidatePosition) / positionLimit);
+        float spatialWeight = rcp(1.0 + (float)(x * x + y * y) * 0.0625);
+        float weight = normalWeight * positionWeight * spatialWeight;
+        float4 irradiance = _GIRawIrradiance.Load(int3(candidate, 0));
+        if (irradiance.a <= 0.0) continue;
+        sum += irradiance.rgb * weight;
+        weightSum += weight;
+    }
+    _GIResolvedIrradiance[id.xy] = float4(
+        weightSum > 1e-5 ? sum / weightSum : 0.0, weightSum > 1e-5 ? 1.0 : 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void ResolveSpecularIrradiance(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIScreenSize)) return;
+    float3 position;
+    if (!GILoadPosition(id.xy, position))
+    {
+        _GIResolvedSpecular[id.xy] = 0.0;
+        return;
+    }
+    float3 normal = normalize(_GIGeometryNormal.Load(int3(id.xy, 0)).xyz);
+    int2 center = int2(id.xy / _GIProbeTileSize);
+    uint2 receiverPixel = _GIProbeReceiverPixelInput.Load(int3(center, 0));
+    float smoothness;
+    GIGetSpecularF0(receiverPixel, smoothness);
+    float roughness = saturate(1.0 - smoothness);
+    float3 sum = 0.0; float weightSum = 0.0;
+    float3 centerSample = 0.0; float centerWeight = 0.0;
+    for (int y = -1; y <= 1; y++)
+    for (int x = -1; x <= 1; x++)
+    {
+        int2 candidate = center + int2(x, y);
+        if (any(candidate < 0) || any(candidate >= int2(_GIProbeGridSize))) continue;
+        float4 p = _GIHistoryPositionOutput.Load(int3(candidate, 0));
+        float4 n = _GIHistoryNormalOutput.Load(int3(candidate, 0));
+        float4 s = _GIFilteredSpecularInput.Load(int3(candidate, 0));
+        if (p.a <= 0.0 || n.a <= 0.0 || s.a <= 0.0) continue;
+        float nw = saturate((dot(normal, normalize(n.xyz)) - 0.45) / 0.55);
+        float pw = saturate(1.0 - distance(position, p.xyz) /
+                            max(0.75, distance(position, _GICameraPosition) * 0.08));
+        float w = nw * pw * rcp(1.0 + (float)(x * x + y * y) * 0.5);
+        sum += s.rgb * w; weightSum += w;
+        if (x == 0 && y == 0) { centerSample = s.rgb; centerWeight = w; }
+    }
+    float centerBlend = 0.30 + (0.12 - 0.30) * roughness;
+    float3 resolved = centerWeight > 1e-5 ? lerp(sum / max(weightSum, 1e-5), centerSample,
+                                                  centerBlend) :
+        (weightSum > 1e-5 ? sum / weightSum : 0.0);
+    _GIResolvedSpecular[id.xy] = float4(resolved,
+                                         weightSum > 1e-5 ? 1.0 : 0.0);
+}
+
+[numthreads(8, 8, 1)]
+void VisualizePrimaryProbes(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _GIScreenSize)) return;
+    uint2 probe = min(id.xy / _GIProbeTileSize, _GIProbeGridSize - 1u);
+    float3 color = 0.0;
+    float4 primary = _GIProbeReceiverPosition.Load(int3(probe, 0));
+    if (primary.a > 0.0)
+    {
+        if (_GIProbeDebugMode == 1u)
+            color = _GIProbeReceiverNormal.Load(int3(probe, 0)).xyz * 0.5 + 0.5;
+        else if (_GIProbeDebugMode == 2u)
+            // "Probe Source" must show the radiance cache actually consumed by
+            // reconstruction, not the deliberately rotating raw Monte Carlo sample.
+        {
+            float4 cached = _GIFilteredProbeIrradianceInput.Load(int3(probe, 0));
+            // Hide uninitialized data only. A valid zero estimate remains black and
+            // participates in accumulation; alpha is the bounded history length.
+            color = cached.a > 0.0 ? cached.rgb : 0.0;
+        }
+        else if (_GIProbeDebugMode == 3u)
+        {
+            float4 specular = _GIPrimarySpecularDebugInput.Load(int3(probe, 0));
+            color = specular.a > 0.0 ? specular.rgb : 0.0;
+        }
+        else if (_GIProbeDebugMode == 4u)
+        {
+            // SpecularWeight is the temporal sample count, not F0. Showing the
+            // actual history length makes convergence and reset behaviour
+            // inspectable without confusing material colour with reuse weight.
+            float4 history = _GISpecularHistoryInput.Load(int3(probe, 0));
+            float t = saturate(history.a / 32.0);
+            color = float3(t, saturate(1.0 - abs(t * 2.0 - 1.0)), 1.0 - t);
+        }
+        else if (_GIProbeDebugMode == 5u)
+        {
+            float4 specular = _GIResolvedSpecularInput.Load(int3(id.xy, 0));
+            color = specular.a > 0.0 ? specular.rgb : 0.0;
+        }
+        else
+        {
+            uint2 pp = _GIProbeReceiverPixel.Load(int3(probe, 0));
+            uint2 pd = uint2(abs(int2(id.xy) - int2(pp)));
+            bool pm = (pd.x <= 1u && pd.y <= 5u) || (pd.y <= 1u && pd.x <= 5u);
+            color = pm ? float3(1.0, 0.95, 0.15) : float3(0.008, 0.012, 0.018);
+        }
+    }
+    _GIProbeDebug[id.xy] = float4(color, 1.0);
+}

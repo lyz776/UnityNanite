@@ -55,7 +55,17 @@ GBufferFragOutput PackGBuffersSurfaceData(SurfaceData surfaceData, InputData inp
     output.gBuffer0 = half4(surfaceData.albedo.rgb, PackGBufferMaterialFlags(materialFlags));   // albedo          albedo          albedo          materialFlags   (sRGB rendertarget)
     output.gBuffer1 = half4(surfaceData.specular.rgb, surfaceData.occlusion);                   // specular        specular        specular        occlusion
     output.gBuffer2 = half4(packedNormalWS, surfaceData.smoothness);                            // encoded-normal  encoded-normal  encoded-normal  smoothness
-    output.color    = half4(globalIllumination, 1);                                             // GI              GI              GI              unused          (lighting buffer)
+    // SimpleLit-style GBuffer shaders often assemble baked diffuse and emission before
+    // entering this common packer. Preserve emission while RealtimeGI owns diffuse.
+    // MaterialUnlit shaders that carry their own lighting can explicitly keep the
+    // complete term because the deferred diffuse composite does not shade their stencil.
+#if defined(REALTIME_GI_KEEP_NATIVE_DIFFUSE)
+    half realtimeGIDiffuse = 0.0h;
+#else
+    half realtimeGIDiffuse = saturate((half)_RealtimeGIDiffuseEnabled);
+#endif
+    output.color = half4(
+        lerp(globalIllumination, surfaceData.emission, realtimeGIDiffuse), 1);                  // GI              GI              GI              unused          (lighting buffer)
 
     #if defined(GBUFFER_FEATURE_DEPTH)
     output.depth = inputData.positionCS.z;

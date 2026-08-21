@@ -339,6 +339,13 @@ namespace UnityEngine.Rendering.Universal
         private TextureHandle _irradianceTexture;
 
         /// <summary>
+        /// True when an external deferred diffuse resolve owns the indirect diffuse term.
+        /// GBuffer material passes keep emission and indirect specular, but omit baked/SH
+        /// diffuse so the external resolve can insert it exactly once after all geometry.
+        /// </summary>
+        public bool realtimeGIDiffuseEnabled { get; set; }
+
+        /// <summary>
         /// STP debug visualization written to by the STP upscaler.
         /// </summary>
         internal TextureHandle stpDebugView
@@ -371,6 +378,7 @@ namespace UnityEngine.Rendering.Universal
             _dBufferDepth = TextureHandle.nullHandle;
             _ssaoTexture = TextureHandle.nullHandle;
             _irradianceTexture = TextureHandle.nullHandle;
+            realtimeGIDiffuseEnabled = false;
             _stpDebugView = TextureHandle.nullHandle;
 
             for (int i = 0; i < _gBuffer.Length; i++)

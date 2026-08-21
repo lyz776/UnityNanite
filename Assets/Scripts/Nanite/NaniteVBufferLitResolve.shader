@@ -800,18 +800,15 @@ Shader "Nanite/VBufferLitResolve"
                 inputData.vertexLighting = float3(0.0, 0.0, 0.0);
                 inputData.normalizedScreenSpaceUV = screenUv;
                 float4 probeOcclusion = float4(1.0, 1.0, 1.0, 1.0);
-                #if defined(_SCREEN_SPACE_IRRADIANCE)
-                    inputData.bakedGI = SAMPLE_GI(_ScreenSpaceIrradiance, input.positionCS.xy);
-                #else
-                    // Fullscreen procedural resolve 没有 Renderer per-draw CBUFFER；
-                    // 改为显式读取每实例 SH，避免 RT3 在 dielectric 材质下掉黑。
-                    inputData.bakedGI = SampleInstanceProbeSH(instanceId, inputData.normalWS);
-                    if (dot(inputData.bakedGI, inputData.bakedGI) < 1e-6h)
-                    {
-                        half3 vertexShTerm = SampleSHVertex(inputData.normalWS);
-                        inputData.bakedGI = SampleSHPixel(vertexShTerm, inputData.normalWS);
-                    }
-                #endif
+                // Fullscreen procedural resolve 没有 Renderer per-draw CBUFFER；
+                // 显式读取每实例 SH。RealtimeGI 启用时只在本次 GBuffer draw 内
+                // 通过 _RealtimeGIDiffuseEnabled 抑制这项 diffuse。
+                inputData.bakedGI = SampleInstanceProbeSH(instanceId, inputData.normalWS);
+                if (dot(inputData.bakedGI, inputData.bakedGI) < 1e-6h)
+                {
+                    half3 vertexShTerm = SampleSHVertex(inputData.normalWS);
+                    inputData.bakedGI = SampleSHPixel(vertexShTerm, inputData.normalWS);
+                }
                 inputData.shadowMask = probeOcclusion;
                 float3 bitangentForTbn = tangentSignWS * normalize(cross(normalVertexWS, tangentVertexWS));
                 inputData.tangentToWorld = half3x3((half3)tangentVertexWS, (half3)bitangentForTbn, (half3)normalVertexWS);
@@ -838,18 +835,19 @@ Shader "Nanite/VBufferLitResolve"
                     inputData.normalWS,
                     inputData.viewDirectionWS,
                     inputData.normalizedScreenSpaceUV);
-                // GlobalIllumination is the single owner of indirect light.  When the
-                // RealtimeGI deferred injection flag is active it deliberately returns
-                // zero here and the traced diffuse/specular terms are added later.  Do
-                // not resurrect unity_SpecCube0 or _GlossyEnvironmentCubeMap as a
-                // "black fallback": that bypassed the replacement contract and made
-                // Nanite surfaces keep reflection-probe / Unity skybox IBL forever.
+                // Indirect diffuse is optionally suppressed only while this GBuffer
+                // resolve runs. RealtimeGI inserts the shared native/Nanite result
+                // after the complete GBuffer exists; reflection probes remain native.
 
+                half3 surfaceLighting = lerp(
+                    surfaceData.emission + gi,
+                    surfaceData.emission,
+                    saturate((half)_RealtimeGIDiffuseEnabled));
                 GBufferFragOutput output = PackGBuffersBRDFData(
                     brdfData,
                     inputData,
                     surfaceData.smoothness,
-                    surfaceData.emission + gi,
+                    surfaceLighting,
                     surfaceData.occlusion);
 
                 #if defined(GBUFFER_FEATURE_RENDERING_LAYERS)

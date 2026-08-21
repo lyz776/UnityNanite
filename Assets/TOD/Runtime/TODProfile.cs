@@ -100,6 +100,7 @@ namespace UnityNanite.TOD
         public TODFloatParameter contrast = new TODFloatParameter(1f);
         public TODFloatParameter horizonSunGlow = new TODFloatParameter(0.42f);
         public TODFloatParameter horizonSunGlowPower = new TODFloatParameter(10f);
+        public TODFloatParameter giIntensity = new TODFloatParameter(1f);
         public TODColorParameter sunScatterColor = new TODColorParameter(new Color(1f, 0.72f, 0.45f));
         public TODFloatParameter sunScatterIntensity = new TODFloatParameter(0.16f);
         public TODFloatParameter sunScatterPower = new TODFloatParameter(34f);
