@@ -28,6 +28,20 @@ UnityNanite 是一个面向 **Unity 6000.3.10f1 + URP 17.3.0** 的图形实验�
 - **24 小时 TOD：** 可编辑的昼夜 Profile，以及动态天空、云、云影、雾和太阳/月亮 Lens Flare；该模块可以独立使用。
 - **验证工具：** Unity 编辑器诊断菜单、DX12 构建检查、RenderDoc 捕获与 GPU 时间分析脚本。
 
+### 三个模块怎么用
+
+#### Nanite · [完整步骤](Docs/NANITE_GUIDE.md)
+
+把 FBX/OBJ 放进 `Assets/`，打开 **Nanite → Bake Nanite...**，选择模型，设置输出目录与名称，并选 **Static Base → Generate Static Base**。将生成目录中的 **`Prefab/<名称>.prefab`** 拖入场景；在 Scene 视图的 Shading 下拉菜单选择 **Nanite → Clusters / Triangles / Pages** 预览。选中生成的 `NaniteMesh` 资源后，可从 **Nanite → Diagnostics** 运行 BVH/GPU 剔除检查。
+
+#### GI · [完整步骤](Docs/GI_GUIDE.md)
+
+在 `PC_RPAsset` 的 **Deferred+** Renderer `PC_Renderer` 中启用 **GIWorldRendererFeature**，进入 Play Mode 查看 Game 视图。可读、不透明的普通 Mesh 会写入 GI 世界缓存；Nanite 由只读适配器读取已常驻 Page，再贡献几何，**不会改写 Nanite 资源**。运动物体加 `Rigidbody` 或 `GITransformTracked`。在 Feature 中启用 Debug，用 **Surface / Source** 检查覆盖，再比较 `Diffuse Intensity` 为 0 与 1 的画面。
+
+#### TOD · [完整步骤](Docs/TOD_GUIDE.md)
+
+运行 **Tools → Unity Nanite → TOD → Install Project Defaults**，再用 **GameObject → Unity Nanite → Create 24 Hour TOD Rig** 在当前场景创建 Rig。选中 Rig，拖动 **当前时间** 预览；用 **Window → Unity Nanite → 24 Hour TOD** 编辑 Profile。最后运行 **Tools → Unity Nanite → TOD → Validate Installation**，并保存场景。
+
 ### 目录结构
 
 | 路径 | 内容 |
@@ -47,7 +61,7 @@ UnityNanite 是一个面向 **Unity 6000.3.10f1 + URP 17.3.0** 的图形实验�
 1. 用 **Unity 6000.3.10f1** 打开仓库根目录。等待 Package Manager 完成导入；项目使用仓库内的定制 URP 包。
 2. 在 Windows 上使用 **Direct3D 12**，打开 `Assets/Scenes/SampleScene.unity`。
 3. 在 Unity 菜单中选择 **Nanite → Bake Nanite...** 烘焙模型；`Assets/Plugins/x86_64/API_CPP.dll` 是随项目提供的 Windows 原生插件。需要重编译时参见 [原生插件说明](Native/API_CPP/README.md)。
-4. 若要体验昼夜系统，参见 [TOD 快速开始](Assets/TOD/README.md)。在构建 Windows Player 前，可运行 **Tools → Nanite → Validate DX12 Portability Contract**。
+4. 若要体验昼夜系统，参见 [TOD 操作指南](Docs/TOD_GUIDE.md)。在构建 Windows Player 前，可运行 **Tools → Nanite → Validate DX12 Portability Contract**。
 
 这是图形研究工程，不保证其他平台、渲染 API 或 Unity 版本可直接运行。
 
@@ -76,6 +90,20 @@ The current target is **Windows x64 with Direct3D 12**. The project takes inspir
 - **24-hour time of day:** Editable profiles, sky, clouds, cloud shadows, fog, and sun/moon lens flares. It can be used independently.
 - **Diagnostics:** Unity editor validation menus, a DX12 build guard, and RenderDoc capture and GPU timing scripts.
 
+### Using the three modules
+
+#### Nanite · [Full guide](Docs/NANITE_GUIDE.md)
+
+Import an FBX/OBJ under `Assets/`, open **Nanite → Bake Nanite...**, select the model and an output folder, then choose **Static Base → Generate Static Base**. Drag the generated **`Prefab/<name>.prefab`** into the scene. Use the Scene view **Shading → Nanite → Clusters / Triangles / Pages** modes to inspect it. Select the generated `NaniteMesh` asset and run the BVH/GPU checks under **Nanite → Diagnostics**.
+
+#### GI · [Full guide](Docs/GI_GUIDE.md)
+
+Enable **GIWorldRendererFeature** on the **Deferred+** `PC_Renderer` used by `PC_RPAsset`, then enter Play Mode and inspect the Game view. Readable opaque ordinary meshes populate the GI world cache. The Nanite adapter reads resident pages without modifying Nanite resources and also contributes geometry. Add `Rigidbody` or `GITransformTracked` for rigid motion. Use **Enable Debug → Surface / Source** to inspect coverage, then compare `Diffuse Intensity` at 0 and 1.
+
+#### TOD · [Full guide](Docs/TOD_GUIDE.md)
+
+Run **Tools → Unity Nanite → TOD → Install Project Defaults**, then **GameObject → Unity Nanite → Create 24 Hour TOD Rig** in the target scene. Select the Rig and move **当前时间** (Current Time) to preview it. Edit profiles through **Window → Unity Nanite → 24 Hour TOD**. Run **Tools → Unity Nanite → TOD → Validate Installation** and save the scene.
+
 ### Repository layout
 
 | Path | Purpose |
@@ -95,7 +123,7 @@ The current target is **Windows x64 with Direct3D 12**. The project takes inspir
 1. Open the repository root in **Unity 6000.3.10f1** and allow Package Manager to import the embedded URP package.
 2. On Windows, select **Direct3D 12** and open `Assets/Scenes/SampleScene.unity`.
 3. Use **Nanite → Bake Nanite...** to bake a mesh. The repository includes `Assets/Plugins/x86_64/API_CPP.dll`; see the [native plugin guide](Native/API_CPP/README.md) if you need to rebuild it.
-4. Follow the [TOD guide](Assets/TOD/README.md) to try the sky system. Before building a Windows Player, run **Tools → Nanite → Validate DX12 Portability Contract**.
+4. Follow the [TOD guide](Docs/TOD_GUIDE.md) to try the sky system. Before building a Windows Player, run **Tools → Nanite → Validate DX12 Portability Contract**.
 
 This is a graphics research project. Other platforms, graphics APIs, and Unity versions are not verified.
 

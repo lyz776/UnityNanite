@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="370" viewBox="0 0 1120 370" role="img" aria-labelledby="title desc">
+  <title id="title">UnityNanite realtime GI data flow</title>
+  <desc id="desc">Readable opaque ordinary meshes and resident Nanite pages contribute geometry to the GI world cache. The Nanite adapter only reads Nanite page buffers. Screen probes gather indirect light for visible opaque Deferred surfaces.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#0b1630"/><stop offset="1" stop-color="#111429"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0 L9 5 L0 10Z" fill="#7a91be"/></marker>
+    <style>
+      .title{font:700 29px 'Segoe UI',Arial,sans-serif;fill:#f4f7ff}
+      .label{font:700 18px 'Segoe UI',Arial,sans-serif;fill:#edf3ff}
+      .detail{font:14px 'Segoe UI',Arial,sans-serif;fill:#adbbdb}
+      .card{fill:#182741;stroke:#41567d;stroke-width:1.5}
+      .line{fill:none;stroke:#7a91be;stroke-width:3;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1120" height="370" rx="20" fill="url(#background)"/>
+  <text x="42" y="61" class="title">REALTIME GI · GEOMETRY TO LIGHTING</text>
+  <text x="43" y="87" class="detail">Geometry contributors → world cache → screen probes → visible receivers</text>
+  <rect x="42" y="124" width="240" height="83" rx="13" class="card"/>
+  <rect x="42" y="225" width="240" height="83" rx="13" class="card"/>
+  <rect x="369" y="157" width="215" height="117" rx="13" class="card"/>
+  <rect x="668" y="157" width="169" height="117" rx="13" class="card"/>
+  <rect x="922" y="157" width="155" height="117" rx="13" class="card"/>
+  <rect x="42" y="124" width="240" height="5" rx="2" fill="#50d3e8"/>
+  <rect x="42" y="225" width="240" height="5" rx="2" fill="#6b9df6"/>
+  <rect x="369" y="157" width="215" height="5" rx="2" fill="#78c7d9"/>
+  <rect x="668" y="157" width="169" height="5" rx="2" fill="#8fa9ff"/>
+  <rect x="922" y="157" width="155" height="5" rx="2" fill="#c392ed"/>
+  <path d="M282 165 H326 Q340 165 340 185 V202 H366" class="line"/>
+  <path d="M282 267 H326 Q340 267 340 247 V230 H366" class="line"/>
+  <path d="M584 216 H665" class="line"/>
+  <path d="M837 216 H919" class="line"/>
+  <text x="62" y="158" class="label">ORDINARY MESH</text>
+  <text x="62" y="184" class="detail">Readable · opaque</text>
+  <text x="62" y="259" class="label">NANITE PAGES</text>
+  <text x="62" y="285" class="detail">Resident · read-only access</text>
+  <text x="390" y="205" class="label">GI WORLD CACHE</text>
+  <text x="390" y="232" class="detail">Geometry + material</text>
+  <text x="689" y="205" class="label">SCREEN</text>
+  <text x="689" y="231" class="detail">Surface + probes</text>
+  <text x="943" y="205" class="label">DEFERRED</text>
+  <text x="943" y="231" class="detail">Opaque receiver</text>
+  <text x="43" y="343" class="detail">The GI adapter never writes Nanite page buffers. A visible surface may contribute geometry and receive indirect light.</text>
+</svg>

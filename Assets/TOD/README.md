@@ -3,6 +3,8 @@
 `Assets/TOD` 是一个独立的 URP 昼夜循环模块，不依赖
 `Assets/Scripts/Nanite` 下的 GPU Driven/Nanite 实现。
 
+[从零配置场景的中英文教程](../../Docs/TOD_GUIDE.md)
+
 ## 快速开始
 
 1. 首次使用执行 **Tools > Unity Nanite > TOD > Install Project Defaults**。
@@ -17,7 +19,7 @@
 - `Assets/TOD/Profiles/Default TOD Profile.asset`
 - `Assets/TOD/Generated/TOD Dynamic Sky.mat`
 - `Assets/TOD/Prefabs/TOD Rig.prefab`
-- `Assets` 内每个 URP Renderer Data 上的 `TODFogRendererFeature`
+- `Assets` 内每个 URP Renderer Data 上的 `TODFogRendererFeature` 和 `TODCloudShadowRendererFeature`
 
 TOD Rig 会自动把默认动态天空材质设为当前场景的 Skybox；也可以在挂点上关闭
 “自动指定天空盒”并使用自定义材质。
