@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">UnityNanite rendering pipeline</title>
+  <desc id="desc">Source mesh is baked into a cluster hierarchy and streamed as pages. GPU culling selects visible clusters for VBuffer rendering; GI and time of day complete the frame.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0b1630"/><stop offset="1" stop-color="#111429"/></linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#25d2ee"/><stop offset="1" stop-color="#8e6cff"/></linearGradient>
+    <linearGradient id="lit" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#80c2dc"/><stop offset=".55" stop-color="#e7baa4"/><stop offset="1" stop-color="#825c9f"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="15"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="5" orient="auto"><path d="M0 0 L8 5 L0 10Z" fill="#6e83b7"/></marker>
+    <style>
+      .title{font:700 39px 'Segoe UI',Arial,sans-serif;fill:#f5f8ff;letter-spacing:1px}
+      .subtitle{font:17px 'Segoe UI',Arial,sans-serif;fill:#9eaccd}
+      .step{font:700 15px 'Segoe UI',Arial,sans-serif;fill:#e9f1ff;letter-spacing:1.2px}
+      .caption{font:14px 'Segoe UI',Arial,sans-serif;fill:#99a9ce}
+      .small{font:13px 'Segoe UI',Arial,sans-serif;fill:#9eaccd}
+      .card{fill:#17233e;stroke:#334970;stroke-width:1.5}
+    </style>
+  </defs>
+  <rect width="1200" height="560" rx="22" fill="url(#bg)"/>
+  <circle cx="142" cy="113" r="89" fill="#17bede" opacity=".16" filter="url(#glow)"/>
+  <circle cx="1045" cy="443" r="108" fill="#886af5" opacity=".16" filter="url(#glow)"/>
+  <rect x="42" y="42" width="5" height="43" rx="2.5" fill="url(#accent)"/>
+  <text x="63" y="75" class="title">UNITY NANITE</text>
+  <text x="64" y="105" class="subtitle">Virtualized geometry experiment for Unity 6 / URP</text>
+  <rect x="1008" y="52" width="145" height="31" rx="15" fill="#172b43" stroke="#356b83"/>
+  <text x="1080" y="73" text-anchor="middle" class="small" fill="#a5e4ef">WINDOWS · DX12</text>
+
+  <path d="M282 283 H337 M577 283 H632 M872 283 H927" stroke="#6e83b7" stroke-width="3" marker-end="url(#arrow)"/>
+  <rect x="45" y="151" width="238" height="259" rx="19" class="card"/>
+  <rect x="340" y="151" width="238" height="259" rx="19" class="card"/>
+  <rect x="635" y="151" width="238" height="259" rx="19" class="card"/>
+  <rect x="930" y="151" width="238" height="259" rx="19" class="card"/>
+  <rect x="45" y="151" width="238" height="4" rx="2" fill="#2fcbe6"/>
+  <rect x="340" y="151" width="238" height="4" rx="2" fill="#50b5ee"/>
+  <rect x="635" y="151" width="238" height="4" rx="2" fill="#6d96ff"/>
+  <rect x="930" y="151" width="238" height="4" rx="2" fill="#a477f6"/>
+
+  <g transform="translate(101 181)" fill="none" stroke="#69d3e7" stroke-width="2">
+    <path d="M0 87 L41 12 L105 0 L137 55 L112 131 L25 137Z"/>
+    <path d="M0 87 L75 59 L41 12 M75 59 L105 0 M75 59 L137 55 M75 59 L112 131 M75 59 L25 137 M25 137 L112 131"/>
+    <circle cx="75" cy="59" r="5" fill="#b9f1f4" stroke="none"/>
+  </g>
+  <g transform="translate(389 196)" stroke-width="2">
+    <path d="M71 0 L116 28 L71 57 L26 28Z" fill="#1c4b70" stroke="#76caee"/>
+    <path d="M26 28 L71 57 L71 119 L26 90Z" fill="#284261" stroke="#76caee"/>
+    <path d="M116 28 L71 57 L71 119 L116 90Z" fill="#333965" stroke="#76caee"/>
+    <path d="M71 57 L71 119 M26 90 L71 119 L116 90" fill="none" stroke="#76caee"/>
+    <circle cx="71" cy="119" r="6" fill="#b3b6ff" stroke="none"/>
+  </g>
+  <g transform="translate(676 191)" fill="none" stroke="#91a5ff">
+    <rect x="19" y="7" width="139" height="105" rx="10" stroke-width="2"/>
+    <path d="M19 43 H158 M19 77 H158 M65 7 V112 M111 7 V112" opacity=".45"/>
+    <path d="M36 92 L64 65 L88 77 L123 34 L147 50" stroke="#51d1eb" stroke-width="4"/>
+    <circle cx="123" cy="34" r="8" fill="#c6e5ff" stroke="none"/>
+    <path d="M17 125 H159" stroke="#455c90" stroke-width="3"/>
+  </g>
+  <g transform="translate(971 189)">
+    <rect x="0" y="0" width="157" height="119" rx="10" fill="url(#lit)" stroke="#c3aad6" stroke-width="2"/>
+    <path d="M0 82 Q42 44 83 73 T157 40 V119 H0Z" fill="#3c4e78" opacity=".78"/>
+    <path d="M0 101 Q60 74 94 89 T157 64 V119 H0Z" fill="#203454" opacity=".9"/>
+    <circle cx="108" cy="37" r="20" fill="#fff2d0" opacity=".84"/>
+    <path d="M0 0 H157 V119 H0Z" fill="none" stroke="#c3aad6" stroke-width="2"/>
+  </g>
+
+  <text x="164" y="349" text-anchor="middle" class="step">SOURCE MESH</text>
+  <text x="459" y="349" text-anchor="middle" class="step">CLUSTER DAG</text>
+  <text x="754" y="349" text-anchor="middle" class="step">GPU CULLING</text>
+  <text x="1049" y="349" text-anchor="middle" class="step">VBUFFER + LIGHTING</text>
+  <text x="164" y="377" text-anchor="middle" class="caption">Model input</text>
+  <text x="459" y="377" text-anchor="middle" class="caption">LOD · Pages · Streaming</text>
+  <text x="754" y="377" text-anchor="middle" class="caption">Frustum · HZB · Shadows</text>
+  <text x="1049" y="377" text-anchor="middle" class="caption">Material resolve</text>
+
+  <path d="M46 449 H1167" stroke="#304266"/>
+  <text x="48" y="485" class="small" fill="#cbd6f1">ADDITIONAL SYSTEMS</text>
+  <rect x="258" y="459" width="406" height="54" rx="13" fill="#172744" stroke="#365372"/>
+  <circle cx="288" cy="486" r="10" fill="#4ec9e4"/>
+  <text x="310" y="492" class="step" style="font-size:14px">REALTIME GI</text>
+  <text x="468" y="492" class="small">Screen probes · World cache</text>
+  <rect x="687" y="459" width="480" height="54" rx="13" fill="#242541" stroke="#554b82"/>
+  <circle cx="717" cy="486" r="10" fill="#d8a6ff"/>
+  <text x="739" y="492" class="step" style="font-size:14px">24-HOUR TOD</text>
+  <text x="889" y="492" class="small">Sky · Clouds · Fog · Lens flare</text>
+</svg>

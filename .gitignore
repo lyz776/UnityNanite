@@ -110,3 +110,9 @@ InitTestScene*.unity*
 
 # Unity auto-recovery scenes
 /[Aa]ssets/_Recovery/
+
+# Local archives and generated validation output
+/Archive/Local/
+/Validation/
+/tmp/
+/交付文档/

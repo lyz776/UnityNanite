@@ -82,9 +82,6 @@ Lens Flare 使用太阳和月亮挂点上的 Unity URP `LensFlareComponentSRP`�
 控制两者强度、尺寸和遮挡采样；光斑、鬼影与彩虹环的具体形状由挂点上的
 `LensFlareDataSRP` 资产决定。
 
-完整设计、性能分级和贴地雾实现顺序见
-`Assets/TOD/Docs/FOG_AND_LENS_FLARE_PLAN.md`。
-
 控制器每次应用 Profile 时会写入：
 
 - `_TODTime`、`_TODTime01`、`_TODDayOrNight`
